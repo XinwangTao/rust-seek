@@ -162,6 +162,75 @@ pub fn query(
     Some((hits, index.items.len() as u64, age_ms, truncated))
 }
 
+/// 只按扩展名 + 根目录取候选文件，不做名字/内容匹配。
+///
+/// 给内容搜索用：整机遍历是 19s 的瓶颈，而按扩展名筛完通常只剩几千个文件，
+/// 先拿候选再逐个读，就绕开了遍历。返回 `(候选, 索引条目数, 索引年龄 ms, 是否被截断)`。
+pub fn candidates(
+    roots: &[String],
+    exts: &HashSet<String>,
+    max: usize,
+) -> Option<(Vec<Hit>, u64, u128, bool)> {
+    let guard = lock();
+    let index = guard.as_ref()?;
+    let mut hits = Vec::new();
+    let mut truncated = false;
+
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut loose: Vec<String> = Vec::new();
+    if roots.is_empty() {
+        ranges.push((0, index.items.len()));
+    } else {
+        for root in roots {
+            let prefix = norm_prefix(root);
+            let (lo, hi) = prefix_bounds(index, &prefix);
+            if hi > lo {
+                ranges.push((lo, hi));
+            } else {
+                loose.push(prefix);
+            }
+        }
+    }
+
+    let push = |index: &Index, item: &Item, hits: &mut Vec<Hit>| -> bool {
+        if !exts.is_empty() && !ext_matches(index.name(item), exts) {
+            return true;
+        }
+        hits.push(Hit {
+            path: index.path(item).to_string(),
+            size: item.size,
+            mtime: item.mtime,
+        });
+        hits.len() < max
+    };
+
+    'scan: for (lo, hi) in ranges {
+        for item in &index.items[lo..hi] {
+            if !push(index, item, &mut hits) {
+                truncated = true;
+                break 'scan;
+            }
+        }
+    }
+
+    if !loose.is_empty() && !truncated {
+        for item in &index.items {
+            let path = index.path(item);
+            let hit_prefix = loose.iter().any(|p| {
+                path.get(..p.len())
+                    .map_or(false, |head| head.eq_ignore_ascii_case(p))
+            });
+            if hit_prefix && !push(index, item, &mut hits) {
+                truncated = true;
+                break;
+            }
+        }
+    }
+
+    let age_ms = now_unix().saturating_sub(index.built_unix) as u128 * 1000;
+    Some((hits, index.items.len() as u64, age_ms, truncated))
+}
+
 fn match_item(
     index: &Index,
     item: &Item,

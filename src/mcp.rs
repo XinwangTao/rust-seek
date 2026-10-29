@@ -127,7 +127,8 @@ Whole-drive searches are served from an in-memory name index: the first such que
         {
             "name": "search_text",
             "description": "Search file contents with a regex (ripgrep semantics: parallel walk, binary files and huge files skipped). \
-Returns one entry per file with line numbers and matching lines.",
+Returns one entry per file with line numbers and matching lines. \
+When roots are drive roots and exts is given, candidates come from the name index and only those files are read (source:\"index\"), skipping the ~19s whole-drive walk.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -141,7 +142,8 @@ Returns one entry per file with line numbers and matching lines.",
                     "include_hidden": { "type": "boolean", "default": false },
                     "prune_system": { "type": "boolean", "default": true, "description": "Skip whole-machine noise: C:\\Windows, Program Files, ProgramData, $Recycle.Bin and similar directories directly under a drive root. Set false to traverse them (much slower)." },
                     "budget_ms": { "type": "integer", "default": 10000, "description": "Wall-clock budget for the traversal in ms (0 = unlimited). On expiry the partial result comes back with timed_out:true." },
-                    "skip_dirs": { "type": "array", "items": { "type": "string" } }
+                    "skip_dirs": { "type": "array", "items": { "type": "string" } },
+                    "use_index": { "type": "boolean", "default": false, "description": "Also serve subdirectory roots from the name index (drive roots already do, when exts is given). Much faster but newly created files can be missing until the index refreshes." }
                 },
                 "required": ["pattern"]
             }
@@ -331,6 +333,45 @@ fn run_search_text(args: &Value) -> Result<String, String> {
     let skip = skip_set(args);
 
     let start = Instant::now();
+
+    // 整盘内容搜索：按扩展名从索引拿候选文件，跳过 ~19s 的目录遍历，只读目标文件。
+    // 没有 exts 就不能走（那等于读全盘每个文件）；子目录要显式 use_index。
+    let extra_skip = args
+        .get("skip_dirs")
+        .and_then(Value::as_array)
+        .map_or(false, |a| !a.is_empty());
+    let force_index = arg_bool(args, "use_index", false);
+    if !exts.is_empty()
+        && prune_system
+        && !include_hidden
+        && !extra_skip
+        && (roots_are_drives(&roots) || force_index)
+    {
+        index::ensure_ready();
+        if let Some((cands, entries, age, cand_trunc)) = index::candidates(&roots, &exts, 200_000) {
+            let (mut files, timed_out) =
+                search_text_candidates(&cands, &re, max_bytes, per_file, max_files, budget_ms, start);
+            files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+            files.truncate(max_files);
+            let count = files.len();
+            return Ok(json!({
+                "pattern": pattern,
+                "roots": roots,
+                "source": "index",
+                "index_entries": entries,
+                "index_age_ms": age,
+                "index_state": index::status(),
+                "scanned": cands.len(),
+                "elapsed_ms": start.elapsed().as_millis(),
+                "truncated": timed_out || cand_trunc || count >= max_files,
+                "timed_out": timed_out,
+                "count": count,
+                "files": files,
+            })
+            .to_string());
+        }
+    }
+
     let hits: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let timed_out = Arc::new(AtomicBool::new(false));
@@ -396,6 +437,65 @@ fn run_search_text(args: &Value) -> Result<String, String> {
 }
 
 // ---------- 遍历 ----------
+
+/// 并行读索引给出的候选文件做内容匹配；命中 `max_files` 或超出 `budget_ms` 立即停。
+fn search_text_candidates(
+    cands: &[index::Hit],
+    re: &Regex,
+    max_bytes: u64,
+    per_file: usize,
+    max_files: usize,
+    budget_ms: u128,
+    start: Instant,
+) -> (Vec<Value>, bool) {
+    let results: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let timed_out = AtomicBool::new(false);
+    let workers = num_cpus::get().clamp(1, 32);
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                if budget_ms > 0 && start.elapsed().as_millis() >= budget_ms {
+                    timed_out.store(true, Ordering::Relaxed);
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                let i = cursor.fetch_add(1, Ordering::Relaxed);
+                let Some(cand) = cands.get(i) else { break };
+                let Ok(Some(hit)) = search_file(Path::new(&cand.path), re, max_bytes) else {
+                    continue;
+                };
+                let matches: Vec<Value> = hit
+                    .matches
+                    .iter()
+                    .take(per_file)
+                    .map(|m| json!({ "line": m.line_num, "text": m.line }))
+                    .collect();
+                let mut guard = results.lock().unwrap();
+                if guard.len() < max_files {
+                    guard.push(json!({
+                        "path": hit.path,
+                        "match_count": hit.matches.len(),
+                        "matches": matches,
+                    }));
+                }
+                let full = guard.len() >= max_files;
+                drop(guard);
+                if full {
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+            });
+        }
+    });
+
+    (results.into_inner().unwrap_or_default(), timed_out.load(Ordering::Relaxed))
+}
 
 /// 并行遍历若干根目录；回调返回 `Step::Quit` 或外部 `stop` 置位时立即结束整次遍历。
 fn walk_roots<F>(roots: &[String], include_hidden: bool, stop: Arc<AtomicBool>, visit: F) -> u64
