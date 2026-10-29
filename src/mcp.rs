@@ -21,7 +21,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -118,7 +118,8 @@ Whole-drive searches are served from an in-memory name index: the first such que
                     "prune_system": { "type": "boolean", "default": true, "description": "Skip whole-machine noise: C:\\Windows, Program Files, ProgramData, $Recycle.Bin and similar directories directly under a drive root. Set false to traverse them (much slower)." },
                     "budget_ms": { "type": "integer", "default": 10000, "description": "Wall-clock budget for the traversal in ms (0 = unlimited). On expiry the partial result comes back with timed_out:true." },
                     "skip_dirs": { "type": "array", "items": { "type": "string" }, "description": "Extra directory names to prune, on top of the defaults." },
-                    "refresh_index": { "type": "boolean", "default": false, "description": "Rebuild the whole-drive name index (takes ~20s in the background) instead of querying it. Results for this call come from a normal walk." }
+                    "refresh_index": { "type": "boolean", "default": false, "description": "Rebuild the whole-drive name index (takes ~20s in the background) instead of querying it. Results for this call come from a normal walk." },
+                    "use_index": { "type": "boolean", "default": false, "description": "Also serve large subdirectory roots from the name index (whole-drive roots already do). Much faster but results may lag the index by up to 24h, so newly created files can be missing." }
                 },
                 "required": ["pattern"]
             }
@@ -198,12 +199,18 @@ fn run_search_files(args: &Value) -> Result<String, String> {
         .and_then(Value::as_array)
         .map_or(false, |a| !a.is_empty());
     let refresh = arg_bool(args, "refresh_index", false);
+    let force_index = arg_bool(args, "use_index", false);
 
     let start = Instant::now();
 
     // 整盘查询优先走索引：只有剪枝参数与建索引时完全一致才用，保证结果集不变。
-    // 索引没建过时会先尝试磁盘缓存（约 0.3s），没有缓存才退回遍历并在后台建。
-    if prune_system && !include_hidden && !extra_skip && roots_are_drives(&roots) {
+    // 索引没建过时会先尝试磁盘缓存（约 0.2s），没有缓存才退回遍历并在后台建。
+    // 子目录查询默认不走索引（可能要刚建的文件），传 use_index: true 才强制用。
+    if prune_system
+        && !include_hidden
+        && !extra_skip
+        && (roots_are_drives(&roots) || force_index)
+    {
         index::ensure_ready();
         if refresh {
             index::rebuild();
@@ -213,7 +220,8 @@ fn run_search_files(args: &Value) -> Result<String, String> {
             } else {
                 None
             };
-            if let Some((hits, entries, age, full)) = index::lookup(&re, &exts, max_results, budget)
+            if let Some((hits, entries, age, full)) =
+                index::query(&re, &roots, &exts, max_results, budget)
             {
                 let mut files: Vec<Value> = hits
                     .into_iter()
@@ -221,7 +229,7 @@ fn run_search_files(args: &Value) -> Result<String, String> {
                         json!({
                             "path": h.path,
                             "size": h.size,
-                            "modified": (h.mtime > 0).then(|| fmt_unix(h.mtime)),
+                            "modified": h.modified().map(fmt_time),
                         })
                     })
                     .collect();
@@ -245,7 +253,7 @@ fn run_search_files(args: &Value) -> Result<String, String> {
         }
     }
     // 整盘查询顺手把索引准备好，后续同类查询就只剩内存扫描
-    if roots_are_drives(&roots) {
+    if roots_are_drives(&roots) || force_index {
         index::ensure_ready();
     }
 
@@ -508,10 +516,6 @@ fn ext_matches(path: &Path, exts: &HashSet<String>) -> bool {
 fn fmt_time(t: std::time::SystemTime) -> String {
     let dt: chrono::DateTime<chrono::Local> = t.into();
     dt.format("%Y-%m-%d %H:%M").to_string()
-}
-
-fn fmt_unix(secs: u64) -> String {
-    fmt_time(UNIX_EPOCH + Duration::from_secs(secs))
 }
 
 /// roots 全是盘符根（`C:/`、`D:/`）时才可能有对应的整盘索引。

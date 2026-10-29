@@ -109,7 +109,7 @@ claude mcp add rust-seek -- "F:\path\to\rust-seek.exe" --mcp
 
 | 工具 | 作用 | 关键参数 |
 |------|------|----------|
-| `search_files` | 按文件名/路径找文件，返回绝对路径 + 大小 + 修改时间 | `pattern`、`roots`、`exts`、`max_results`（默认 100）、`refresh_index` |
+| `search_files` | 按文件名/路径找文件，返回绝对路径 + 大小 + 修改时间 | `pattern`、`roots`、`exts`、`max_results`（默认 100）、`use_index`、`refresh_index` |
 | `search_text` | 按内容找（ripgrep 语义，并行、跳二进制、跳大文件） | `pattern`、`roots`、`exts`、`max_files`（默认 50）、`max_matches_per_file` |
 | `list_drives` | 列出可搜索的本地磁盘 | — |
 
@@ -131,6 +131,8 @@ claude mcp add rust-seek -- "F:\path\to\rust-seek.exe" --mcp
 
 - 缓存位置 `%LOCALAPPDATA%\rust-seek\index-v1.bin`（约 213MB），24 小时后自动后台刷新，7 天后强制重建
 - 常驻内存约 220MB；只存文件（不存目录），剪枝规则和普通搜索一致，所以结果集相同
+- 条目按路径排序，子目录查询用二分定位区间，只扫那一段：`use_index: true` 可让任意大目录也走索引
+- GUI 的「整机 + 文件名」搜索同样走索引（状态栏标「· 索引」）；单盘 / 指定目录仍走遍历（那两种范围不剪系统目录，语义不同）
 - `refresh_index: true` 强制重建，本次调用仍走遍历
 - 响应里的 `source`（`index` / `walk`）、`index_age_ms`、`index_entries` 说明数据来源与新鲜度
 

@@ -23,7 +23,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// 条目上限，防止在超大存储上把内存吃穿
 const MAX_ENTRIES: usize = 4_000_000;
@@ -32,7 +32,7 @@ const TTL_SECS: u64 = 24 * 3600;
 /// 超过这个年龄的缓存直接不用，重新遍历
 const MAX_CACHE_AGE_SECS: u64 = 7 * 24 * 3600;
 
-const MAGIC: &[u8; 8] = b"RSKIDX\x01\x00";
+const MAGIC: &[u8; 8] = b"RSKIDX\x02\x00";
 const HDR: usize = 32;
 const ITEM_BYTES: usize = 32;
 
@@ -62,41 +62,150 @@ pub struct Hit {
     pub mtime: u64,
 }
 
+impl Hit {
+    pub fn modified(&self) -> Option<std::time::SystemTime> {
+        if self.mtime == 0 {
+            None
+        } else {
+            Some(UNIX_EPOCH + Duration::from_secs(self.mtime))
+        }
+    }
+}
+
+impl Index {
+    fn path(&self, item: &Item) -> &str {
+        &self.blob[item.path_off as usize..(item.path_off + item.path_len) as usize]
+    }
+
+    fn name(&self, item: &Item) -> &str {
+        &self.blob[item.name_off as usize..(item.name_off + item.name_len) as usize]
+    }
+}
+
 /// 索引可用时按文件名匹配；不可用返回 None，调用方照常走目录遍历。
+///
+/// `roots` 为空表示全盘；否则只扫这些前缀命中的条目（条目按路径排序，二分定位）。
 /// 返回 `(命中, 索引条目数, 索引年龄 ms, 是否提前结束)`。
-pub fn lookup(
+pub fn query(
     re: &Regex,
+    roots: &[String],
     exts: &HashSet<String>,
     max: usize,
     budget: Option<Duration>,
 ) -> Option<(Vec<Hit>, u64, u128, bool)> {
     let guard = lock();
     let index = guard.as_ref()?;
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let mut hits = Vec::new();
-    let mut full = false;
-    for item in &index.items {
-        if hits.len() >= max {
-            full = true;
-            break;
-        }
-        if let Some(b) = budget {
-            if start.elapsed() >= b {
-                full = true;
-                break;
+    let mut truncated = false;
+
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut loose: Vec<String> = Vec::new();
+    if roots.is_empty() {
+        ranges.push((0, index.items.len()));
+    } else {
+        for root in roots {
+            let prefix = norm_prefix(root);
+            let (lo, hi) = prefix_bounds(index, &prefix);
+            if hi > lo {
+                ranges.push((lo, hi));
+            } else {
+                // 二分没找到：多半是用户输入的路径大小写和磁盘不一致，退化成线性比
+                loose.push(prefix);
             }
         }
-        let name = &index.blob[item.name_off as usize..(item.name_off + item.name_len) as usize];
-        if !exts.is_empty() && !ext_matches(name, exts) {
-            continue;
-        }
-        if re.is_match(name) {
-            let path = &index.blob[item.path_off as usize..(item.path_off + item.path_len) as usize];
-            hits.push(Hit { path: path.to_string(), size: item.size, mtime: item.mtime });
+    }
+
+    'scan: for (lo, hi) in ranges {
+        for item in &index.items[lo..hi] {
+            if hits.len() >= max {
+                truncated = true;
+                break 'scan;
+            }
+            if let Some(b) = budget {
+                if start.elapsed() >= b {
+                    truncated = true;
+                    break 'scan;
+                }
+            }
+            if match_item(index, item, re, exts, &mut hits).is_some() && hits.len() >= max {
+                truncated = true;
+                break 'scan;
+            }
         }
     }
+
+    if !loose.is_empty() {
+        for item in &index.items {
+            if hits.len() >= max {
+                truncated = true;
+                break;
+            }
+            if let Some(b) = budget {
+                if start.elapsed() >= b {
+                    truncated = true;
+                    break;
+                }
+            }
+            let path = index.path(item);
+            let hit_prefix = loose.iter().any(|p| {
+                path.get(..p.len())
+                    .map_or(false, |head| head.eq_ignore_ascii_case(p))
+            });
+            if hit_prefix {
+                match_item(index, item, re, exts, &mut hits);
+            }
+        }
+    }
+
     let age_ms = now_unix().saturating_sub(index.built_unix) as u128 * 1000;
-    Some((hits, index.items.len() as u64, age_ms, full))
+    Some((hits, index.items.len() as u64, age_ms, truncated))
+}
+
+fn match_item(
+    index: &Index,
+    item: &Item,
+    re: &Regex,
+    exts: &HashSet<String>,
+    hits: &mut Vec<Hit>,
+) -> Option<()> {
+    let name = index.name(item);
+    if !exts.is_empty() && !ext_matches(name, exts) {
+        return None;
+    }
+    if !re.is_match(name) {
+        return None;
+    }
+    hits.push(Hit { path: index.path(item).to_string(), size: item.size, mtime: item.mtime });
+    Some(())
+}
+
+/// `C:/Users` → `C:/Users/`，并把盘符统一成大写（索引里的写法）。
+fn norm_prefix(root: &str) -> String {
+    let mut p = root.replace('\\', "/");
+    if !p.ends_with('/') {
+        p.push('/');
+    }
+    if p.len() >= 2 && p.as_bytes()[1] == b':' {
+        let head = p[..1].to_ascii_uppercase();
+        p.replace_range(..1, &head);
+    }
+    p
+}
+
+/// 排序后所有以 `prefix` 开头的条目是连续区间 `[lo, hi)`。
+/// 上界用「前缀末字节 +1」定位（前缀必然以 `/` 结尾，`/`+1 = `0`），不用逐条判前缀。
+fn prefix_bounds(index: &Index, prefix: &str) -> (usize, usize) {
+    let lo = index.items.partition_point(|it| index.path(it) < prefix);
+    let mut upper = prefix.as_bytes().to_vec();
+    if let Some(last) = upper.last_mut() {
+        *last = last.wrapping_add(1);
+    }
+    let hi = match std::str::from_utf8(&upper) {
+        Ok(u) => index.items.partition_point(|it| index.path(it) < u),
+        Err(_) => lo,
+    };
+    (lo, hi.max(lo))
 }
 
 /// `idle` / `building` / `ready`
@@ -111,57 +220,63 @@ pub fn status() -> &'static str {
     }
 }
 
-/// 保证索引可用：已有就检查是否需要后台刷新；没有就尝试磁盘缓存；再没有就后台建。
-/// 磁盘缓存载入是同步的（约 0.3s），因为调用方可能马上要查。
-pub fn ensure_ready() {
-    enum Ready {
-        Fresh,
-        Stale,
-        Missing,
+/// 索引已在内存里。
+pub fn is_ready() -> bool {
+    lock().is_some()
+}
+
+/// 同步载入磁盘缓存（不触发构建）。返回载入后是否有可用索引。
+/// 已有索引直接 true；正在后台构建时返回 false，调用方照常遍历。
+pub fn try_load() -> bool {
+    if is_ready() {
+        return true;
     }
-    let state = {
-        let guard = lock();
-        match guard.as_ref() {
-            Some(index) => {
-                if now_unix().saturating_sub(index.built_unix) > TTL_SECS {
-                    Ready::Stale
-                } else {
-                    Ready::Fresh
-                }
-            }
-            None => Ready::Missing,
+    if BUILDING.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let loaded = load_cache();
+    let ok = loaded.is_some();
+    {
+        let mut guard = lock();
+        if let Some(index) = loaded {
+            *guard = Some(Box::new(index));
         }
-    };
+    }
+    BUILDING.store(false, Ordering::SeqCst);
+    ok
+}
 
-    match state {
-        Ready::Fresh => {}
-        Ready::Stale => rebuild(),
-        Ready::Missing => {
-            // BUILDING 兼作载入锁，避免两个请求同时读盘
-            if BUILDING.swap(true, Ordering::SeqCst) {
-                return;
-            }
-            let loaded = load_cache();
-            let loaded_ok = loaded.is_some();
-            {
-                let mut guard = lock();
-                if let Some(index) = loaded {
-                    *guard = Some(Box::new(index));
+/// 保证索引可用：已有就检查是否需要后台刷新；没有就尝试磁盘缓存；再没有就后台建。
+/// 磁盘缓存载入是同步的（约 0.2s），因为调用方可能马上要查。
+pub fn ensure_ready() {
+    match freshness() {
+        Freshness::Fresh => {}
+        Freshness::Stale => rebuild(),
+        Freshness::Missing => {
+            if try_load() {
+                if freshness() == Freshness::Stale {
+                    rebuild();
                 }
-            }
-            BUILDING.store(false, Ordering::SeqCst);
-
-            if !loaded_ok {
-                if !BUILDING.swap(true, Ordering::SeqCst) {
-                    spawn_build();
-                }
-            } else if lock()
-                .as_ref()
-                .map_or(false, |i| now_unix().saturating_sub(i.built_unix) > TTL_SECS)
-            {
-                rebuild();
+            } else if !BUILDING.swap(true, Ordering::SeqCst) {
+                spawn_build();
             }
         }
+    }
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Freshness {
+    Fresh,
+    Stale,
+    Missing,
+}
+
+fn freshness() -> Freshness {
+    let guard = lock();
+    match guard.as_ref() {
+        Some(index) if now_unix().saturating_sub(index.built_unix) > TTL_SECS => Freshness::Stale,
+        Some(_) => Freshness::Fresh,
+        None => Freshness::Missing,
     }
 }
 
@@ -260,10 +375,12 @@ fn build() -> Option<Index> {
         );
     }
     drop(tx);
-    let raw = collector.join().ok()?;
+    let mut raw = collector.join().ok()?;
     if overflow.load(Ordering::Relaxed) {
         eprintln!("rust-seek: index hit the {MAX_ENTRIES} entry cap, results may be incomplete");
     }
+    // 按路径排序：子目录查询靠二分定位区间，不用扫全表
+    raw.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
     let total: usize = raw.iter().map(|(p, _, _)| p.len()).sum();
     let mut blob = String::with_capacity(total);

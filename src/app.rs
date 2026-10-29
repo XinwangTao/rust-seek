@@ -1,4 +1,5 @@
 use crate::fastwalk::{self, Step};
+use crate::index;
 use crate::integration;
 use crate::searcher::{
     path_in_noise_dir, path_is_system_root, search_file, search_filename_meta, SearchResult,
@@ -525,11 +526,47 @@ impl App {
         let exts = self.ext_filter_active();
         // 整机搜索时跳过系统目录里的条目；用户手动指定目录时不干预
         let prune_system = self.prefs.prune_system && matches!(self.scope, Scope::Machine);
+        // 索引的剪枝规则和「整机 + 剪系统目录」完全一致，只有这种组合能走索引：
+        // 单盘/指定目录的范围语义不同（不剪系统目录），走了会少结果。
+        let use_index =
+            prune_system && matches!(mode, SearchMode::Filename) && matches!(self.scope, Scope::Machine);
         let walk_roots: Vec<std::path::PathBuf> =
             roots.iter().map(std::path::PathBuf::from).collect();
 
         thread::spawn(move || {
             let start = Instant::now();
+
+            // 常驻索引：整机 250 万条目 19s → 0.1s。没建过就先同步载入磁盘缓存
+            // （约 0.2s）；仍然没有就照常遍历，遍历结束后再在后台建。
+            if use_index && (index::is_ready() || index::try_load()) {
+                let ext_set: HashSet<String> =
+                    exts.iter().map(|e| e.to_ascii_lowercase()).collect();
+                if let Some((hits, _, _, _)) =
+                    index::query(&re, &roots, &ext_set, MAX_RESULTS + 1, None)
+                {
+                    for h in &hits {
+                        if cancelled.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let path = std::path::Path::new(&h.path);
+                        let Some(result) =
+                            search_filename_meta(path, &re, || Some((h.size, h.modified())))
+                        else {
+                            continue;
+                        };
+                        if tx.send(SearchMsg::Result(result)).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = tx.send(SearchMsg::Done {
+                        ms: start.elapsed().as_millis(),
+                        visited: hits.len() as u64,
+                        scope: format!("{scope_label} · 索引"),
+                    });
+                    return;
+                }
+            }
+
             let opts = fastwalk::Options { include_hidden: false, threads };
             let visited = fastwalk::walk(&walk_roots, &opts, &cancelled, |path, info| {
                 // 回收站 / 系统还原 / WinSxS，以及盘符下的 Windows、Program Files 等大头目录：
@@ -567,6 +604,10 @@ impl App {
                 }
                 Step::Continue
             });
+            // 整机首搜走完再后台建索引：不和本次遍历抢磁盘 I/O，下次搜索就是毫秒级
+            if use_index {
+                index::ensure_ready();
+            }
             let _ = tx.send(SearchMsg::Done {
                 ms: start.elapsed().as_millis(),
                 visited,
