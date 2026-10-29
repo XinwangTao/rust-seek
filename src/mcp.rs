@@ -6,10 +6,12 @@
 //! 为 Agent 场景做的取舍：
 //! - 达到 `max_results` 立即 `WalkState::Quit` 掐断整棵遍历，不等全盘走完
 //! - 默认用 `WalkState::Skip` 整棵剪掉 node_modules/.git/target/WinSxS 之类目录
+//! - 盘符下的 Windows / Program Files / ProgramData 等系统大头目录默认也整棵剪掉
+//!   （`prune_system: false` 可关闭）
 //! - 结果按路径排序后返回，便于模型稳定引用；响应自带 scanned/elapsed_ms 便于判断是否截断
 
 use crate::integration;
-use crate::searcher::{search_file, search_filename_meta};
+use crate::searcher::{path_is_system_root, search_file, search_filename_meta};
 use ignore::{WalkBuilder, WalkState};
 use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
@@ -134,6 +136,7 @@ node_modules/.git/target/WinSxS and similar directories are pruned by default.",
                     "exts": { "type": "array", "items": { "type": "string" }, "description": "Only keep these extensions (without dot), e.g. [\"rs\",\"toml\"]." },
                     "max_results": { "type": "integer", "default": 100, "description": "Hard cap on returned files (1-2000). Traversal quits once reached." },
                     "include_hidden": { "type": "boolean", "default": false },
+                    "prune_system": { "type": "boolean", "default": true, "description": "Skip whole-machine noise: C:\\Windows, Program Files, ProgramData, $Recycle.Bin and similar directories directly under a drive root. Set false to traverse them (much slower)." },
                     "skip_dirs": { "type": "array", "items": { "type": "string" }, "description": "Extra directory names to prune, on top of the defaults." }
                 },
                 "required": ["pattern"]
@@ -154,6 +157,7 @@ Returns one entry per file with line numbers and matching lines.",
                     "max_matches_per_file": { "type": "integer", "default": 5, "description": "Cap on matches reported per file (1-50)." },
                     "max_file_size_mb": { "type": "integer", "default": 10, "description": "Skip files larger than this (1-200 MB)." },
                     "include_hidden": { "type": "boolean", "default": false },
+                    "prune_system": { "type": "boolean", "default": true, "description": "Skip whole-machine noise: C:\\Windows, Program Files, ProgramData, $Recycle.Bin and similar directories directly under a drive root. Set false to traverse them (much slower)." },
                     "skip_dirs": { "type": "array", "items": { "type": "string" } }
                 },
                 "required": ["pattern"]
@@ -203,6 +207,7 @@ fn run_search_files(args: &Value) -> Result<String, String> {
     let roots = resolve_roots(args)?;
     let max_results = arg_usize(args, "max_results", 100, 1, 2000);
     let include_hidden = arg_bool(args, "include_hidden", false);
+    let prune_system = arg_bool(args, "prune_system", true);
     let exts = lower_list(args, "exts");
     let skip = skip_set(args);
 
@@ -216,6 +221,10 @@ fn run_search_files(args: &Value) -> Result<String, String> {
     let skip_c = skip.clone();
     let scanned = walk_roots(&roots, include_hidden, stop.clone(), move |entry| {
         let path = entry.path();
+        // 盘符下的 Windows / Program Files 等大头目录整棵剪掉（roots 自身不剪）
+        if prune_system && entry.depth() > 0 && path_is_system_root(path) {
+            return if is_dir(entry) { Step::Skip } else { Step::Continue };
+        }
         if is_skipped(path, &skip_c) {
             return if is_dir(entry) { Step::Skip } else { Step::Continue };
         }
@@ -262,6 +271,7 @@ fn run_search_text(args: &Value) -> Result<String, String> {
     let per_file = arg_usize(args, "max_matches_per_file", 5, 1, 50);
     let max_bytes = arg_usize(args, "max_file_size_mb", 10, 1, 200) as u64 * 1024 * 1024;
     let include_hidden = arg_bool(args, "include_hidden", false);
+    let prune_system = arg_bool(args, "prune_system", true);
     let exts = lower_list(args, "exts");
     let skip = skip_set(args);
 
@@ -275,6 +285,9 @@ fn run_search_text(args: &Value) -> Result<String, String> {
     let skip_c = skip.clone();
     let scanned = walk_roots(&roots, include_hidden, stop.clone(), move |entry| {
         let path = entry.path();
+        if prune_system && entry.depth() > 0 && path_is_system_root(path) {
+            return if is_dir(entry) { Step::Skip } else { Step::Continue };
+        }
         if is_skipped(path, &skip_c) {
             return if is_dir(entry) { Step::Skip } else { Step::Continue };
         }

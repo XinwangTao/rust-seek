@@ -1,5 +1,7 @@
 use crate::integration;
-use crate::searcher::{search_file, search_filename_meta, SearchResult};
+use crate::searcher::{
+    path_in_noise_dir, path_is_system_root, search_file, search_filename_meta, SearchResult,
+};
 use eframe::egui;
 use egui::{Color32, RichText, ScrollArea, TextEdit, Ui};
 use ignore::WalkBuilder;
@@ -160,6 +162,9 @@ struct Prefs {
     /// 文件类型筛选
     #[serde(default)]
     file_kind: FileKind,
+    /// 整机搜索时跳过系统大头目录（Windows / Program Files / ProgramData…）
+    #[serde(default = "default_true")]
+    prune_system: bool,
 }
 
 impl Prefs {
@@ -519,7 +524,7 @@ impl App {
         let mode = self.mode;
         let exts = self.ext_filter_active();
         // 整机搜索时跳过系统目录里的条目；用户手动指定目录时不干预
-        let prune_system = matches!(self.scope, Scope::Machine);
+        let prune_system = self.prefs.prune_system && matches!(self.scope, Scope::Machine);
         let visited = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         thread::spawn(move || {
@@ -545,9 +550,13 @@ impl App {
                     if cancelled.load(Ordering::Relaxed) { return ignore::WalkState::Quit; }
                     let entry = match entry { Ok(e) => e, Err(_) => return ignore::WalkState::Continue };
                     visited.fetch_add(1, Ordering::Relaxed);
-                    // 回收站 / 系统还原 / WinSxS 里的条目直接跳过；命中的是目录就整棵剪掉，
-                    // 否则这些目录会被逐条遍历，白白拖慢整机搜索（还会刷一堆拒绝访问错误）
-                    if prune_system && path_in_noise_dir(entry.path()) {
+                    // 回收站 / 系统还原 / WinSxS，以及盘符下的 Windows、Program Files 等大头目录：
+                    // 命中的是目录就整棵剪掉，否则这些目录会被逐条遍历，白白拖慢整机搜索
+                    // （还会刷一堆拒绝访问错误）。depth == 0 是用户给的根，不剪。
+                    if prune_system
+                        && entry.depth() > 0
+                        && (path_in_noise_dir(entry.path()) || path_is_system_root(entry.path()))
+                    {
                         return if entry.file_type().map_or(false, |ft| ft.is_dir()) {
                             ignore::WalkState::Skip
                         } else {
@@ -1287,6 +1296,22 @@ impl App {
 
                 ui.separator();
 
+                if ui.checkbox(&mut self.prefs.prune_system,
+                    "整机搜索时跳过系统目录（Windows / Program Files / ProgramData / 回收站…）").changed()
+                {
+                    self.save_prefs();
+                    self.status = if self.prefs.prune_system {
+                        "已开启：整机搜索将跳过系统目录".into()
+                    } else {
+                        "已关闭：整机搜索会遍历整个系统盘（明显更慢）".into()
+                    };
+                }
+                ui.label(RichText::new(
+                    "只跳过盘符根下的系统目录，项目里的同名文件夹不受影响；仅对「整机」范围生效。")
+                    .weak().small());
+
+                ui.separator();
+
                 if ui.checkbox(&mut self.prefs.dock_bottom,
                     "系统式面板（停靠屏幕底部、无边框、不进任务栏，失焦自动收起）").changed()
                 {
@@ -1502,21 +1527,4 @@ fn push_history(history: &mut Vec<String>, value: String) {
     history.retain(|h| h != &value);
     history.insert(0, value);
     history.truncate(MAX_HISTORY);
-}
-
-/// 整机搜索时跳过的系统目录名（回收站、系统还原、WinSxS 等）。
-/// 仅在「整机」范围生效；用户手动指定的目录不做干预。
-fn is_noise_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "$recycle.bin" | "system volume information" | "winsxs" | "recovery"
-    )
-}
-
-/// 路径中任意一段是系统目录就算噪声条目。
-fn path_in_noise_dir(path: &std::path::Path) -> bool {
-    path.components().any(|c| match c {
-        std::path::Component::Normal(s) => s.to_str().map_or(false, is_noise_name),
-        _ => false,
-    })
 }

@@ -152,6 +152,59 @@ fn truncate(line: &str) -> String {
     }
 }
 
+// ---------- 目录剪枝 ----------
+
+/// 整机搜索时整棵跳过的系统目录名（任意层级）：回收站、系统还原、WinSxS。
+pub fn is_noise_dir_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "$recycle.bin" | "system volume information" | "winsxs" | "recovery"
+    )
+}
+
+/// 路径中任意一段是噪声目录。
+pub fn path_in_noise_dir(path: &Path) -> bool {
+    path.components().any(|c| match c {
+        std::path::Component::Normal(s) => s.to_str().map_or(false, is_noise_dir_name),
+        _ => false,
+    })
+}
+
+/// 盘符根下第一层的大头目录（`C:\Windows`、`C:\Program Files` 等）。
+///
+/// 只认「盘符 + 目录名」这两段，绝不按任意层级匹配：项目里常有 `src\windows`、
+/// `web\Program Files` 这类同名目录，整层剪掉会直接搜不到代码。
+pub fn path_is_system_root(path: &Path) -> bool {
+    let mut comps = path
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::RootDir));
+    match (comps.next(), comps.next()) {
+        (Some(std::path::Component::Prefix(_)), Some(std::path::Component::Normal(s))) => {
+            s.to_str().map_or(false, is_system_root_name)
+        }
+        _ => false,
+    }
+}
+
+fn is_system_root_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "windows"
+            | "windows.old"
+            | "program files"
+            | "program files (x86)"
+            | "programdata"
+            | "perflogs"
+            | "msocache"
+            | "config.msi"
+            | "recovery"
+            | "$windows.~bt"
+            | "$windows.~ws"
+            | "$extend"
+            | "$winreagent"
+    )
+}
+
 pub fn file_icon(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {

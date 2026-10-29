@@ -32,6 +32,7 @@ Most search tools are either too slow, too complex, or require a runtime environ
 - **Live search** — 文件名模式下输入即出结果（150ms 防抖），无需按回车；整机范围改为回车触发，避免全盘反复空扫
 - **Sort results** — 按路径 / 修改时间（最新在前）/ 大小（最大在前）
 - **Search-stage pruning** — 类型/后缀在遍历阶段就剪枝，整机搜索不会去读无关文件
+- **System dir pruning** — 整机搜索默认跳过盘符下的 `Windows` / `Program Files` / `ProgramData` / 回收站等系统目录（设置里可开关，只认盘符根下两层，不会误伤项目里的同名文件夹）
 - **Keyboard navigation** — ↑/↓ 选中结果、Enter 直接打开（无结果时 Enter 触发搜索）
 - **Modified time & size** — 每条文件结果显示修改时间和大小
 - **Binary file detection** — automatically skips binary files, no garbage output
@@ -117,6 +118,7 @@ claude mcp add rust-seek -- "F:\path\to\rust-seek.exe" --mcp
 
 - **命中上限一到就掐断遍历**：`max_results` / `max_files` 满足后返回 `WalkState::Quit`，不等全盘走完
 - **整棵剪枝**：默认用 `WalkState::Skip` 跳过 `node_modules`、`.git`、`target`、`__pycache__`、`WinSxS`、回收站等，可用 `skip_dirs` 追加
+- **系统目录默认剪掉**：盘符下的 `C:\Windows`、`Program Files`、`ProgramData` 等大头目录整棵跳过，`prune_system: false` 可关闭
 - **不跟随符号链接**：元数据取遍历器缓存的 `symlink_metadata`，碰到失效 junction 不会卡在 SMB 超时上
 - 响应自带 `scanned` / `elapsed_ms` / `truncated`，模型能判断结果是否被截断
 
