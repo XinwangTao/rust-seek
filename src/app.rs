@@ -422,8 +422,13 @@ impl App {
         }
     }
 
-    fn hide_window(&mut self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    fn hide_window(&mut self, _ctx: &egui::Context) {
+        // 与呼出对称走 Win32 直隐：本窗口样式/显示由 Win32 接管（热键 SW_SHOW 直调），
+        // ViewportCommand::Visible 经 winit 的内部状态与真实窗口脱节，实测不生效
+        let hwnd = self.bridge.hwnd.load(Ordering::Relaxed);
+        if hwnd != 0 {
+            integration::win_hide(hwnd);
+        }
     }
 
     /// 消费外部事件（热键/托盘/其他实例）设置的桥接标志。
@@ -755,17 +760,24 @@ impl eframe::App for App {
         }
 
         // —— 失焦自动隐藏：像系统搜索面板一样，点到别处即收起 ——
+        // 前台判定直接用 Win32（winit 的 focused 事件在热键 Win32 呼出路径下不可靠）；
+        // 面板可见期间保活低频重绘，否则 egui 事件驱动模式下没人醒来复查 300ms 计时。
         if self.prefs.dock_bottom && !self.show_settings {
             let hwnd = self.bridge.hwnd.load(Ordering::Relaxed);
             let visible = hwnd != 0 && integration::win_is_visible(hwnd);
-            let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-            if visible && !focused {
-                let since = *self.unfocused_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= Duration::from_millis(300) {
+            if visible {
+                let focused = integration::foreground_window() == hwnd;
+                if !focused {
+                    let since = *self.unfocused_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_millis(300) {
+                        self.unfocused_since = None;
+                        self.cancel_search();
+                        self.hide_window(ctx);
+                    }
+                } else {
                     self.unfocused_since = None;
-                    self.cancel_search();
-                    self.hide_window(ctx);
                 }
+                ctx.request_repaint_after(Duration::from_millis(250));
             } else {
                 self.unfocused_since = None;
             }

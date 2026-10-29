@@ -87,6 +87,7 @@ extern "system" {
     fn IsWindowVisible(hwnd: isize) -> i32;
     fn SetWindowPos(hwnd: isize, after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
     fn SetForegroundWindow(hwnd: isize) -> i32;
+    fn GetForegroundWindow() -> isize;
     fn SetFocus(hwnd: isize) -> isize;
     fn keybd_event(vk: u8, scan: u8, flags: u32, extra: usize);
     fn EnumWindows(cb: Option<extern "system" fn(isize, isize) -> i32>, lparam: isize) -> i32;
@@ -143,6 +144,11 @@ pub fn bottom_center_position(width: f32, height: f32) -> Option<(f32, f32)> {
 
 pub fn win_is_visible(hwnd: isize) -> bool {
     unsafe { IsWindowVisible(hwnd) != 0 }
+}
+
+/// 当前前台窗口 HWND（失焦判定用：比 winit 的 focused 事件在 Win32 直呼出路径下更可靠）。
+pub fn foreground_window() -> isize {
+    unsafe { GetForegroundWindow() }
 }
 
 /// 以底栏停靠姿态显示主窗口并抢焦点（模拟按下 Alt 是绕过前台锁的通行做法）。
