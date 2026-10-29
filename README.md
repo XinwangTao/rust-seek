@@ -5,7 +5,7 @@
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue?logo=windows)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Version](https://img.shields.io/badge/version-0.2.0-brightgreen)
+![Version](https://img.shields.io/badge/version-4.7.0-brightgreen)
 
 ---
 
@@ -18,6 +18,21 @@ Most search tools are either too slow, too complex, or require a runtime environ
 - 🎯 **Full regex support** — powered by Rust's battle-tested `regex` crate
 - 🖥️ **Native GUI** — built with `egui`, renders at 60fps with zero web bloat
 - 📦 **Zero dependencies for the user** — one `.exe`, runs anywhere on Windows
+
+---
+
+## 🎯 三种使用方式
+
+同一个 `rust-seek.exe`，按你的习惯选一种（或全都要）：
+
+| 形态 | 入口 | 适合谁 |
+|------|------|--------|
+| **纯软件端** | 双击 `rust-seek.exe` 打开搜索窗口 | 手动找文件/内容，点开即用 |
+| **系统集成** | 开机后台常驻，`Alt+Space` / `Win+S` 呼出，接管任务栏搜索 | 当系统自带搜索用，随手呼出 |
+| **AI Agent（MCP）** | `rust-seek.exe --mcp`，Claude Code / Cursor 直接调用 | 让 AI 调用你的整机搜索 |
+
+三种形态共用同一套搜索引擎与整盘索引——索引建一次，处处受益。
+下文分别展开：搜索能力见 [Features](#-features)，系统集成见 [系统底栏集成](#-系统底栏集成windows)，AI 调用见 [MCP Server](#-mcp-server给-ai-agent-用)。
 
 ---
 
