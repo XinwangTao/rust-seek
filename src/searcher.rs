@@ -25,29 +25,33 @@ pub struct SearchResult {
 
 #[allow(dead_code)]
 pub fn search_filename(path: &Path, pattern: &Regex) -> Option<SearchResult> {
-    let meta = std::fs::metadata(path).ok();
-    search_filename_meta(path, pattern, meta)
+    search_filename_meta(path, pattern, || {
+        std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()))
+    })
 }
 
-/// 用调用方给好的元数据。整机遍历时必须走这个：`fs::metadata` 会跟随符号链接，
-/// 碰到指向已失效网络路径的 junction 会阻塞到 SMB 超时，整个遍历因此停摆。
-/// `ignore::DirEntry::metadata()` 在 follow_links=false 时等价于 symlink_metadata，
-/// 本地取数、不跟随链接。
-pub fn search_filename_meta(
+/// 大小/修改时间用闭包延迟获取：**只有文件名命中时才去取**。
+///
+/// 遍历时给每个条目取元数据（walkdir 的 `metadata()` 走 `symlink_metadata`）在整机
+/// 250 万条目上就是 250 万次系统调用，而命中通常只有几十个。走 [`crate::fastwalk`]
+/// 时枚举本身已经带回大小和时间，闭包直接给出、一次系统调用都不用。
+pub fn search_filename_meta<F>(
     path: &Path,
     pattern: &Regex,
-    meta: Option<std::fs::Metadata>,
-) -> Option<SearchResult> {
+    meta: F,
+) -> Option<SearchResult>
+where
+    F: FnOnce() -> Option<(u64, Option<std::time::SystemTime>)>,
+{
     let name = path.file_name()?.to_string_lossy();
-    let ranges: Vec<(usize, usize)> = pattern
-        .find_iter(name.as_ref())
-        .map(|m| (m.start(), m.end()))
-        .collect();
+    let mut ranges = Vec::new();
+    for m in pattern.find_iter(name.as_ref()) {
+        ranges.push((m.start(), m.end()));
+    }
     if ranges.is_empty() { return None; }
     let (display_path, win_path) = make_paths(path);
     let icon = file_icon(&display_path);
-    let file_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-    let modified = meta.and_then(|m| m.modified().ok());
+    let (file_size, modified) = meta().unwrap_or((0, None));
     Some(SearchResult {
         icon, win_path, path: display_path, file_size, modified,
         matches: vec![Match {
@@ -153,6 +157,27 @@ fn truncate(line: &str) -> String {
 }
 
 // ---------- 目录剪枝 ----------
+
+/// 整机搜索 / 建索引时整棵跳过的目录名（任意层级，不分大小写）。
+/// 这些目录里的文件 Agent 基本不会要，却常常占掉整盘一半条目。
+pub const SKIP_DIRS: &[&str] = &[
+    "$recycle.bin",
+    "system volume information",
+    "winsxs",
+    "node_modules",
+    ".git",
+    ".hg",
+    ".svn",
+    "target",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    ".cache",
+    ".gradle",
+    ".next",
+    ".nuxt",
+];
 
 /// 整机搜索时整棵跳过的系统目录名（任意层级）：回收站、系统还原、WinSxS。
 pub fn is_noise_dir_name(name: &str) -> bool {

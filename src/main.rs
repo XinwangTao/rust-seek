@@ -1,4 +1,6 @@
 mod app;
+mod fastwalk;
+mod index;
 mod integration;
 mod mcp;
 mod searcher;

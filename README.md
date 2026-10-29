@@ -33,6 +33,7 @@ Most search tools are either too slow, too complex, or require a runtime environ
 - **Sort results** — 按路径 / 修改时间（最新在前）/ 大小（最大在前）
 - **Search-stage pruning** — 类型/后缀在遍历阶段就剪枝，整机搜索不会去读无关文件
 - **System dir pruning** — 整机搜索默认跳过盘符下的 `Windows` / `Program Files` / `ProgramData` / 回收站等系统目录（设置里可开关，只认盘符根下两层，不会误伤项目里的同名文件夹）
+- **Whole-drive index (MCP)** — MCP server 常驻内存的文件名索引 + 磁盘缓存，整盘搜索从 19s 降到 0.1s，见 [整盘索引](#整盘索引)
 - **Keyboard navigation** — ↑/↓ 选中结果、Enter 直接打开（无结果时 Enter 触发搜索）
 - **Modified time & size** — 每条文件结果显示修改时间和大小
 - **Binary file detection** — automatically skips binary files, no garbage output
@@ -108,22 +109,42 @@ claude mcp add rust-seek -- "F:\path\to\rust-seek.exe" --mcp
 
 | 工具 | 作用 | 关键参数 |
 |------|------|----------|
-| `search_files` | 按文件名/路径找文件，返回绝对路径 + 大小 + 修改时间 | `pattern`、`roots`、`exts`、`max_results`（默认 100） |
+| `search_files` | 按文件名/路径找文件，返回绝对路径 + 大小 + 修改时间 | `pattern`、`roots`、`exts`、`max_results`（默认 100）、`refresh_index` |
 | `search_text` | 按内容找（ripgrep 语义，并行、跳二进制、跳大文件） | `pattern`、`roots`、`exts`、`max_files`（默认 50）、`max_matches_per_file` |
 | `list_drives` | 列出可搜索的本地磁盘 | — |
 
-`roots` 省略时搜索所有本地磁盘；`pattern` 默认按正则解释，`regex: false` 走纯文本子串。
+`roots` 省略时搜索 MCP server 的工作目录（客户端通常把它设成当前项目），
+传 `["C:/","D:/",…]` 才是整盘；`pattern` 默认按正则解释，`regex: false` 走纯文本子串。
+
+### 整盘索引
+
+整盘遍历受磁盘元数据 I/O 限制，本机 250 万条目约 **19s**，而且**第二遍一样慢**
+（Windows 不会把全部目录元数据留在缓存里）。所以 MCP server 会在首次整盘查询时
+在后台建一份文件名索引，之后的同类查询直接走内存：
+
+| 场景 | 耗时 |
+|------|------|
+| 首次整盘查询（索引在建，本次走遍历） | 受 `budget_ms` 限制，默认 10s 返回部分结果 |
+| 索引就绪后，同进程再查 | **0.08–0.12s**（160 万条目全扫） |
+| 进程重启后首次查询（从磁盘缓存载入） | **0.12s** |
+| 项目内查询（不走索引） | < 10ms |
+
+- 缓存位置 `%LOCALAPPDATA%\rust-seek\index-v1.bin`（约 213MB），24 小时后自动后台刷新，7 天后强制重建
+- 常驻内存约 220MB；只存文件（不存目录），剪枝规则和普通搜索一致，所以结果集相同
+- `refresh_index: true` 强制重建，本次调用仍走遍历
+- 响应里的 `source`（`index` / `walk`）、`index_age_ms`、`index_entries` 说明数据来源与新鲜度
 
 ### 为速度做的取舍
 
-- **命中上限一到就掐断遍历**：`max_results` / `max_files` 满足后返回 `WalkState::Quit`，不等全盘走完
-- **整棵剪枝**：默认用 `WalkState::Skip` 跳过 `node_modules`、`.git`、`target`、`__pycache__`、`WinSxS`、回收站等，可用 `skip_dirs` 追加
+- **命中上限一到就掐断遍历**：`max_results` / `max_files` 满足后返回 `Step::Quit`，不等全盘走完
+- **整棵剪枝**：默认跳过 `node_modules`、`.git`、`target`、`__pycache__`、`WinSxS`、回收站等，可用 `skip_dirs` 追加
 - **系统目录默认剪掉**：盘符下的 `C:\Windows`、`Program Files`、`ProgramData` 等大头目录整棵跳过，`prune_system: false` 可关闭
-- **不跟随符号链接**：元数据取遍历器缓存的 `symlink_metadata`，碰到失效 junction 不会卡在 SMB 超时上
+- **不跟随符号链接**：碰到失效 junction 不会卡在 SMB 超时上
+- **时间预算**：`budget_ms`（默认 10000，0 为不限）到期返回部分结果并标 `timed_out: true`，不让 Agent 干等
 - 响应自带 `scanned` / `elapsed_ms` / `truncated`，模型能判断结果是否被截断
 
 实测（本机 4 盘、约 250 万条目）：源目录内 `search_text` 约 **7ms**；F 盘搜文件名取 3 条 **236ms**（扫 8.4 万条后提前退出）；
-全盘无命中项时约 **23s**（必须扫完才能确定没有）。
+整盘索引就绪后任意文件名查询 **0.1s 量级**；整盘无索引冷启扫描约 **19s**。
 
 ---
 
@@ -180,6 +201,8 @@ src/
 ├── main.rs         # Entry point, window setup
 ├── app.rs          # GUI logic (egui), search orchestration, result rendering
 ├── integration.rs  # System integration: global hotkey, tray, autostart, taskbar search toggle
+├── fastwalk.rs     # Parallel directory walk: FindFirstFileExW + FIND_FIRST_EX_LARGE_FETCH on Windows
+├── index.rs        # In-memory whole-drive name index + on-disk cache, used by the MCP server
 ├── mcp.rs          # MCP server (`--mcp`): stdio JSON-RPC, tool schemas, walk orchestration
 └── searcher.rs     # Core search engine: mmap I/O, regex matching, binary detection
 ```
@@ -187,7 +210,8 @@ src/
 | Component | Technology | Why |
 |-----------|-----------|-----|
 | GUI framework | `egui` / `eframe` | Immediate-mode, native, no Electron |
-| Directory traversal | `ignore` | Same crate as ripgrep, parallel + gitignore-aware |
+| Directory traversal | Win32 `FindFirstFileExW` (fallback: `ignore`) | 一条记录不再一次系统调用，文件名/大小/时间一次带回 |
+| Whole-drive index | `std::sync` + flat string arena | 常驻进程重复整盘搜索从 19s 降到 0.1s |
 | File reading | `memmap2` | OS-level memory mapping for large files |
 | Pattern matching | `regex` | Rust's standard regex engine, DFA-based, very fast |
 | Folder dialog | `rfd` | Native OS file picker |

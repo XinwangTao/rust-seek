@@ -1,10 +1,10 @@
+use crate::fastwalk::{self, Step};
 use crate::integration;
 use crate::searcher::{
     path_in_noise_dir, path_is_system_root, search_file, search_filename_meta, SearchResult,
 };
 use eframe::egui;
 use egui::{Color32, RichText, ScrollArea, TextEdit, Ui};
-use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -525,73 +525,51 @@ impl App {
         let exts = self.ext_filter_active();
         // 整机搜索时跳过系统目录里的条目；用户手动指定目录时不干预
         let prune_system = self.prefs.prune_system && matches!(self.scope, Scope::Machine);
-        let visited = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let walk_roots: Vec<std::path::PathBuf> =
+            roots.iter().map(std::path::PathBuf::from).collect();
 
         thread::spawn(move || {
             let start = Instant::now();
-            let mut builder = WalkBuilder::new(&roots[0]);
-            for r in &roots[1..] {
-                builder.add(r);
-            }
-            builder
-                .hidden(true)
-                .git_ignore(false)
-                .ignore(false)
-                .threads(threads);
-            let walker = builder.build_parallel();
-
-            walker.run(|| {
-                let tx = tx.clone();
-                let re = re.clone();
-                let cancelled = cancelled.clone();
-                let exts = exts.clone();
-                let visited = visited.clone();
-                Box::new(move |entry| {
-                    if cancelled.load(Ordering::Relaxed) { return ignore::WalkState::Quit; }
-                    let entry = match entry { Ok(e) => e, Err(_) => return ignore::WalkState::Continue };
-                    visited.fetch_add(1, Ordering::Relaxed);
-                    // 回收站 / 系统还原 / WinSxS，以及盘符下的 Windows、Program Files 等大头目录：
-                    // 命中的是目录就整棵剪掉，否则这些目录会被逐条遍历，白白拖慢整机搜索
-                    // （还会刷一堆拒绝访问错误）。depth == 0 是用户给的根，不剪。
-                    if prune_system
-                        && entry.depth() > 0
-                        && (path_in_noise_dir(entry.path()) || path_is_system_root(entry.path()))
-                    {
-                        return if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                            ignore::WalkState::Skip
-                        } else {
-                            ignore::WalkState::Continue
-                        };
+            let opts = fastwalk::Options { include_hidden: false, threads };
+            let visited = fastwalk::walk(&walk_roots, &opts, &cancelled, |path, info| {
+                // 回收站 / 系统还原 / WinSxS，以及盘符下的 Windows、Program Files 等大头目录：
+                // 命中的是目录就整棵剪掉，否则这些目录会被逐条遍历，白白拖慢整机搜索。
+                // depth == 0 是用户给的根，不剪。
+                if prune_system
+                    && info.depth > 0
+                    && (path_in_noise_dir(path) || path_is_system_root(path))
+                {
+                    return if info.is_dir { Step::Skip } else { Step::Continue };
+                }
+                // 类型/后缀预筛：在读取文件之前剪枝，整机搜索才不会白读全盘
+                if !exts.is_empty() {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    if !exts.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+                        return Step::Continue;
                     }
-                    // 类型/后缀预筛：在读取文件之前剪枝，整机搜索才不会白读全盘
-                    if !exts.is_empty() {
-                        let ext = entry.path().extension().and_then(|e| e.to_str()).unwrap_or("");
-                        if !exts.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
-                            return ignore::WalkState::Continue;
-                        }
+                }
+                let result = match mode {
+                    // 大小/时间直接用目录枚举带回的，命中时零系统调用
+                    SearchMode::Filename => {
+                        search_filename_meta(path, &re, || Some((info.size, info.modified)))
                     }
-                    let result = match mode {
-                        // 元数据用遍历器已缓存的（symlink_metadata），避免整机遍历时
-                        // 跟随 junction 去 stat 失效网络路径而卡死
-                        SearchMode::Filename => {
-                            search_filename_meta(entry.path(), &re, entry.metadata().ok())
+                    SearchMode::Text => {
+                        if info.is_dir {
+                            return Step::Continue;
                         }
-                        SearchMode::Text => {
-                            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
-                                return ignore::WalkState::Continue;
-                            }
-                            search_file(entry.path(), &re, 10 * 1024 * 1024).ok().flatten()
-                        }
-                    };
-                    if let Some(r) = result {
-                        if tx.send(SearchMsg::Result(r)).is_err() { return ignore::WalkState::Quit; }
+                        search_file(path, &re, 10 * 1024 * 1024).ok().flatten()
                     }
-                    ignore::WalkState::Continue
-                })
+                };
+                if let Some(r) = result {
+                    if tx.send(SearchMsg::Result(r)).is_err() {
+                        return Step::Quit;
+                    }
+                }
+                Step::Continue
             });
             let _ = tx.send(SearchMsg::Done {
                 ms: start.elapsed().as_millis(),
-                visited: visited.load(Ordering::Relaxed),
+                visited,
                 scope: scope_label,
             });
         });
