@@ -1,6 +1,6 @@
 [package]
 name = "rust-seek"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A high-performance file and text search tool"
 
@@ -18,6 +18,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "5"
 encoding_rs = "0.8.35"
+global-hotkey = "0.9.0"
+tray-icon = "0.26.1"
+winreg = "0.56.0"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 
 [profile.release]
 opt-level = 3

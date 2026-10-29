@@ -20,9 +20,24 @@ pub struct SearchResult {
     pub icon: &'static str,
     pub matches: Vec<Match>,
     pub file_size: u64,
+    pub modified: Option<std::time::SystemTime>,
 }
 
+#[allow(dead_code)]
 pub fn search_filename(path: &Path, pattern: &Regex) -> Option<SearchResult> {
+    let meta = std::fs::metadata(path).ok();
+    search_filename_meta(path, pattern, meta)
+}
+
+/// 用调用方给好的元数据。整机遍历时必须走这个：`fs::metadata` 会跟随符号链接，
+/// 碰到指向已失效网络路径的 junction 会阻塞到 SMB 超时，整个遍历因此停摆。
+/// `ignore::DirEntry::metadata()` 在 follow_links=false 时等价于 symlink_metadata，
+/// 本地取数、不跟随链接。
+pub fn search_filename_meta(
+    path: &Path,
+    pattern: &Regex,
+    meta: Option<std::fs::Metadata>,
+) -> Option<SearchResult> {
     let name = path.file_name()?.to_string_lossy();
     let ranges: Vec<(usize, usize)> = pattern
         .find_iter(name.as_ref())
@@ -31,9 +46,10 @@ pub fn search_filename(path: &Path, pattern: &Regex) -> Option<SearchResult> {
     if ranges.is_empty() { return None; }
     let (display_path, win_path) = make_paths(path);
     let icon = file_icon(&display_path);
-    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let file_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let modified = meta.and_then(|m| m.modified().ok());
     Some(SearchResult {
-        icon, win_path, path: display_path, file_size,
+        icon, win_path, path: display_path, file_size, modified,
         matches: vec![Match {
             line_num: 0, line: name.into_owned(), ranges,
             context_before: None, context_after: None,
@@ -65,7 +81,8 @@ pub fn search_file(path: &Path, pattern: &Regex, max_filesize: u64) -> Result<Op
     if matches.is_empty() { return Ok(None); }
     let (display_path, win_path) = make_paths(path);
     let icon = file_icon(&display_path);
-    Ok(Some(SearchResult { path: display_path, win_path, icon, matches, file_size: file_len }))
+    let modified = metadata.modified().ok();
+    Ok(Some(SearchResult { path: display_path, win_path, icon, matches, file_size: file_len, modified }))
 }
 
 /// Compute both display path (forward slash) and win_path (backslash) in one pass
