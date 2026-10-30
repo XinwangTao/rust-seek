@@ -104,7 +104,7 @@ fn tool_defs() -> Value {
 Traversal stops as soon as max_results matches are collected or budget_ms expires, so it never blocks for long. \
 roots defaults to the server's working directory (normally your project); pass roots like [\"C:/\",\"D:/\"] to search elsewhere or the whole machine. \
 node_modules/.git/target/WinSxS and drive-root system directories are pruned by default. \
-Whole-drive searches are served from an in-memory name index: the first such query starts building it in the background and falls back to a normal walk; once built, repeat queries come back in ~0.1-0.5s with source:\"index\".",
+Whole-drive searches are served from an in-memory name index: the first such query builds it in a single ~19s pass (answering the query in the same walk) instead of running a competing background walk; once built, repeat queries come back in ~0.1-0.5s with source:\"index\".",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -186,6 +186,44 @@ fn list_drives() -> String {
     json!({ "drives": drives }).to_string()
 }
 
+/// 把 index 命中序列化成 search_files 的索引结果 JSON（source:"index"）。
+fn files_index_result(
+    pattern: &str,
+    roots: &[String],
+    hits: Vec<index::Hit>,
+    entries: u64,
+    age_ms: u128,
+    full: bool,
+    elapsed: Duration,
+) -> String {
+    let mut files: Vec<Value> = hits
+        .into_iter()
+        .map(|h| {
+            json!({
+                "path": h.path,
+                "size": h.size,
+                "modified": h.modified().map(fmt_time),
+            })
+        })
+        .collect();
+    files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    let count = files.len();
+    json!({
+        "pattern": pattern,
+        "roots": roots,
+        "source": "index",
+        "index_entries": entries,
+        "index_age_ms": age_ms,
+        "index_state": index::status(),
+        "elapsed_ms": elapsed.as_millis(),
+        "truncated": full,
+        "timed_out": false,
+        "count": count,
+        "files": files,
+    })
+    .to_string()
+}
+
 fn run_search_files(args: &Value) -> Result<String, String> {
     let pattern = arg_str(args, "pattern").ok_or("missing required argument: pattern")?;
     let re = build_regex(&pattern, arg_bool(args, "regex", true), arg_bool(args, "case_sensitive", false))?;
@@ -206,15 +244,17 @@ fn run_search_files(args: &Value) -> Result<String, String> {
     let start = Instant::now();
 
     // 整盘查询优先走索引：只有剪枝参数与建索引时完全一致才用，保证结果集不变。
-    // 索引没建过时会先尝试磁盘缓存（约 0.2s），没有缓存才退回遍历并在后台建。
+    // 索引没建过时：先试磁盘缓存（约 0.2s）；真冷启动则一趟遍历同时建索引 + 答查询，
+    // 避免后台建索引与兜底遍历并发抢 I/O（否则首次整盘查询会慢到 ~55s）。
     // 子目录查询默认不走索引（可能要刚建的文件），传 use_index: true 才强制用。
+    let is_drive_query = roots_are_drives(&roots);
     if prune_system
         && !include_hidden
         && !extra_skip
-        && (roots_are_drives(&roots) || force_index)
+        && (is_drive_query || force_index)
     {
-        index::ensure_ready();
         if refresh {
+            index::ensure_ready();
             index::rebuild();
         } else {
             let budget = if budget_ms > 0 {
@@ -222,40 +262,42 @@ fn run_search_files(args: &Value) -> Result<String, String> {
             } else {
                 None
             };
+            // 真冷启动（无内存索引、无后台在建、无磁盘缓存）：一趟遍历建索引 + 答查询
+            if is_drive_query
+                && !index::is_ready()
+                && !index::is_building()
+                && !index::try_load()
+            {
+                if let Some((hits, entries)) = index::build_and_match(&re, &exts, max_results) {
+                    return Ok(files_index_result(
+                        &pattern,
+                        &roots,
+                        hits,
+                        entries,
+                        0,
+                        false,
+                        start.elapsed(),
+                    ));
+                }
+            }
+            index::ensure_ready();
             if let Some((hits, entries, age, full)) =
                 index::query(&re, &roots, &exts, max_results, budget)
             {
-                let mut files: Vec<Value> = hits
-                    .into_iter()
-                    .map(|h| {
-                        json!({
-                            "path": h.path,
-                            "size": h.size,
-                            "modified": h.modified().map(fmt_time),
-                        })
-                    })
-                    .collect();
-                files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
-                let count = files.len();
-                return Ok(json!({
-                    "pattern": pattern,
-                    "roots": roots,
-                    "source": "index",
-                    "index_entries": entries,
-                    "index_age_ms": age,
-                    "index_state": index::status(),
-                    "elapsed_ms": start.elapsed().as_millis(),
-                    "truncated": full,
-                    "timed_out": false,
-                    "count": count,
-                    "files": files,
-                })
-                .to_string());
+                return Ok(files_index_result(
+                    &pattern,
+                    &roots,
+                    hits,
+                    entries,
+                    age,
+                    full,
+                    start.elapsed(),
+                ));
             }
         }
     }
     // 整盘查询顺手把索引准备好，后续同类查询就只剩内存扫描
-    if roots_are_drives(&roots) || force_index {
+    if is_drive_query || force_index {
         index::ensure_ready();
     }
 
@@ -347,6 +389,14 @@ fn run_search_text(args: &Value) -> Result<String, String> {
         && !extra_skip
         && (roots_are_drives(&roots) || force_index)
     {
+        // 真冷启动：先同步建索引，再走候选（避免后台建索引与兜底遍历并发抢 I/O）
+        if roots_are_drives(&roots)
+            && !index::is_ready()
+            && !index::is_building()
+            && !index::try_load()
+        {
+            index::build_sync();
+        }
         index::ensure_ready();
         if let Some((cands, entries, age, cand_trunc)) = index::candidates(&roots, &exts, 200_000) {
             let (mut files, timed_out) =
