@@ -393,23 +393,25 @@ pub fn build_sync() -> bool {
     ok
 }
 
-/// 冷启动一趟遍历：同时建索引 + 按文件名答查询。返回 (命中, 索引条目数)。
+/// 冷启动一趟遍历：同时建索引 + 按文件名答查询。返回 (命中, 索引条目数, 是否超预算)。
 /// 只在整盘查询且索引缺失、无缓存、无后台在建时调用；失败返回 None，调用方照常退回遍历。
+/// `budget` 超时后停止收集命中（第三项返回 true），但索引条目仍会收全。
 pub fn build_and_match(
     re: &Regex,
     exts: &HashSet<String>,
     max: usize,
-) -> Option<(Vec<Hit>, u64)> {
+    budget: Option<Duration>,
+) -> Option<(Vec<Hit>, u64, bool)> {
     if BUILDING.swap(true, Ordering::SeqCst) {
         return None;
     }
-    let outcome = build_with_match(Some(re), Some(exts), max);
+    let outcome = build_with_match(Some(re), Some(exts), max, budget);
     let result = match outcome {
-        Some((index, hits)) => {
+        Some((index, hits, timed_out)) => {
             let entries = index.items.len() as u64;
             save_cache(&index);
             *lock() = Some(Box::new(index));
-            Some((hits, entries))
+            Some((hits, entries, timed_out))
         }
         None => None,
     };
@@ -433,16 +435,18 @@ fn now_unix() -> u64 {
 type RawItem = (Box<str>, u64, u64);
 
 fn build() -> Option<Index> {
-    build_with_match(None, None, 0).map(|(index, _)| index)
+    build_with_match(None, None, 0, None).map(|(index, _, _)| index)
 }
 
 /// 一趟遍历收集所有文件；`match_re` 为 Some 时同时按文件名答查询（冷启动合并用）。
 /// 匹配语义与 [`query`] 的 `match_item` 完全一致，保证「冷启动答的」和「之后索引查的」结果集相同。
+/// `budget` 超时后停止收集命中（第三项返回 true），但索引条目照常收全。
 fn build_with_match(
     match_re: Option<&Regex>,
     match_exts: Option<&HashSet<String>>,
     max: usize,
-) -> Option<(Index, Vec<Hit>)> {
+    budget: Option<Duration>,
+) -> Option<(Index, Vec<Hit>, bool)> {
     let roots: Vec<PathBuf> = integration::local_drives()
         .into_iter()
         .map(|d| PathBuf::from(format!("{d}/")))
@@ -451,6 +455,7 @@ fn build_with_match(
         return None;
     }
 
+    let started = Instant::now();
     let cancel = AtomicBool::new(false);
     let overflow = AtomicBool::new(false);
     let count = std::sync::atomic::AtomicUsize::new(0);
@@ -467,6 +472,7 @@ fn build_with_match(
     });
 
     let hits = Mutex::new(Vec::new());
+    let timed_out = AtomicBool::new(false);
     {
         let tx = tx.clone();
         fastwalk::walk(
@@ -474,6 +480,12 @@ fn build_with_match(
             &fastwalk::Options { include_hidden: false, threads: num_cpus::get() },
             &cancel,
             |path, info| {
+                // 预算超时后停止收集命中（索引条目仍照常收，见下方 tx.send）
+                if let Some(b) = budget {
+                    if started.elapsed() >= b {
+                        timed_out.store(true, Ordering::Relaxed);
+                    }
+                }
                 if info.depth > 0 && is_pruned(path) {
                     return if info.is_dir { Step::Skip } else { Step::Continue };
                 }
@@ -492,15 +504,17 @@ fn build_with_match(
 
                 // 冷启动答查询：按文件名匹配，语义与 query 的 match_item 一致
                 if let Some(re) = match_re {
-                    let name = path_str.rsplit('/').next().unwrap_or(&path_str);
-                    let ok = match match_exts {
-                        Some(exts) => exts.is_empty() || ext_matches(name, exts),
-                        None => true,
-                    };
-                    if ok && re.is_match(name) {
-                        let mut guard = hits.lock().unwrap();
-                        if guard.len() < max {
-                            guard.push(Hit { path: path_str.clone(), size: info.size, mtime });
+                    if !timed_out.load(Ordering::Relaxed) {
+                        let name = path_str.rsplit('/').next().unwrap_or(&path_str);
+                        let ok = match match_exts {
+                            Some(exts) => exts.is_empty() || ext_matches(name, exts),
+                            None => true,
+                        };
+                        if ok && re.is_match(name) {
+                            let mut guard = hits.lock().unwrap();
+                            if guard.len() < max {
+                                guard.push(Hit { path: path_str.clone(), size: info.size, mtime });
+                            }
                         }
                     }
                 }
@@ -543,7 +557,11 @@ fn build_with_match(
     }
 
     let index = Index { blob, items, built_unix: now_unix() };
-    Some((index, hits.into_inner().unwrap_or_default()))
+    Some((
+        index,
+        hits.into_inner().unwrap_or_default(),
+        timed_out.load(Ordering::Relaxed),
+    ))
 }
 
 /// 与搜索默认剪枝完全一致：盘符根下的系统大头目录 + 任意层级的噪声目录。

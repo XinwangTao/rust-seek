@@ -187,13 +187,15 @@ fn list_drives() -> String {
 }
 
 /// 把 index 命中序列化成 search_files 的索引结果 JSON（source:"index"）。
+#[allow(clippy::too_many_arguments)]
 fn files_index_result(
     pattern: &str,
     roots: &[String],
     hits: Vec<index::Hit>,
     entries: u64,
     age_ms: u128,
-    full: bool,
+    truncated: bool,
+    timed_out: bool,
     elapsed: Duration,
 ) -> String {
     let mut files: Vec<Value> = hits
@@ -216,8 +218,8 @@ fn files_index_result(
         "index_age_ms": age_ms,
         "index_state": index::status(),
         "elapsed_ms": elapsed.as_millis(),
-        "truncated": full,
-        "timed_out": false,
+        "truncated": truncated,
+        "timed_out": timed_out,
         "count": count,
         "files": files,
     })
@@ -268,14 +270,18 @@ fn run_search_files(args: &Value) -> Result<String, String> {
                 && !index::is_building()
                 && !index::try_load()
             {
-                if let Some((hits, entries)) = index::build_and_match(&re, &exts, max_results) {
+                if let Some((hits, entries, timed_out)) =
+                    index::build_and_match(&re, &exts, max_results, budget)
+                {
+                    let truncated = timed_out || hits.len() >= max_results;
                     return Ok(files_index_result(
                         &pattern,
                         &roots,
                         hits,
                         entries,
                         0,
-                        false,
+                        truncated,
+                        timed_out,
                         start.elapsed(),
                     ));
                 }
@@ -291,6 +297,7 @@ fn run_search_files(args: &Value) -> Result<String, String> {
                     entries,
                     age,
                     full,
+                    false,
                     start.elapsed(),
                 ));
             }
@@ -389,18 +396,21 @@ fn run_search_text(args: &Value) -> Result<String, String> {
         && !extra_skip
         && (roots_are_drives(&roots) || force_index)
     {
-        // 真冷启动：先同步建索引，再走候选（避免后台建索引与兜底遍历并发抢 I/O）
+        // 真冷启动：先同步建索引，再走候选（避免后台建索引与兜底遍历并发抢 I/O）。
+        // 建索引是固定成本，读文件阶段的预算从建完索引后重新计，否则 40s 建索引会吃光 budget_ms。
+        let mut search_start = start;
         if roots_are_drives(&roots)
             && !index::is_ready()
             && !index::is_building()
             && !index::try_load()
         {
             index::build_sync();
+            search_start = Instant::now();
         }
         index::ensure_ready();
         if let Some((cands, entries, age, cand_trunc)) = index::candidates(&roots, &exts, 200_000) {
             let (mut files, timed_out) =
-                search_text_candidates(&cands, &re, max_bytes, per_file, max_files, budget_ms, start);
+                search_text_candidates(&cands, &re, max_bytes, per_file, max_files, budget_ms, search_start);
             files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
             files.truncate(max_files);
             let count = files.len();
