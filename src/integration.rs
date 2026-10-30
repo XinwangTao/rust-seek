@@ -84,11 +84,15 @@ extern "system" {
     fn WaitForSingleObject(h: *mut core::ffi::c_void, ms: u32) -> u32;
     fn GetLastError() -> u32;
     fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+    fn IsIconic(hwnd: isize) -> i32;
     fn IsWindowVisible(hwnd: isize) -> i32;
     fn SetWindowPos(hwnd: isize, after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
     fn SetForegroundWindow(hwnd: isize) -> i32;
     fn GetForegroundWindow() -> isize;
     fn SetFocus(hwnd: isize) -> isize;
+    fn BringWindowToTop(hwnd: isize) -> i32;
+    fn AttachThreadInput(id_attach: u32, id_attach_to: u32, attach: i32) -> i32;
+    fn GetCurrentThreadId() -> u32;
     fn keybd_event(vk: u8, scan: u8, flags: u32, extra: usize);
     fn EnumWindows(cb: Option<extern "system" fn(isize, isize) -> i32>, lparam: isize) -> i32;
     fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
@@ -106,6 +110,7 @@ const EVENT_MODIFY_STATE: u32 = 0x0002;
 const INFINITE: u32 = 0xFFFF_FFFF;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const SW_HIDE: i32 = 0;
+const SW_RESTORE: i32 = 9;
 const SWP_NOSIZE: u32 = 0x0001;
 const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOZORDER: u32 = 0x0004;
@@ -151,12 +156,20 @@ pub fn foreground_window() -> isize {
     unsafe { GetForegroundWindow() }
 }
 
-/// 以底栏停靠姿态显示主窗口并抢焦点（模拟按下 Alt 是绕过前台锁的通行做法）。
+/// 以底栏停靠姿态显示主窗口并抢焦点。
+///
+/// Windows 前台锁（foreground lock）会拦下后台进程的 `SetForegroundWindow`，导致热键唤出时
+/// 窗口只闪烁任务栏、不浮到前台。这里用业界标准组合拳：恢复+置顶+显示 → AttachThreadInput
+/// 借用前台线程输入状态 → 抢前台 → 取消置顶；若仍被前台锁拒绝，再用 Alt 键兜底换取前台权限。
+/// 注意不能带 SWP_NOZORDER，否则 HWND_TOPMOST 会被忽略。
 pub fn win_show_launcher(hwnd: isize) {
     let pos = bottom_center_position(LAUNCHER_W, LAUNCHER_H);
     let (x, y) = pos.map(|(x, y)| (x as i32, y as i32)).unwrap_or((0, 0));
     unsafe {
-        // 先置顶再取消，保证窗口浮在当前前台之上
+        // 1) 若最小化先恢复，再置顶 + 显示 + 定位到停靠位
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
         SetWindowPos(
             hwnd,
             HWND_TOPMOST,
@@ -164,14 +177,40 @@ pub fn win_show_launcher(hwnd: isize) {
             y,
             LAUNCHER_W as i32,
             LAUNCHER_H as i32,
-            SWP_NOZORDER | SWP_SHOWWINDOW,
+            SWP_SHOWWINDOW,
         );
-        SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-        // 短暂按下并释放 Alt，使本进程获得设置前台窗口的许可
-        keybd_event(VK_MENU, 0, 0, 0);
-        keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
-        SetForegroundWindow(hwnd);
+
+        // 2) 把本线程输入队列并入前台线程，绕过前台锁的“最后输入”判定
+        let fg = GetForegroundWindow();
+        let fg_thread = if fg != 0 {
+            GetWindowThreadProcessId(fg, std::ptr::null_mut())
+        } else {
+            0
+        };
+        let this_thread = GetCurrentThreadId();
+        let attached = fg_thread != 0
+            && fg_thread != this_thread
+            && AttachThreadInput(this_thread, fg_thread, 1) != 0;
+
+        // 3) 抢前台并聚焦
+        let fg_ok = SetForegroundWindow(hwnd);
+        BringWindowToTop(hwnd);
         SetFocus(hwnd);
+
+        // 4) 前台锁拒绝时用 Alt 键兜底：模拟一次真实键盘输入换取前台权限
+        if fg_ok == 0 {
+            keybd_event(VK_MENU, 0, 0, 0);
+            keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+            SetForegroundWindow(hwnd);
+            SetFocus(hwnd);
+        }
+
+        if attached {
+            AttachThreadInput(this_thread, fg_thread, 0);
+        }
+
+        // 5) 取消置顶，避免面板常驻最上层
+        SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     }
 }
 
@@ -299,7 +338,9 @@ pub fn notify_existing_or_claim() -> bool {
     }
 }
 
-/// 主实例后台线程：其他实例发来“呼出”事件时直接切换窗口可见性。
+/// 主实例后台线程：其他实例发来“呼出”事件时呼出主窗口。
+/// 窗口隐藏、或可见但失焦/被遮挡时都置顶抢焦点；仅当窗口已在前台时不动，
+/// 避免误触发 pending_show 清空用户正在输入的查询。
 pub fn spawn_show_watcher(bridge: Arc<Bridge>) {
     thread::spawn(move || unsafe {
         let ev = wide(SHOW_EVENT);
@@ -312,7 +353,7 @@ pub fn spawn_show_watcher(bridge: Arc<Bridge>) {
                 return;
             }
             let hwnd = bridge.hwnd.load(Ordering::Relaxed);
-            if hwnd != 0 && !win_is_visible(hwnd) {
+            if hwnd != 0 && (!win_is_visible(hwnd) || foreground_window() != hwnd) {
                 bridge.show_panel();
             }
         }
