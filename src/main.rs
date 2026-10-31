@@ -1,6 +1,7 @@
 mod app;
 mod clipboard;
 mod fastwalk;
+mod icon;
 mod index;
 mod integration;
 mod mcp;
@@ -22,12 +23,16 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let start_hidden = std::env::args().any(|a| a == "--hidden");
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Rust Seek")
+        .with_inner_size([900.0, 600.0])
+        .with_min_inner_size([600.0, 400.0])
+        .with_visible(!start_hidden);
+    if let Some(icon) = icon::egui_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Rust Seek")
-            .with_inner_size([900.0, 600.0])
-            .with_min_inner_size([600.0, 400.0])
-            .with_visible(!start_hidden),
+        viewport,
         ..Default::default()
     };
     eframe::run_native("Rust Seek", options, Box::new(move |cc| {

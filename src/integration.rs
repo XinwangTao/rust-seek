@@ -506,7 +506,9 @@ pub fn setup_tray(hotkey_label: &str, clip_label: Option<&str>, bridge: Arc<Brid
     let quit_item = MenuItem::new("退出", true, None);
     let _ = menu.append(&quit_item);
 
-    let icon = tray_icon::Icon::from_rgba(tray_rgba(), 32, 32).map_err(|e| e.to_string())?;
+    let (icon_rgba, icon_w, icon_h) =
+        crate::icon::rgba().unwrap_or_else(|| (tray_rgba(), 32, 32));
+    let icon = tray_icon::Icon::from_rgba(icon_rgba, icon_w, icon_h).map_err(|e| e.to_string())?;
     let tray = tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("Rust Seek — 文件/文本搜索")
@@ -576,7 +578,7 @@ pub fn setup_tray(hotkey_label: &str, clip_label: Option<&str>, bridge: Arc<Brid
     })
 }
 
-/// 程序化绘制 32×32 放大镜托盘图标（避免引入 image 依赖）。
+/// 回退用：程序化绘制 32×32 放大镜托盘图标（`assets/rust-seek-64.png` 解码失败时才用）。
 fn tray_rgba() -> Vec<u8> {
     const S: usize = 32;
     const SS: u32 = 3; // 3×3 超采样抗锯齿
