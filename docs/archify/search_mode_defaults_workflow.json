@@ -1,0 +1,102 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Rust Seek 搜索匹配口径（文件名默认纯文本）",
+    "locale": "zh-CN",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    { "id": "io", "label": "输入与执行" },
+    { "id": "filename", "label": "文件名口径" },
+    { "id": "textmode", "label": "文本口径" }
+  ],
+  "mainPath": ["keyword", "mode", "fname", "match", "result"],
+  "nodes": [
+    {
+      "id": "keyword",
+      "lane": "io",
+      "col": 0,
+      "type": "frontend",
+      "label": "输入关键词",
+      "sublabel": "粘贴文件名 / 标题",
+      "width": 130
+    },
+    {
+      "id": "mode",
+      "lane": "io",
+      "col": 1,
+      "type": "backend",
+      "label": "模式判定",
+      "sublabel": "文件名 / 文本内容",
+      "width": 126
+    },
+    {
+      "id": "fcheck",
+      "lane": "io",
+      "col": 3,
+      "type": "security",
+      "label": "勾选 F 覆盖",
+      "sublabel": "切模式复位默认",
+      "width": 132
+    },
+    {
+      "id": "match",
+      "lane": "io",
+      "col": 4,
+      "type": "backend",
+      "label": "执行匹配",
+      "sublabel": "纯文本 = 转义后比对",
+      "width": 138
+    },
+    {
+      "id": "result",
+      "lane": "io",
+      "col": 5,
+      "type": "frontend",
+      "label": "结果列表",
+      "sublabel": "0 条也照常提示",
+      "width": 124
+    },
+    {
+      "id": "fname",
+      "lane": "filename",
+      "col": 2,
+      "type": "backend",
+      "label": "文件名匹配",
+      "sublabel": "默认纯文本",
+      "tag": "F 默认勾选",
+      "width": 132
+    },
+    {
+      "id": "text",
+      "lane": "textmode",
+      "col": 2,
+      "type": "backend",
+      "label": "文本内容匹配",
+      "sublabel": "默认正则",
+      "tag": "F 默认不勾",
+      "width": 136
+    }
+  ],
+  "edges": [
+    { "id": "keyword-mode", "from": "keyword", "to": "mode", "label": "回车 / 实时", "variant": "emphasis", "role": "main" },
+    { "id": "mode-fname", "from": "mode", "to": "fname", "label": "文件名", "variant": "emphasis", "role": "main" },
+    { "id": "mode-text", "from": "mode", "to": "text", "label": "文本内容", "variant": "default", "role": "branch" },
+    { "id": "fname-match", "from": "fname", "to": "match", "label": "纯文本", "variant": "emphasis", "role": "main" },
+    { "id": "text-match", "from": "text", "to": "match", "label": "正则", "variant": "default", "role": "branch" },
+    { "id": "fcheck-match", "from": "fcheck", "to": "match", "label": "手动覆盖默认", "variant": "dashed", "role": "branch" },
+    { "id": "match-result", "from": "match", "to": "result", "label": "命中 / 无命中", "variant": "emphasis", "role": "main" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "本次口径变更",
+      "items": [
+        "文件名模式：F（纯文本）默认勾选，粘贴带 ( ) + 的标题直接能搜到",
+        "文本内容模式：F 默认不勾，仍按正则；手动勾选覆盖，切模式复位默认",
+        "MCP 的 regex 参数不变；索引、范围、剪贴板均不动"
+      ]
+    }
+  ]
+}

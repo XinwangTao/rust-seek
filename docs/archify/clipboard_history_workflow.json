@@ -1,0 +1,208 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Rust Seek 剪切板历史流程",
+    "locale": "zh-CN",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    {
+      "id": "capture",
+      "label": "采集"
+    },
+    {
+      "id": "store",
+      "label": "存储"
+    },
+    {
+      "id": "use",
+      "label": "呼出与回填"
+    },
+    {
+      "id": "exception",
+      "label": "异常与隐私",
+      "variant": "exception"
+    }
+  ],
+  "mainPath": [
+    "copy",
+    "clip",
+    "listener",
+    "filter",
+    "store",
+    "panel",
+    "action"
+  ],
+  "nodes": [
+    {
+      "id": "copy",
+      "lane": "capture",
+      "col": 0,
+      "type": "external",
+      "label": "用户复制",
+      "sublabel": "任意程序",
+      "width": 118
+    },
+    {
+      "id": "clip",
+      "lane": "capture",
+      "col": 1,
+      "type": "external",
+      "label": "Windows 剪贴板",
+      "sublabel": "文本 / 位图",
+      "width": 132
+    },
+    {
+      "id": "listener",
+      "lane": "capture",
+      "col": 2,
+      "type": "backend",
+      "label": "剪贴板监听器",
+      "sublabel": "隐藏消息窗",
+      "tag": "WM_CLIPBOARDUPDATE",
+      "width": 136
+    },
+    {
+      "id": "filter",
+      "lane": "capture",
+      "col": 3,
+      "type": "backend",
+      "label": "过滤与去重",
+      "sublabel": "空 / 超长 / 连续重复",
+      "width": 136
+    },
+    {
+      "id": "store",
+      "lane": "store",
+      "col": 3,
+      "type": "database",
+      "label": "历史存储",
+      "sublabel": "history.json + images/",
+      "tag": "上限淘汰",
+      "width": 140
+    },
+    {
+      "id": "hotkey",
+      "lane": "use",
+      "col": 3,
+      "type": "backend",
+      "label": "Ctrl+Shift+V",
+      "sublabel": "全局热键",
+      "width": 120
+    },
+    {
+      "id": "panel",
+      "lane": "use",
+      "col": 4,
+      "type": "frontend",
+      "label": "历史面板",
+      "sublabel": "复用主搜索窗",
+      "tag": "搜索 + 预览",
+      "width": 132
+    },
+    {
+      "id": "action",
+      "lane": "use",
+      "col": 5,
+      "type": "frontend",
+      "label": "选中并写回",
+      "sublabel": "回车 · 不自动粘贴",
+      "width": 140
+    },
+    {
+      "id": "paused",
+      "lane": "exception",
+      "col": 3,
+      "type": "security",
+      "label": "暂停记录",
+      "sublabel": "托盘开关",
+      "width": 120
+    }
+  ],
+  "edges": [
+    {
+      "id": "copy-clip",
+      "from": "copy",
+      "to": "clip",
+      "label": "复制",
+      "variant": "emphasis",
+      "role": "main"
+    },
+    {
+      "id": "clip-listener",
+      "from": "clip",
+      "to": "listener",
+      "label": "WM_CLIPBOARDUPDATE",
+      "variant": "default",
+      "role": "main"
+    },
+    {
+      "id": "listener-filter",
+      "from": "listener",
+      "to": "filter",
+      "variant": "default",
+      "role": "main"
+    },
+    {
+      "id": "filter-store",
+      "from": "filter",
+      "to": "store",
+      "label": "追加 + 淘汰",
+      "variant": "emphasis",
+      "role": "main"
+    },
+    {
+      "id": "filter-paused",
+      "from": "filter",
+      "to": "paused",
+      "label": "已暂停",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "hotkey-panel",
+      "from": "hotkey",
+      "to": "panel",
+      "label": "呼出",
+      "variant": "emphasis",
+      "role": "main"
+    },
+    {
+      "id": "store-panel",
+      "from": "store",
+      "to": "panel",
+      "label": "读取历史",
+      "variant": "default",
+      "role": "main"
+    },
+    {
+      "id": "panel-action",
+      "from": "panel",
+      "to": "action",
+      "label": "浏览 · 选择",
+      "variant": "emphasis",
+      "role": "main"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "交互口径",
+      "items": [
+        "Ctrl+Shift+V 呼出面板并切到「剪切板」模式",
+        "↑/↓ 选择，Enter 只写回剪贴板，不自动粘贴；Esc 关闭；Del 删除当前条目",
+        "托盘「暂停记录剪切板」即时生效"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "存储与兜底（默认值待确认）",
+      "items": [
+        "%LOCALAPPDATA%\\rust-seek\\clipboard\\：history.json + images/*.png",
+        "上限 500 条文本 / 200 张图片，超出淘汰最旧；连续重复不新增；原子写",
+        "剪贴板被占用或图片过大：跳过本次，不影响搜索"
+      ]
+    }
+  ]
+}
