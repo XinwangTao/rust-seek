@@ -1,0 +1,102 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Rust Seek 索引不完整时的兜底遍历",
+    "locale": "zh-CN",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    { "id": "io", "label": "查询与响应" },
+    { "id": "decide", "label": "索引判定" },
+    { "id": "fallback", "label": "兜底补齐" }
+  ],
+  "mainPath": ["query", "index", "complete", "walk", "merge", "resp"],
+  "nodes": [
+    {
+      "id": "query",
+      "lane": "io",
+      "col": 0,
+      "type": "frontend",
+      "label": "搜索请求",
+      "sublabel": "search_files / 整机文件名",
+      "width": 142
+    },
+    {
+      "id": "index",
+      "lane": "io",
+      "col": 1,
+      "type": "backend",
+      "label": "取索引候选",
+      "sublabel": "index-v1.bin 内存索引",
+      "width": 140
+    },
+    {
+      "id": "hit",
+      "lane": "io",
+      "col": 3,
+      "type": "database",
+      "label": "索引命中",
+      "sublabel": "source: index",
+      "tag": "快路径",
+      "width": 128
+    },
+    {
+      "id": "resp",
+      "lane": "io",
+      "col": 4,
+      "type": "frontend",
+      "label": "响应",
+      "sublabel": "带 index_complete",
+      "width": 128
+    },
+    {
+      "id": "complete",
+      "lane": "decide",
+      "col": 2,
+      "type": "security",
+      "label": "索引完整？",
+      "sublabel": "complete 标记",
+      "width": 132
+    },
+    {
+      "id": "walk",
+      "lane": "fallback",
+      "col": 2,
+      "type": "backend",
+      "label": "真实遍历补齐",
+      "sublabel": "预算独立计时",
+      "tag": "默认 60s",
+      "width": 138
+    },
+    {
+      "id": "merge",
+      "lane": "fallback",
+      "col": 3,
+      "type": "backend",
+      "label": "合并去重",
+      "sublabel": "索引 + 遍历",
+      "width": 128
+    }
+  ],
+  "edges": [
+    { "id": "query-index", "from": "query", "to": "index", "label": "整盘查询", "variant": "emphasis", "role": "main" },
+    { "id": "index-complete", "from": "index", "to": "complete", "label": "查完整性", "variant": "emphasis", "role": "main" },
+    { "id": "complete-hit", "from": "complete", "to": "hit", "label": "完整", "variant": "default", "role": "branch" },
+    { "id": "complete-walk", "from": "complete", "to": "walk", "label": "被上限截断", "variant": "emphasis", "role": "main" },
+    { "id": "hit-resp", "from": "hit", "to": "resp", "label": "直接返回", "variant": "default", "role": "branch" },
+    { "id": "walk-merge", "from": "walk", "to": "merge", "label": "带种子遍历", "variant": "emphasis", "role": "main" },
+    { "id": "merge-resp", "from": "merge", "to": "resp", "label": "index+walk", "variant": "emphasis", "role": "main" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "本次修复的契约变化",
+      "items": [
+        "响应新增 index_complete：false 表示索引被条目上限截断，0 命中不再等于文件不存在",
+        "索引不完整且命中不足时回退真实遍历并合并，响应 source 为 index+walk",
+        "遍历预算从真正开始遍历时计时，不被前置建索引的 20-40s 吃光"
+      ]
+    }
+  ]
+}
