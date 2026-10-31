@@ -25,15 +25,31 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-/// 条目上限，防止在超大存储上把内存吃穿
-const MAX_ENTRIES: usize = 4_000_000;
+/// 条目上限默认值，防止在超大存储上把内存吃穿（800 万条 ≈ 600MB；每 100 万条约 75MB）。
+/// 可用 `RUST_SEEK_MAX_ENTRIES` 覆盖（调小省内存，或调大覆盖更大机器）。
+/// 撞上限时索引只覆盖部分目录，查询会回退真实遍历兜底，不会给出假阴性。
+const MAX_ENTRIES_DEFAULT: usize = 8_000_000;
+/// 缓存校验用的硬上限：即使当前配置调小，也不因此丢弃更大但合法的旧缓存
+const MAX_ENTRIES_CEIL: usize = 20_000_000;
 /// 缓存年龄超过这个值就在后台重建（旧索引继续服务）
 const TTL_SECS: u64 = 24 * 3600;
 /// 超过这个年龄的缓存直接不用，重新遍历
 const MAX_CACHE_AGE_SECS: u64 = 7 * 24 * 3600;
 
-const MAGIC: &[u8; 8] = b"RSKIDX\x02\x00";
-const HDR: usize = 32;
+/// 缓存格式 v3：header 从 32 扩到 40 字节，多一个 flags 位记录「索引是否完整」。
+/// 旧 v2 缓存因 MAGIC 不匹配自动作废，重新建一次即可。
+const MAGIC: &[u8; 8] = b"RSKIDX\x03\x00";
+const HDR: usize = 40;
+const FLAG_COMPLETE: u64 = 1 << 0;
+
+fn max_entries() -> usize {
+    std::env::var("RUST_SEEK_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 100_000)
+        .map(|n| n.min(MAX_ENTRIES_CEIL))
+        .unwrap_or(MAX_ENTRIES_DEFAULT)
+}
 const ITEM_BYTES: usize = 32;
 
 #[derive(Clone, Copy)]
@@ -51,6 +67,9 @@ struct Index {
     blob: String,
     items: Vec<Item>,
     built_unix: u64,
+    /// false = 构建时撞到条目上限提前收尾，这台机器有文件没进索引。
+    /// 查询方必须据此回退真实遍历，否则会拿到假阴性。
+    complete: bool,
 }
 
 static INDEX: Mutex<Option<Box<Index>>> = Mutex::new(None);
@@ -85,14 +104,16 @@ impl Index {
 /// 索引可用时按文件名匹配；不可用返回 None，调用方照常走目录遍历。
 ///
 /// `roots` 为空表示全盘；否则只扫这些前缀命中的条目（条目按路径排序，二分定位）。
-/// 返回 `(命中, 索引条目数, 索引年龄 ms, 是否提前结束)`。
+/// 返回 `(命中, 索引条目数, 索引年龄 ms, 是否提前结束, 索引是否完整)`。
+/// 最后一项为 false 时，命中为空/不足 **不能** 当作「文件不存在」，
+/// 调用方应回退遍历兜底（索引在条目上限处截断，剩余目录没进索引）。
 pub fn query(
     re: &Regex,
     roots: &[String],
     exts: &HashSet<String>,
     max: usize,
     budget: Option<Duration>,
-) -> Option<(Vec<Hit>, u64, u128, bool)> {
+) -> Option<(Vec<Hit>, u64, u128, bool, bool)> {
     let guard = lock();
     let index = guard.as_ref()?;
     let start = Instant::now();
@@ -159,18 +180,18 @@ pub fn query(
     }
 
     let age_ms = now_unix().saturating_sub(index.built_unix) as u128 * 1000;
-    Some((hits, index.items.len() as u64, age_ms, truncated))
+    Some((hits, index.items.len() as u64, age_ms, truncated, index.complete))
 }
 
 /// 只按扩展名 + 根目录取候选文件，不做名字/内容匹配。
 ///
 /// 给内容搜索用：整机遍历是 19s 的瓶颈，而按扩展名筛完通常只剩几千个文件，
-/// 先拿候选再逐个读，就绕开了遍历。返回 `(候选, 索引条目数, 索引年龄 ms, 是否被截断)`。
+/// 先拿候选再逐个读，就绕开了遍历。返回 `(候选, 索引条目数, 索引年龄 ms, 是否被截断, 索引是否完整)`。
 pub fn candidates(
     roots: &[String],
     exts: &HashSet<String>,
     max: usize,
-) -> Option<(Vec<Hit>, u64, u128, bool)> {
+) -> Option<(Vec<Hit>, u64, u128, bool, bool)> {
     let guard = lock();
     let index = guard.as_ref()?;
     let mut hits = Vec::new();
@@ -228,7 +249,7 @@ pub fn candidates(
     }
 
     let age_ms = now_unix().saturating_sub(index.built_unix) as u128 * 1000;
-    Some((hits, index.items.len() as u64, age_ms, truncated))
+    Some((hits, index.items.len() as u64, age_ms, truncated, index.complete))
 }
 
 fn match_item(
@@ -393,25 +414,26 @@ pub fn build_sync() -> bool {
     ok
 }
 
-/// 冷启动一趟遍历：同时建索引 + 按文件名答查询。返回 (命中, 索引条目数, 是否超预算)。
+/// 冷启动一趟遍历：同时建索引 + 按文件名答查询。
+/// 返回 `(命中, 索引条目数, 索引是否完整)`。
 /// 只在整盘查询且索引缺失、无缓存、无后台在建时调用；失败返回 None，调用方照常退回遍历。
-/// `budget` 超时后停止收集命中（第三项返回 true），但索引条目仍会收全。
+/// 不套 `budget`：这一趟本来就要走完全盘来建索引，提前停止收集命中只会白丢结果。
 pub fn build_and_match(
     re: &Regex,
     exts: &HashSet<String>,
     max: usize,
-    budget: Option<Duration>,
 ) -> Option<(Vec<Hit>, u64, bool)> {
     if BUILDING.swap(true, Ordering::SeqCst) {
         return None;
     }
-    let outcome = build_with_match(Some(re), Some(exts), max, budget);
+    let outcome = build_with_match(Some(re), Some(exts), max);
     let result = match outcome {
-        Some((index, hits, timed_out)) => {
+        Some((index, hits)) => {
             let entries = index.items.len() as u64;
+            let complete = index.complete;
             save_cache(&index);
             *lock() = Some(Box::new(index));
-            Some((hits, entries, timed_out))
+            Some((hits, entries, complete))
         }
         None => None,
     };
@@ -435,18 +457,16 @@ fn now_unix() -> u64 {
 type RawItem = (Box<str>, u64, u64);
 
 fn build() -> Option<Index> {
-    build_with_match(None, None, 0, None).map(|(index, _, _)| index)
+    build_with_match(None, None, 0).map(|(index, _)| index)
 }
 
 /// 一趟遍历收集所有文件；`match_re` 为 Some 时同时按文件名答查询（冷启动合并用）。
 /// 匹配语义与 [`query`] 的 `match_item` 完全一致，保证「冷启动答的」和「之后索引查的」结果集相同。
-/// `budget` 超时后停止收集命中（第三项返回 true），但索引条目照常收全。
 fn build_with_match(
     match_re: Option<&Regex>,
     match_exts: Option<&HashSet<String>>,
     max: usize,
-    budget: Option<Duration>,
-) -> Option<(Index, Vec<Hit>, bool)> {
+) -> Option<(Index, Vec<Hit>)> {
     let roots: Vec<PathBuf> = integration::local_drives()
         .into_iter()
         .map(|d| PathBuf::from(format!("{d}/")))
@@ -455,10 +475,11 @@ fn build_with_match(
         return None;
     }
 
-    let started = Instant::now();
     let cancel = AtomicBool::new(false);
     let overflow = AtomicBool::new(false);
     let count = std::sync::atomic::AtomicUsize::new(0);
+    // 只读一次环境变量：闭包里每条文件查 env 太贵
+    let cap = max_entries();
 
     // 遍历回调是 `Fn + Sync` 且被所有线程共享：用 channel 单向下发，
     // 每条只做一次原子操作，避免 160 万次共享锁竞争。
@@ -472,7 +493,6 @@ fn build_with_match(
     });
 
     let hits = Mutex::new(Vec::new());
-    let timed_out = AtomicBool::new(false);
     {
         let tx = tx.clone();
         fastwalk::walk(
@@ -480,19 +500,13 @@ fn build_with_match(
             &fastwalk::Options { include_hidden: false, threads: num_cpus::get() },
             &cancel,
             |path, info| {
-                // 预算超时后停止收集命中（索引条目仍照常收，见下方 tx.send）
-                if let Some(b) = budget {
-                    if started.elapsed() >= b {
-                        timed_out.store(true, Ordering::Relaxed);
-                    }
-                }
                 if info.depth > 0 && is_pruned(path) {
                     return if info.is_dir { Step::Skip } else { Step::Continue };
                 }
                 if info.is_dir {
                     return Step::Continue;
                 }
-                if count.fetch_add(1, Ordering::Relaxed) >= MAX_ENTRIES {
+                if count.fetch_add(1, Ordering::Relaxed) >= cap {
                     overflow.store(true, Ordering::Relaxed);
                     return Step::Quit;
                 }
@@ -504,17 +518,15 @@ fn build_with_match(
 
                 // 冷启动答查询：按文件名匹配，语义与 query 的 match_item 一致
                 if let Some(re) = match_re {
-                    if !timed_out.load(Ordering::Relaxed) {
-                        let name = path_str.rsplit('/').next().unwrap_or(&path_str);
-                        let ok = match match_exts {
-                            Some(exts) => exts.is_empty() || ext_matches(name, exts),
-                            None => true,
-                        };
-                        if ok && re.is_match(name) {
-                            let mut guard = hits.lock().unwrap();
-                            if guard.len() < max {
-                                guard.push(Hit { path: path_str.clone(), size: info.size, mtime });
-                            }
+                    let name = path_str.rsplit('/').next().unwrap_or(&path_str);
+                    let ok = match match_exts {
+                        Some(exts) => exts.is_empty() || ext_matches(name, exts),
+                        None => true,
+                    };
+                    if ok && re.is_match(name) {
+                        let mut guard = hits.lock().unwrap();
+                        if guard.len() < max {
+                            guard.push(Hit { path: path_str.clone(), size: info.size, mtime });
                         }
                     }
                 }
@@ -529,8 +541,12 @@ fn build_with_match(
     }
     drop(tx);
     let mut raw = collector.join().ok()?;
-    if overflow.load(Ordering::Relaxed) {
-        eprintln!("rust-seek: index hit the {MAX_ENTRIES} entry cap, results may be incomplete");
+    let complete = !overflow.load(Ordering::Relaxed);
+    if !complete {
+        eprintln!(
+            "rust-seek: index hit the {} entry cap, results may be incomplete (fallback traversal will cover the rest; raise RUST_SEEK_MAX_ENTRIES to index more)",
+            cap
+        );
     }
     // 按路径排序：子目录查询靠二分定位区间，不用扫全表
     raw.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -556,12 +572,8 @@ fn build_with_match(
         });
     }
 
-    let index = Index { blob, items, built_unix: now_unix() };
-    Some((
-        index,
-        hits.into_inner().unwrap_or_default(),
-        timed_out.load(Ordering::Relaxed),
-    ))
+    let index = Index { blob, items, built_unix: now_unix(), complete };
+    Some((index, hits.into_inner().unwrap_or_default()))
 }
 
 /// 与搜索默认剪枝完全一致：盘符根下的系统大头目录 + 任意层级的噪声目录。
@@ -611,7 +623,10 @@ fn load_cache() -> Option<Index> {
     }
     let blob_len = u64::from_le_bytes(buf[16..24].try_into().ok()?) as usize;
     let count = u64::from_le_bytes(buf[24..32].try_into().ok()?) as usize;
-    if count > MAX_ENTRIES || HDR.checked_add(blob_len)?.checked_add(count * ITEM_BYTES)? != buf.len() {
+    let flags = u64::from_le_bytes(buf[32..40].try_into().ok()?);
+    if count > MAX_ENTRIES_CEIL
+        || HDR.checked_add(blob_len)?.checked_add(count * ITEM_BYTES)? != buf.len()
+    {
         return None;
     }
 
@@ -641,7 +656,12 @@ fn load_cache() -> Option<Index> {
         items.push(item);
     }
 
-    Some(Index { blob, items, built_unix })
+    Some(Index {
+        blob,
+        items,
+        built_unix,
+        complete: flags & FLAG_COMPLETE != 0,
+    })
 }
 
 fn save_cache(index: &Index) {
@@ -654,6 +674,8 @@ fn save_cache(index: &Index) {
     buf.extend_from_slice(&index.built_unix.to_le_bytes());
     buf.extend_from_slice(&(index.blob.len() as u64).to_le_bytes());
     buf.extend_from_slice(&(index.items.len() as u64).to_le_bytes());
+    let flags = if index.complete { FLAG_COMPLETE } else { 0 };
+    buf.extend_from_slice(&flags.to_le_bytes());
     buf.extend_from_slice(index.blob.as_bytes());
     for it in &index.items {
         buf.extend_from_slice(&it.path_off.to_le_bytes());

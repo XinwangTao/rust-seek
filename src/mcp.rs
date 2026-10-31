@@ -104,7 +104,8 @@ fn tool_defs() -> Value {
 Traversal stops as soon as max_results matches are collected or budget_ms expires, so it never blocks for long. \
 roots defaults to the server's working directory (normally your project); pass roots like [\"C:/\",\"D:/\"] to search elsewhere or the whole machine. \
 node_modules/.git/target/WinSxS and drive-root system directories are pruned by default. \
-Whole-drive searches are served from an in-memory name index: the first such query builds it in a single ~19s pass (answering the query in the same walk) instead of running a competing background walk; once built, repeat queries come back in ~0.1-0.5s with source:\"index\".",
+Whole-drive searches are served from an in-memory name index: the first such query builds it in a single ~19s pass (answering the query in the same walk) instead of running a competing background walk; once built, repeat queries come back in ~0.1-0.5s with source:\"index\". \
+The result carries index_complete; if the index hit its entry cap on a very large machine, the call automatically falls back to a real walk and merges both result sets (source:\"index+walk\", index_complete:false) instead of returning a false negative.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -187,6 +188,7 @@ fn list_drives() -> String {
 }
 
 /// 把 index 命中序列化成 search_files 的索引结果 JSON（source:"index"）。
+/// `complete=false` 表示索引在上限处截断，本次结果不可当作全量。
 #[allow(clippy::too_many_arguments)]
 fn files_index_result(
     pattern: &str,
@@ -196,6 +198,7 @@ fn files_index_result(
     age_ms: u128,
     truncated: bool,
     timed_out: bool,
+    complete: bool,
     elapsed: Duration,
 ) -> String {
     let mut files: Vec<Value> = hits
@@ -217,6 +220,7 @@ fn files_index_result(
         "index_entries": entries,
         "index_age_ms": age_ms,
         "index_state": index::status(),
+        "index_complete": complete,
         "elapsed_ms": elapsed.as_millis(),
         "truncated": truncated,
         "timed_out": timed_out,
@@ -233,6 +237,7 @@ fn run_search_files(args: &Value) -> Result<String, String> {
     let max_results = arg_usize(args, "max_results", 100, 1, 2000);
     let include_hidden = arg_bool(args, "include_hidden", false);
     let prune_system = arg_bool(args, "prune_system", true);
+    let budget_explicit = args.get("budget_ms").is_some();
     let budget_ms = arg_usize(args, "budget_ms", 10_000, 0, 600_000) as u128;
     let exts = lower_list(args, "exts");
     let skip = skip_set(args);
@@ -244,6 +249,10 @@ fn run_search_files(args: &Value) -> Result<String, String> {
     let force_index = arg_bool(args, "use_index", false);
 
     let start = Instant::now();
+
+    // 索引不完整（撞条目上限）且命中不足时的种子结果：先返回索引命中，
+    // 再继续走真实遍历补齐，避免「索引 ready 但文件没进索引」的假阴性。
+    let mut seed: Option<(Vec<index::Hit>, u64, u128)> = None;
 
     // 整盘查询优先走索引：只有剪枝参数与建索引时完全一致才用，保证结果集不变。
     // 索引没建过时：先试磁盘缓存（约 0.2s）；真冷启动则一趟遍历同时建索引 + 答查询，
@@ -265,41 +274,54 @@ fn run_search_files(args: &Value) -> Result<String, String> {
                 None
             };
             // 真冷启动（无内存索引、无后台在建、无磁盘缓存）：一趟遍历建索引 + 答查询
+            let mut seeded_from_build = false;
             if is_drive_query
                 && !index::is_ready()
                 && !index::is_building()
                 && !index::try_load()
             {
-                if let Some((hits, entries, timed_out)) =
-                    index::build_and_match(&re, &exts, max_results, budget)
+                if let Some((hits, entries, complete)) =
+                    index::build_and_match(&re, &exts, max_results)
                 {
-                    let truncated = timed_out || hits.len() >= max_results;
-                    return Ok(files_index_result(
-                        &pattern,
-                        &roots,
-                        hits,
-                        entries,
-                        0,
-                        truncated,
-                        timed_out,
-                        start.elapsed(),
-                    ));
+                    if complete || hits.len() >= max_results {
+                        let truncated = hits.len() >= max_results;
+                        return Ok(files_index_result(
+                            &pattern,
+                            &roots,
+                            hits,
+                            entries,
+                            0,
+                            truncated,
+                            false,
+                            complete,
+                            start.elapsed(),
+                        ));
+                    }
+                    seed = Some((hits, entries, 0));
+                    seeded_from_build = true;
                 }
             }
-            index::ensure_ready();
-            if let Some((hits, entries, age, full)) =
-                index::query(&re, &roots, &exts, max_results, budget)
-            {
-                return Ok(files_index_result(
-                    &pattern,
-                    &roots,
-                    hits,
-                    entries,
-                    age,
-                    full,
-                    false,
-                    start.elapsed(),
-                ));
+            if !seeded_from_build {
+                index::ensure_ready();
+                if let Some((hits, entries, age, full, complete)) =
+                    index::query(&re, &roots, &exts, max_results, budget)
+                {
+                    if complete || hits.len() >= max_results {
+                        return Ok(files_index_result(
+                            &pattern,
+                            &roots,
+                            hits,
+                            entries,
+                            age,
+                            full,
+                            false,
+                            complete,
+                            start.elapsed(),
+                        ));
+                    }
+                    // 索引被截断：留着当种子，下面遍历补齐后再合并
+                    seed = Some((hits, entries, age));
+                }
             }
         }
     }
@@ -311,15 +333,35 @@ fn run_search_files(args: &Value) -> Result<String, String> {
     let hits: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let timed_out = Arc::new(AtomicBool::new(false));
+    // 索引不完整时这次遍历是「补齐」而不是「整机搜索」：默认 10s 通常走不完
+    // 整盘（实测 ~40s），调用方没显式给 budget_ms 时放宽到 60s，宁可慢也别漏。
+    let walk_budget_ms =
+        if seed.is_some() && !budget_explicit { 60_000u128 } else { budget_ms };
+    let seen: Arc<Mutex<std::collections::HashSet<String>>> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let seed_meta = seed.as_ref().map(|(h, entries, age)| (h.len(), *entries, *age));
+    if let Some((seed_hits, _, _)) = &seed {
+        let mut hg = hits.lock().unwrap();
+        let mut sg = seen.lock().unwrap();
+        for h in seed_hits {
+            sg.insert(h.path.clone());
+            hg.push(json!({
+                "path": h.path,
+                "size": h.size,
+                "modified": h.modified().map(fmt_time),
+            }));
+        }
+    }
 
     let hits_c = hits.clone();
     let re_c = re.clone();
     let exts_c = exts.clone();
     let skip_c = skip.clone();
     let timeout_c = timed_out.clone();
+    let seen_c = seen.clone();
     let scanned = walk_roots(&roots, include_hidden, stop.clone(), move |path, info| {
         // 时间预算：宁可返回部分结果并标记 timed_out，也不让 Agent 干等十几秒
-        if budget_ms > 0 && start.elapsed().as_millis() >= budget_ms {
+        if walk_budget_ms > 0 && start.elapsed().as_millis() >= walk_budget_ms {
             timeout_c.store(true, Ordering::Relaxed);
             return Step::Quit;
         }
@@ -337,6 +379,13 @@ fn run_search_files(args: &Value) -> Result<String, String> {
         let Some(hit) = search_filename_meta(path, &re_c, || Some((info.size, info.modified))) else {
             return Step::Continue;
         };
+        // 索引种子已贡献过的路径不再重复推送
+        {
+            let mut sg = seen_c.lock().unwrap();
+            if !sg.insert(hit.path.clone()) {
+                return Step::Continue;
+            }
+        }
         let mut guard = hits_c.lock().unwrap();
         guard.push(json!({
             "path": hit.path,
@@ -353,7 +402,7 @@ fn run_search_files(args: &Value) -> Result<String, String> {
     let count = files.len();
     let timed_out = timed_out.load(Ordering::Relaxed);
 
-    Ok(json!({
+    let mut out = json!({
         "pattern": pattern,
         "roots": roots,
         "source": "walk",
@@ -364,8 +413,16 @@ fn run_search_files(args: &Value) -> Result<String, String> {
         "timed_out": timed_out,
         "count": count,
         "files": files,
-    })
-    .to_string())
+    });
+    if let Some((seeded, entries, age)) = seed_meta {
+        // 本次结果是「索引命中 + 遍历补齐」的并集；索引只覆盖了一部分目录
+        out["source"] = json!("index+walk");
+        out["index_entries"] = json!(entries);
+        out["index_age_ms"] = json!(age);
+        out["index_complete"] = json!(false);
+        out["seeded_from_index"] = json!(seeded);
+    }
+    Ok(out.to_string())
 }
 
 fn run_search_text(args: &Value) -> Result<String, String> {
@@ -408,27 +465,34 @@ fn run_search_text(args: &Value) -> Result<String, String> {
             search_start = Instant::now();
         }
         index::ensure_ready();
-        if let Some((cands, entries, age, cand_trunc)) = index::candidates(&roots, &exts, 200_000) {
-            let (mut files, timed_out) =
-                search_text_candidates(&cands, &re, max_bytes, per_file, max_files, budget_ms, search_start);
-            files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
-            files.truncate(max_files);
-            let count = files.len();
-            return Ok(json!({
-                "pattern": pattern,
-                "roots": roots,
-                "source": "index",
-                "index_entries": entries,
-                "index_age_ms": age,
-                "index_state": index::status(),
-                "scanned": cands.len(),
-                "elapsed_ms": start.elapsed().as_millis(),
-                "truncated": timed_out || cand_trunc || count >= max_files,
-                "timed_out": timed_out,
-                "count": count,
-                "files": files,
-            })
-            .to_string());
+        if let Some((cands, entries, age, cand_trunc, complete)) =
+            index::candidates(&roots, &exts, 200_000)
+        {
+            // 索引被条目上限截断时候选集不全，直接退回遍历，宁可慢也不给假阴性
+            if complete {
+                let (mut files, timed_out) = search_text_candidates(
+                    &cands, &re, max_bytes, per_file, max_files, budget_ms, search_start,
+                );
+                files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+                files.truncate(max_files);
+                let count = files.len();
+                return Ok(json!({
+                    "pattern": pattern,
+                    "roots": roots,
+                    "source": "index",
+                    "index_entries": entries,
+                    "index_age_ms": age,
+                    "index_state": index::status(),
+                    "index_complete": true,
+                    "scanned": cands.len(),
+                    "elapsed_ms": start.elapsed().as_millis(),
+                    "truncated": timed_out || cand_trunc || count >= max_files,
+                    "timed_out": timed_out,
+                    "count": count,
+                    "files": files,
+                })
+                .to_string());
+            }
         }
     }
 
