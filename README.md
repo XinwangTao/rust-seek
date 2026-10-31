@@ -5,7 +5,7 @@
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue?logo=windows)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Version](https://img.shields.io/badge/version-4.7.0-brightgreen)
+![Version](https://img.shields.io/badge/version-4.9.0-brightgreen)
 
 ---
 
@@ -39,8 +39,9 @@ Most search tools are either too slow, too complex, or require a runtime environ
 ## 🚀 Features
 
 ### Search
-- **Regex search** by default — use any valid regular expression as your pattern
-- **Literal string mode** (`F` checkbox) — disable regex for exact text matching
+- **Plain-text filenames by default** — 文件名模式默认按纯文本匹配（`F` 默认勾选），粘贴带 `( ) + . [ ]` 的标题/文件名直接能搜到；要正则就取消 `F`
+- **Regex search in text mode** — 文本内容模式默认按正则匹配（`F` 默认不勾），可用任意合法正则
+- **Literal string mode** (`F` checkbox) — 当前模式的覆盖开关：勾上 = 纯文本，取消 = 正则；切换模式或重启会回到该模式的默认
 - **Case-insensitive mode** (`Aa` checkbox) — match regardless of letter case
 - **Search scope** — 整机（所有本地磁盘，默认）/ 单个磁盘（`C:` `D:` …）/ 指定目录，顶部一键切换
 - **File type filter** — 按「类型」分组过滤（文档 / 图片 / 视频 / 音频 / 代码 / 压缩包），或直接在「后缀」框输入 `rs,toml`（自定义后缀优先于类型）
@@ -89,6 +90,22 @@ Rust Seek 把系统底栏（任务栏）的搜索接管过来，以「系统式�
 > 热键接管 + 原生框隐藏 + 无边框面板是系统层面的极限做法，最终体验与系统搜索一致。
 
 设置入口：面板右下角 **⚙**。隐藏搜索框需重启资源管理器（设置里有按钮）生效。
+
+---
+
+## 📋 剪切板历史
+
+同一个面板、同一套键盘操作，按 `Ctrl+Shift+V` 切换到「剪切板历史」，把复制过的文本和截图找回来：
+
+- **自动记录** — 监听系统剪贴板，文本与图片（截图/复制的图片）都入库；连续复制同一内容只留 1 条
+- **搜索过滤** — 面板顶部输入框按关键字过滤历史，图片按「图片 / image / 宽高」匹配
+- **选中即复制** — ↑/↓ 选择，`Enter` 把内容写回系统剪贴板（**不自动粘贴**），到目标程序 `Ctrl+V` 即可
+- **单条删除** — `Del` 删除选中条目（图片连文件一起删），重启后仍生效
+- **暂停记录** — 面板内「暂停记录」勾选框 / 托盘同名菜单项，一键停止入库（隐私场景）
+- **容量自限** — 文本 500 条、图片 200 张，超出淘汰最旧；`history.json` + `images/*.png` 存于 `%LOCALAPPDATA%\rust-seek\clipboard\`，原子写、可直接查看清理
+- **热键兜底** — `Ctrl+Shift+V` 被占用时自动降级 `Ctrl+Alt+V`（托盘菜单显示实际热键）；热键失效也能从托盘「剪切板历史」进入
+
+> 关闭面板：`Esc` 或点别处（与搜索面板一致，300ms 失焦收起）。
 
 ---
 
@@ -146,13 +163,17 @@ claude mcp add rust-seek -- "F:\path\to\rust-seek.exe" --mcp
 
 - 缓存位置 `%LOCALAPPDATA%\rust-seek\index-v1.bin`（约 213MB），24 小时后自动后台刷新，7 天后强制重建
 - 常驻内存约 220MB；只存文件（不存目录），剪枝规则和普通搜索一致，所以结果集相同
+- **索引有条目上限（默认 800 万，`RUST_SEEK_MAX_ENTRIES` 可调）**：超大机器撞上限时索引只能覆盖一部分目录，
+  响应里 `index_complete: false`。此时整盘查询会自动回退真实遍历并合并两边结果（`source: "index+walk"`），
+  不会把「索引里没有」当成「文件不存在」；回调没显式给 `budget_ms` 时这条兜底遍历的预算放宽到 60s。
+  想把上限调小省内存（每 100 万条约 75MB）就设 `RUST_SEEK_MAX_ENTRIES`。
 - 条目按路径排序，子目录查询用二分定位区间，只扫那一段：`use_index: true` 可让任意大目录也走索引
 - **整盘内容搜索也走索引**：`search_text` 的 `roots` 是盘符根且带 `exts` 时，先从索引取候选文件
   （按扩展名筛，通常只剩几千个），再并行读这些文件，跳过十几秒的目录遍历。
   实测 F 盘搜 `.tex` 内容：遍历 **12.0s** → 索引 **0.32s**（92 个候选文件）
 - GUI 的「整机 + 文件名」搜索同样走索引（状态栏标「· 索引」）；单盘 / 指定目录仍走遍历（那两种范围不剪系统目录，语义不同）
 - `refresh_index: true` 强制重建，本次调用仍走遍历
-- 响应里的 `source`（`index` / `walk`）、`index_age_ms`、`index_entries` 说明数据来源与新鲜度
+- 响应里的 `source`（`index` / `index+walk` / `walk`）、`index_age_ms`、`index_entries`、`index_complete` 说明数据来源、新鲜度与覆盖范围
 
 ### 为速度做的取舍
 
