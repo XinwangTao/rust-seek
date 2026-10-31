@@ -1,3 +1,4 @@
+use crate::clipboard::{self, ClipKind, ClipSummary};
 use crate::fastwalk::{self, Step};
 use crate::index;
 use crate::integration;
@@ -10,7 +11,7 @@ use regex::RegexBuilder;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,63 @@ enum SearchMsg {
     Result(SearchResult),
     /// 结束：耗时、遍历到的条目数、实际搜索范围（便于看清整机到底搜了哪些盘）
     Done { ms: u128, visited: u64, scope: String },
+}
+
+/// 主面板视图：文件搜索 / 剪切板历史（Ctrl+Shift+V 直接进入后者）
+#[derive(PartialEq, Clone, Copy)]
+enum PanelView {
+    Search,
+    Clipboard,
+}
+
+/// 剪切板面板的 UI 状态（历史本体在监听线程的 Store 里）
+struct ClipUi {
+    store: Arc<Mutex<clipboard::Store>>,
+    rx: Receiver<()>,
+    summaries: Vec<ClipSummary>,
+    textures: std::collections::HashMap<u64, egui::TextureHandle>,
+    filter: String,
+    selected: usize,
+    status: String,
+    focus_filter: bool,
+    /// 搜索框是否持有焦点（持有时 Del 不删条目，避免和文本编辑冲突）
+    filter_focused: bool,
+}
+
+/// 剪切板面板的延迟动作（在 UI 闭包内收集、闭包外执行）
+enum ClipAction {
+    Restore(u64),
+    Delete(u64),
+}
+
+impl ClipUi {
+    fn refresh(&mut self) {
+        if let Ok(store) = self.store.lock() {
+            self.summaries = store.summaries();
+        }
+        if self.selected >= self.summaries.len() {
+            self.selected = self.summaries.len().saturating_sub(1);
+        }
+        // 丢掉已删除条目的缩略图纹理
+        self.textures.retain(|id, _| self.summaries.iter().any(|s| s.id == *id));
+    }
+
+    /// 过滤后的列表下标（图片条目按「图片」关键字匹配）
+    fn visible(&self) -> Vec<usize> {
+        let q = self.filter.trim().to_lowercase();
+        if q.is_empty() {
+            return (0..self.summaries.len()).collect();
+        }
+        self.summaries
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| match s.kind {
+                ClipKind::Text => s.preview.to_lowercase().contains(&q),
+                ClipKind::Image => "图片 image png".contains(&q) || format!("{}x{}", s.width, s.height).contains(&q),
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
 }
 
 #[derive(PartialEq, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -247,6 +305,10 @@ pub struct App {
     autostart: bool,
     show_settings: bool,
     explorer_confirm: bool,
+    /// 当前面板视图（搜索 / 剪切板历史）
+    view: PanelView,
+    /// 剪切板历史面板状态
+    clip: ClipUi,
 }
 
 impl App {
@@ -267,9 +329,14 @@ impl App {
             s => s.clone(),
         };
         let file_kind = prefs.file_kind;
+        // 匹配口径（2026-10-31 确认）：文件名模式默认纯文本——文件名里的 ( ) + . [ ] 很常见，
+        // 按正则解释会静默搜不到（如「新机器做库（新库 + 入库审核）…」）；文本内容模式仍默认正则。
+        // F 不写进 prefs，每次启动按当前模式回到该模式的默认值。
+        let start_mode = prefs.last_mode.unwrap_or(SearchMode::Filename);
 
         // 与热键/托盘/唤出线程共享的桥
-        let bridge = Arc::new(integration::Bridge::new());
+        let clip_paused = Arc::new(AtomicBool::new(false));
+        let bridge = Arc::new(integration::Bridge::new(clip_paused.clone()));
         bridge.panel.store(prefs.dock_bottom, Ordering::Relaxed);
         // 全局热键（呼出/隐藏）
         let (hotkey, hotkey_error) = match integration::setup_hotkey(prefs.hotkey_preset, bridge.clone()) {
@@ -278,16 +345,42 @@ impl App {
         };
         // 托盘常驻
         let hotkey_label = hotkey.as_ref().map(|h| h.label).unwrap_or("Rust Seek");
-        let tray = integration::setup_tray(hotkey_label, bridge.clone()).ok();
+        let clip_label = hotkey.as_ref().and_then(|h| h.clip_label);
+        let tray = integration::setup_tray(hotkey_label, clip_label, bridge.clone()).ok();
         // 其他实例唤出事件
         integration::spawn_show_watcher(bridge.clone());
+
+        // 剪切板历史：监听线程 + 持久化存储（目录不可用时降级为临时目录，功能仍在）
+        let (clip_store, clip_rx) = match clipboard::default_dir() {
+            Some(dir) => {
+                let listener = clipboard::spawn(dir, clip_paused.clone());
+                (listener.store, listener.rx)
+            }
+            None => {
+                let tmp = std::env::temp_dir().join("rust-seek-clipboard");
+                let (_tx, rx) = mpsc::channel();
+                (Arc::new(Mutex::new(clipboard::Store::open(tmp))), rx)
+            }
+        };
+        let mut clip = ClipUi {
+            store: clip_store,
+            rx: clip_rx,
+            summaries: Vec::new(),
+            textures: std::collections::HashMap::new(),
+            filter: String::new(),
+            selected: 0,
+            status: String::new(),
+            focus_filter: false,
+            filter_focused: false,
+        };
+        clip.refresh();
 
         Self {
             pattern: String::new(),
             search_path: cwd,
             ignore_case: true,
-            fixed_string: false,
-            mode: prefs.last_mode.unwrap_or(SearchMode::Filename),
+            fixed_string: start_mode == SearchMode::Filename,
+            mode: start_mode,
             results: Vec::new(),
             total_matches: 0,
             result_capped: false,
@@ -332,6 +425,8 @@ impl App {
             autostart: integration::autostart_enabled(),
             show_settings: false,
             explorer_confirm: false,
+            view: PanelView::Search,
+            clip,
         }
         .with_active_preset()
     }
@@ -434,6 +529,14 @@ impl App {
     /// 消费外部事件（热键/托盘/其他实例）设置的桥接标志。
     /// 显示/隐藏本身由处理器用 Win32 直接完成，这里只做 egui 侧的善后。
     fn poll_bridge_events(&mut self) {
+        // 剪切板热键/托盘优先：切到剪切板面板并刷新历史。
+        // 先于 pending_show 判断——同一批事件里两者都置位时，不能先按 pending_show
+        // 清空关键词/结果再切视图，否则用户正在进行的搜索会被冲掉。
+        if self.bridge.clip_pending.swap(false, Ordering::Relaxed) {
+            self.bridge.pending_show.store(false, Ordering::Relaxed);
+            self.open_clipboard_view();
+            return;
+        }
         // 窗口刚被外部呼出：清空上一次查询，聚焦输入框
         if self.bridge.pending_show.swap(false, Ordering::Relaxed) {
             self.cancel_search();
@@ -444,7 +547,301 @@ impl App {
             self.filter.clear();
             self.status = "就绪".to_string();
             self.needs_focus = true;
+            self.view = PanelView::Search;
         }
+    }
+
+    /// 打开剪切板历史面板（Ctrl+Shift+V / 托盘菜单 / 状态栏按钮）
+    fn open_clipboard_view(&mut self) {
+        self.cancel_search();
+        self.clip.refresh();
+        self.clip.filter.clear();
+        self.clip.selected = 0;
+        self.clip.status.clear();
+        self.clip.focus_filter = true;
+        self.view = PanelView::Clipboard;
+    }
+
+    /// 剪切板面板的一帧：顶部搜索 + 中间列表 + 底部提示。
+    fn update_clipboard(&mut self, ctx: &egui::Context) {
+        // 监听线程有新条目：刷新快照（历史本体在 store 里，UI 只拿摘要）
+        while self.clip.rx.try_recv().is_ok() {
+            self.clip.refresh();
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.hide_window(ctx);
+            return;
+        }
+
+        // 与搜索面板一致的失焦自动收起
+        if self.prefs.dock_bottom {
+            let hwnd = self.bridge.hwnd.load(Ordering::Relaxed);
+            let window_visible = hwnd != 0 && integration::win_is_visible(hwnd);
+            if window_visible {
+                if integration::foreground_window() != hwnd {
+                    let since = *self.unfocused_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_millis(300) {
+                        self.unfocused_since = None;
+                        self.hide_window(ctx);
+                        return;
+                    }
+                } else {
+                    self.unfocused_since = None;
+                }
+                ctx.request_repaint_after(Duration::from_millis(200));
+            } else {
+                self.unfocused_since = None;
+            }
+        }
+
+        // 顶部：搜索 / 暂停记录 / 返回搜索
+        let mut back_to_search = false;
+        egui::TopBottomPanel::top("clip_toolbar").show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("📋 剪切板历史").strong());
+                let resp = ui.add(
+                    TextEdit::singleline(&mut self.clip.filter)
+                        .hint_text("搜索历史…")
+                        .desired_width(240.0),
+                );
+                if self.clip.focus_filter {
+                    resp.request_focus();
+                    self.clip.focus_filter = false;
+                }
+                self.clip.filter_focused = resp.has_focus();
+                if resp.changed() {
+                    self.clip.selected = 0;
+                }
+                if !self.clip.filter.is_empty() && ui.small_button("✕").clicked() {
+                    self.clip.filter.clear();
+                    self.clip.selected = 0;
+                }
+                ui.separator();
+                let mut paused = self.bridge.clip_paused.load(Ordering::Relaxed);
+                if ui.checkbox(&mut paused, "暂停记录").changed() {
+                    self.bridge.clip_paused.store(paused, Ordering::Relaxed);
+                    if let Some(tray) = self.tray.as_ref() {
+                        tray.clip_pause_item.set_checked(paused);
+                    }
+                }
+                if paused {
+                    ui.label(RichText::new("记录已暂停").color(Color32::from_rgb(255, 150, 0)).small());
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("🗂 返回搜索").on_hover_text("也可以按 Alt+Space").clicked() {
+                        back_to_search = true;
+                    }
+                });
+            });
+            ui.add_space(4.0);
+        });
+        if back_to_search {
+            self.view = PanelView::Search;
+            self.needs_focus = true;
+            return;
+        }
+
+        // 过滤后的下标表 + 键盘导航
+        let visible = self.clip.visible();
+        let (up, down, enter, del) = ctx.input(|i| (
+            i.key_pressed(egui::Key::ArrowUp),
+            i.key_pressed(egui::Key::ArrowDown),
+            i.key_pressed(egui::Key::Enter),
+            i.key_pressed(egui::Key::Delete),
+        ));
+        if !visible.is_empty() && (up || down) {
+            if self.clip.selected >= visible.len() {
+                self.clip.selected = visible.len() - 1;
+            }
+            self.clip.selected = if down {
+                (self.clip.selected + 1).min(visible.len() - 1)
+            } else {
+                self.clip.selected.saturating_sub(1)
+            };
+        }
+        let mut action: Option<ClipAction> = None;
+        if enter && !visible.is_empty() {
+            let pos = self.clip.selected.min(visible.len() - 1);
+            action = Some(ClipAction::Restore(self.clip.summaries[visible[pos]].id));
+        } else if del && (!self.clip.filter_focused || self.clip.filter.is_empty()) && !visible.is_empty() {
+            let pos = self.clip.selected.min(visible.len() - 1);
+            action = Some(ClipAction::Delete(self.clip.summaries[visible[pos]].id));
+        }
+
+        // 底部：状态与快捷键提示
+        egui::TopBottomPanel::bottom("clip_status").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let msg = if self.clip.status.is_empty() {
+                    format!(
+                        "共 {} 条 · ↑/↓ 选择 · Enter 复制回剪贴板 · Del 删除 · Esc 关闭",
+                        self.clip.summaries.len()
+                    )
+                } else {
+                    self.clip.status.clone()
+                };
+                ui.label(RichText::new(msg).color(Color32::GRAY).small());
+            });
+        });
+
+        // 中间：历史列表（只渲染可见行，图片缩略图按需解码）
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.clip.summaries.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        RichText::new("还没有历史：复制一段文本或一张图片后，按 Ctrl+Shift+V 回来")
+                            .color(Color32::GRAY),
+                    );
+                });
+                return;
+            }
+            if visible.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.label(RichText::new("没有匹配的历史条目").color(Color32::GRAY));
+                });
+                return;
+            }
+
+            let row_h = 62.0;
+            let mut click_select: Option<usize> = None;
+            let mut double_restore: Option<u64> = None;
+            let mut row_delete: Option<u64> = None;
+            ScrollArea::vertical().auto_shrink(false).show_rows(ui, row_h, visible.len(), |ui, range| {
+                for pos in range {
+                    let summary = self.clip.summaries[visible[pos]].clone();
+                    let is_selected = pos == self.clip.selected;
+                    let fill = if is_selected {
+                        ui.visuals().selection.bg_fill.gamma_multiply(0.35)
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    let inner = egui::Frame::default()
+                        .fill(fill)
+                        .inner_margin(egui::Margin::symmetric(6, 4))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let kind_tag = match summary.kind {
+                                    ClipKind::Text => "文本",
+                                    ClipKind::Image => "图片",
+                                };
+                                ui.label(RichText::new(kind_tag).color(Color32::GRAY).small());
+                                if summary.kind == ClipKind::Image {
+                                    if let Some(tex) = self.ensure_clip_texture(ctx, &summary) {
+                                        ui.image((tex, egui::vec2(48.0, 48.0)));
+                                    }
+                                }
+                                ui.vertical(|ui| {
+                                    ui.set_max_width((ui.available_width() - 40.0).max(120.0));
+                                    let preview = if summary.preview.is_empty() {
+                                        "（空）".to_string()
+                                    } else {
+                                        summary.preview.clone()
+                                    };
+                                    ui.label(RichText::new(preview).size(13.0));
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} · {}",
+                                            fmt_time_short(summary.created),
+                                            fmt_size(summary.bytes)
+                                        ))
+                                        .color(Color32::GRAY)
+                                        .small(),
+                                    );
+                                });
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("🗑").on_hover_text("删除这条").clicked() {
+                                        row_delete = Some(summary.id);
+                                    }
+                                });
+                            });
+                        });
+                    // Frame 自带的 response 只有 hover 语义，这里补一个可点击区域
+                    let row_resp = ui.interact(
+                        inner.response.rect,
+                        ui.id().with(("clip_row", summary.id)),
+                        egui::Sense::click(),
+                    );
+                    if row_resp.clicked() {
+                        click_select = Some(pos);
+                    }
+                    if row_resp.double_clicked() {
+                        double_restore = Some(summary.id);
+                    }
+                    ui.separator();
+                }
+            });
+
+            if let Some(pos) = click_select {
+                self.clip.selected = pos;
+            }
+            if let Some(id) = double_restore {
+                action = Some(ClipAction::Restore(id));
+            }
+            if let Some(id) = row_delete {
+                action = Some(ClipAction::Delete(id));
+            }
+        });
+
+        match action {
+            Some(ClipAction::Restore(id)) => self.restore_clip(ctx, id),
+            Some(ClipAction::Delete(id)) => self.delete_clip(id),
+            None => {}
+        }
+    }
+
+    /// 缩略图纹理：按需解码 + 降采样，避免把 4K 截图整张贴成 GPU 纹理。
+    fn ensure_clip_texture(&mut self, ctx: &egui::Context, summary: &ClipSummary) -> Option<egui::TextureId> {
+        if let Some(tex) = self.clip.textures.get(&summary.id) {
+            return Some(tex.id());
+        }
+        let path = summary.image_path.clone()?;
+        let (rgba, w, h) = clipboard::load_png_rgba(&path)?;
+        let (rgba, w, h) = clipboard::downscale_rgba(&rgba, w, h, 128);
+        let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+        let tex = ctx.load_texture(format!("clip-thumb-{}", summary.id), image, egui::TextureOptions::LINEAR);
+        let id = tex.id();
+        self.clip.textures.insert(summary.id, tex);
+        Some(id)
+    }
+
+    /// 回填选中条目：只写回系统剪贴板，不自动粘贴。
+    fn restore_clip(&mut self, ctx: &egui::Context, id: u64) {
+        let Some(summary) = self.clip.summaries.iter().find(|s| s.id == id).cloned() else {
+            return;
+        };
+        let result = match summary.kind {
+            ClipKind::Text => {
+                let text = self.clip.store.lock().ok().and_then(|s| s.text_of(id));
+                match text {
+                    Some(t) => clipboard::set_clipboard_text(&t),
+                    None => Err("文本已不在历史中".to_string()),
+                }
+            }
+            ClipKind::Image => match summary.image_path.clone().and_then(|p| clipboard::load_png_rgba(&p)) {
+                Some((rgba, w, h)) => clipboard::set_clipboard_image(&rgba, w, h),
+                None => Err("图片文件缺失".to_string()),
+            },
+        };
+        match result {
+            Ok(()) => {
+                self.clip.status = "已复制到剪贴板，到目标程序按 Ctrl+V 粘贴".to_string();
+                if self.prefs.dock_bottom {
+                    self.hide_window(ctx);
+                }
+            }
+            Err(e) => self.clip.status = format!("回填失败：{e}"),
+        }
+    }
+
+    fn delete_clip(&mut self, id: u64) {
+        if let Ok(mut store) = self.clip.store.lock() {
+            store.delete(id);
+        }
+        self.clip.textures.remove(&id);
+        self.clip.refresh();
+        self.clip.status = "已删除".to_string();
     }
 
     /// record_history=false 用于实时搜索的中间态，避免刷爆历史记录
@@ -540,15 +937,22 @@ impl App {
 
         thread::spawn(move || {
             let start = Instant::now();
+            // 索引命中已发出的路径：索引不完整时下面遍历补齐要去重
+            let seen: Arc<std::sync::Mutex<HashSet<String>>> =
+                Arc::new(std::sync::Mutex::new(HashSet::new()));
 
             // 常驻索引：整机 250 万条目 19s → 0.1s。没建过就先同步载入磁盘缓存
             // （约 0.2s）；仍然没有就照常遍历，遍历结束后再在后台建。
             if use_index && (index::is_ready() || index::try_load()) {
                 let ext_set: HashSet<String> =
                     exts.iter().map(|e| e.to_ascii_lowercase()).collect();
-                if let Some((hits, _, _, _)) =
+                if let Some((hits, _, _, _, complete)) =
                     index::query(&re, &roots, &ext_set, MAX_RESULTS + 1, None)
                 {
+                    {
+                        let mut sg = seen.lock().unwrap();
+                        sg.extend(hits.iter().map(|h| h.path.clone()));
+                    }
                     for h in &hits {
                         if cancelled.load(Ordering::Relaxed) {
                             break;
@@ -563,16 +967,20 @@ impl App {
                             break;
                         }
                     }
-                    let _ = tx.send(SearchMsg::Done {
-                        ms: start.elapsed().as_millis(),
-                        visited: hits.len() as u64,
-                        scope: format!("{scope_label} · 索引"),
-                    });
-                    return;
+                    if complete {
+                        let _ = tx.send(SearchMsg::Done {
+                            ms: start.elapsed().as_millis(),
+                            visited: hits.len() as u64,
+                            scope: format!("{scope_label} · 索引"),
+                        });
+                        return;
+                    }
+                    // 索引被条目上限截断：先显示索引命中，继续遍历补齐剩余目录
                 }
             }
 
             let opts = fastwalk::Options { include_hidden: false, threads };
+            let seen_walk = seen.clone();
             let visited = fastwalk::walk(&walk_roots, &opts, &cancelled, |path, info| {
                 // 回收站 / 系统还原 / WinSxS，以及盘符下的 Windows、Program Files 等大头目录：
                 // 命中的是目录就整棵剪掉，否则这些目录会被逐条遍历，白白拖慢整机搜索。
@@ -603,6 +1011,13 @@ impl App {
                     }
                 };
                 if let Some(r) = result {
+                    // 索引种子阶段已经展示过的路径不再重复
+                    {
+                        let mut sg = seen_walk.lock().unwrap();
+                        if !sg.insert(r.path.clone()) {
+                            return Step::Continue;
+                        }
+                    }
                     if tx.send(SearchMsg::Result(r)).is_err() {
                         return Step::Quit;
                     }
@@ -671,6 +1086,12 @@ impl eframe::App for App {
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.hide_window(ctx);
+            return;
+        }
+
+        // 剪切板面板：独立的一帧（不复用搜索流程，避免键盘/搜索状态互相干扰）
+        if self.view == PanelView::Clipboard {
+            self.update_clipboard(ctx);
             return;
         }
 
@@ -949,6 +1370,8 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.mode, SearchMode::Text, "📄 文本")
                     .on_hover_text("搜索文件内容");
                 if self.mode != prev_mode {
+                    // 切模式复位 F 为该模式默认：文件名 → 纯文本，文本内容 → 正则
+                    self.fixed_string = self.mode == SearchMode::Filename;
                     self.results.clear();
                     self.cancel_search();
                     self.status = "就绪".to_string();
@@ -1084,6 +1507,9 @@ impl eframe::App for App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("▾").on_hover_text("收起（Esc / 热键 / 点其他地方）").clicked() {
                         self.hide_window(ctx);
+                    }
+                    if ui.small_button("📋").on_hover_text("剪切板历史 (Ctrl+Shift+V)").clicked() {
+                        self.open_clipboard_view();
                     }
                     if ui.small_button("⚙").on_hover_text("系统集成设置（热键 / 开机自启 / 隐藏任务栏搜索框）").clicked() {
                         self.show_settings = !self.show_settings;
@@ -1227,6 +1653,10 @@ impl App {
                     ui.label(RichText::new(err).color(Color32::from_rgb(255, 140, 0)).small());
                 }
                 if self.prefs.hotkey_preset != self.active_hotkey_preset {
+                    // 必须先释放旧管理器：GlobalHotKeyManager 的 Drop 才注销热键，
+                    // 旧管理器还活着时新管理器注册 Ctrl+Shift+V 会因「被自己占用」失败并降级，
+                    // 随后旧管理器被替换 drop，剪切板热键就此整体失效。
+                    self.hotkey = None;
                     match integration::setup_hotkey(self.prefs.hotkey_preset, self.bridge.clone()) {
                         Ok(h) => {
                             if let Some(tray) = self.tray.as_ref() {
@@ -1546,6 +1976,20 @@ fn fmt_size(bytes: u64) -> String {
 fn fmt_time(t: std::time::SystemTime) -> String {
     let dt: chrono::DateTime<chrono::Local> = t.into();
     dt.format("%Y-%m-%d %H:%M").to_string()
+}
+
+/// 剪切板条目的相对时间（今天只显示时分，跨天带日期）
+fn fmt_time_short(unix: i64) -> String {
+    let Some(dt) = chrono::DateTime::from_timestamp(unix, 0) else {
+        return String::new();
+    };
+    let local: chrono::DateTime<chrono::Local> = dt.with_timezone(&chrono::Local);
+    let now = chrono::Local::now();
+    if local.date_naive() == now.date_naive() {
+        local.format("%H:%M").to_string()
+    } else {
+        local.format("%m-%d %H:%M").to_string()
+    }
 }
 
 fn reveal_in_explorer(path: &str) {

@@ -26,14 +26,20 @@ pub struct Bridge {
     pub panel: AtomicBool,
     /// 外部（热键/托盘/唤出）刚把窗口显示出来，App 需清空查询并聚焦输入框
     pub pending_show: AtomicBool,
+    /// 剪切板热键/托盘刚请求打开「剪切板」面板（App 帧内消费并切换模式）
+    pub clip_pending: AtomicBool,
+    /// 暂停记录剪切板（托盘与面板共用；监听线程按此跳过入库）
+    pub clip_paused: Arc<AtomicBool>,
 }
 
 impl Bridge {
-    pub fn new() -> Self {
+    pub fn new(clip_paused: Arc<AtomicBool>) -> Self {
         Self {
             hwnd: AtomicIsize::new(0),
             panel: AtomicBool::new(true),
             pending_show: AtomicBool::new(false),
+            clip_pending: AtomicBool::new(false),
+            clip_paused,
         }
     }
 
@@ -377,10 +383,13 @@ pub struct HotkeySetup {
     _manager: global_hotkey::GlobalHotKeyManager,
     pub label: &'static str,
     pub win_s_ok: bool,
+    /// 剪切板历史热键实际生效的组合（注册失败时为 None）
+    pub clip_label: Option<&'static str>,
 }
 
 /// 注册全局热键：用户预设 + 尝试抢占 Win+S（Windows 自带搜索的热键，成功即完成热键层面接管）。
 /// 按下时直接用 Win32 切换主窗口（隐藏窗口下 egui 轮询不可用）。
+/// 另外注册剪切板历史热键：默认 Ctrl+Shift+V，被占用时降级 Ctrl+Alt+V。
 pub fn setup_hotkey(preset_index: usize, bridge: Arc<Bridge>) -> Result<HotkeySetup, String> {
     use global_hotkey::hotkey::{Code, HotKey, Modifiers};
     use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
@@ -398,14 +407,43 @@ pub fn setup_hotkey(preset_index: usize, bridge: Arc<Bridge>) -> Result<HotkeySe
     let win_s = HotKey::new(Some(Modifiers::META), Code::KeyS);
     let win_s_ok = manager.register(win_s).is_ok();
 
+    // 剪切板历史：Ctrl+Shift+V（被占用时降级 Ctrl+Alt+V）
+    let clip_presets: [(&'static str, HotKey); 2] = [
+        ("Ctrl+Shift+V", HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyV)),
+        ("Ctrl+Alt+V", HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyV)),
+    ];
+    let mut clip_label: Option<&'static str> = None;
+    let mut clip_id: Option<u32> = None;
+    for (name, hotkey) in clip_presets {
+        if manager.register(hotkey).is_ok() {
+            clip_label = Some(name);
+            clip_id = Some(hotkey.id());
+            break;
+        }
+    }
+
     let preset_id = hk.id();
     let win_s_id = win_s.id();
     GlobalHotKeyEvent::set_event_handler(Some(move |ev: GlobalHotKeyEvent| {
-        if ev.state == HotKeyState::Pressed && (ev.id == preset_id || (win_s_ok && ev.id == win_s_id)) {
+        if ev.state != HotKeyState::Pressed {
+            return;
+        }
+        if ev.id == preset_id || (win_s_ok && ev.id == win_s_id) {
             bridge.toggle();
+        } else if clip_id == Some(ev.id) {
+            // 剪切板面板总是「呼出」而不是切换：避免按一次热键就把面板关掉。
+            // 面板已可见时不要再走 show_panel()——它会置 pending_show，让 App 清空
+            // 当前关键词与结果，把用户正在进行的搜索冲掉。
+            let hwnd = bridge.hwnd.load(Ordering::Relaxed);
+            if hwnd != 0 && !win_is_visible(hwnd) {
+                // 注意顺序：先 show_panel（置 pending_show）再置 clip_pending——
+                // 反过来的话 App 可能先消费 clip_pending，再被稍后到达的 pending_show 切回搜索视图。
+                bridge.show_panel();
+            }
+            bridge.clip_pending.store(true, Ordering::Relaxed);
         }
     }));
-    Ok(HotkeySetup { _manager: manager, label, win_s_ok })
+    Ok(HotkeySetup { _manager: manager, label, win_s_ok, clip_label })
 }
 
 // ---------- 托盘 ----------
@@ -429,15 +467,31 @@ pub struct TraySetup {
     pub show_item: tray_icon::menu::MenuItem,
     pub autostart_item: tray_icon::menu::CheckMenuItem,
     pub hide_search_item: tray_icon::menu::CheckMenuItem,
+    #[allow(dead_code)]
+    pub clip_item: tray_icon::menu::MenuItem,
+    pub clip_pause_item: tray_icon::menu::CheckMenuItem,
 }
 
-pub fn setup_tray(hotkey_label: &str, bridge: Arc<Bridge>) -> Result<TraySetup, String> {
+pub fn setup_tray(hotkey_label: &str, clip_label: Option<&str>, bridge: Arc<Bridge>) -> Result<TraySetup, String> {
     use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
     use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 
     let menu = Menu::new();
     let show_item = MenuItem::new(format!("显示 / 隐藏 ({hotkey_label})"), true, None);
     let _ = menu.append(&show_item);
+    let clip_item = MenuItem::new(
+        format!("剪切板历史 ({})", clip_label.unwrap_or("热键未注册")),
+        true,
+        None,
+    );
+    let _ = menu.append(&clip_item);
+    let clip_pause_item = CheckMenuItem::new(
+        "暂停记录剪切板",
+        true,
+        bridge.clip_paused.load(Ordering::Relaxed),
+        None,
+    );
+    let _ = menu.append(&clip_pause_item);
     let _ = menu.append(&PredefinedMenuItem::separator());
     let autostart_item = CheckMenuItem::new("开机自启", true, autostart_enabled(), None);
     let _ = menu.append(&autostart_item);
@@ -463,12 +517,26 @@ pub fn setup_tray(hotkey_label: &str, bridge: Arc<Bridge>) -> Result<TraySetup, 
 
     let b = bridge.clone();
     let m_show_id = show_item.id().clone();
+    let m_clip_id = clip_item.id().clone();
     let m_quit_id = quit_item.id().clone();
     let m_autostart = MainThread(autostart_item.clone());
     let m_hide_search = MainThread(hide_search_item.clone());
+    let m_clip_pause = MainThread(clip_pause_item.clone());
+    let b_pause = bridge.clone();
     tray_icon::menu::MenuEvent::set_event_handler(Some(move |ev: tray_icon::menu::MenuEvent| {
         if ev.id == m_show_id {
             b.toggle();
+        } else if ev.id == m_clip_id {
+            // 同热键：面板隐藏时才显示（置 pending_show），避免冲掉正在进行的搜索
+            let hwnd = b.hwnd.load(Ordering::Relaxed);
+            if hwnd != 0 && !win_is_visible(hwnd) {
+                b.show_panel();
+            }
+            b.clip_pending.store(true, Ordering::Relaxed);
+        } else if m_clip_pause.with(|i| ev.id == i.id()) {
+            let next = !b_pause.clip_paused.load(Ordering::Relaxed);
+            b_pause.clip_paused.store(next, Ordering::Relaxed);
+            m_clip_pause.with(|i| i.set_checked(next));
         } else if m_autostart.with(|i| ev.id == i.id()) {
             let next = !autostart_enabled();
             if set_autostart(next).is_ok() {
@@ -498,7 +566,14 @@ pub fn setup_tray(hotkey_label: &str, bridge: Arc<Bridge>) -> Result<TraySetup, 
         }
     }));
 
-    Ok(TraySetup { _tray: tray, show_item, autostart_item, hide_search_item })
+    Ok(TraySetup {
+        _tray: tray,
+        show_item,
+        autostart_item,
+        hide_search_item,
+        clip_item,
+        clip_pause_item,
+    })
 }
 
 /// 程序化绘制 32×32 放大镜托盘图标（避免引入 image 依赖）。
