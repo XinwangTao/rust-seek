@@ -1,4 +1,5 @@
 mod app;
+mod clipboard;
 mod fastwalk;
 mod index;
 mod integration;

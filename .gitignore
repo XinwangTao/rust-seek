@@ -1,1 +1,4 @@
 /target
+
+# Archify 校验产物（截图/回执），只保留图源 .json 与交付 .html
+docs/archify/*.visual-check.*
