@@ -359,9 +359,13 @@ fn run_search_files(args: &Value) -> Result<String, String> {
     let skip_c = skip.clone();
     let timeout_c = timed_out.clone();
     let seen_c = seen.clone();
+    // 预算时钟从「真正开始遍历」起算：前面的索引查询/建索引是固定成本，
+    // 若沿用函数入口的 start，冷启动 20-40s 建索引会把兜底遍历的预算直接吃光，
+    // 首次回调就 Quit → 返回 0 条，正是本轮要修的假阴性。
+    let walk_start = Instant::now();
     let scanned = walk_roots(&roots, include_hidden, stop.clone(), move |path, info| {
         // 时间预算：宁可返回部分结果并标记 timed_out，也不让 Agent 干等十几秒
-        if walk_budget_ms > 0 && start.elapsed().as_millis() >= walk_budget_ms {
+        if walk_budget_ms > 0 && walk_start.elapsed().as_millis() >= walk_budget_ms {
             timeout_c.store(true, Ordering::Relaxed);
             return Step::Quit;
         }
@@ -505,8 +509,10 @@ fn run_search_text(args: &Value) -> Result<String, String> {
     let exts_c = exts.clone();
     let skip_c = skip.clone();
     let timeout_c = timed_out.clone();
+    // 同上：索引不完整退回遍历时，预算从遍历开始计，不吃建索引的时间
+    let walk_start = Instant::now();
     let scanned = walk_roots(&roots, include_hidden, stop.clone(), move |path, info| {
-        if budget_ms > 0 && start.elapsed().as_millis() >= budget_ms {
+        if budget_ms > 0 && walk_start.elapsed().as_millis() >= budget_ms {
             timeout_c.store(true, Ordering::Relaxed);
             return Step::Quit;
         }

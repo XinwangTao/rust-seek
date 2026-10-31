@@ -529,6 +529,14 @@ impl App {
     /// 消费外部事件（热键/托盘/其他实例）设置的桥接标志。
     /// 显示/隐藏本身由处理器用 Win32 直接完成，这里只做 egui 侧的善后。
     fn poll_bridge_events(&mut self) {
+        // 剪切板热键/托盘优先：切到剪切板面板并刷新历史。
+        // 先于 pending_show 判断——同一批事件里两者都置位时，不能先按 pending_show
+        // 清空关键词/结果再切视图，否则用户正在进行的搜索会被冲掉。
+        if self.bridge.clip_pending.swap(false, Ordering::Relaxed) {
+            self.bridge.pending_show.store(false, Ordering::Relaxed);
+            self.open_clipboard_view();
+            return;
+        }
         // 窗口刚被外部呼出：清空上一次查询，聚焦输入框
         if self.bridge.pending_show.swap(false, Ordering::Relaxed) {
             self.cancel_search();
@@ -540,12 +548,6 @@ impl App {
             self.status = "就绪".to_string();
             self.needs_focus = true;
             self.view = PanelView::Search;
-        }
-        // 剪切板热键/托盘：切到剪切板面板并刷新历史
-        if self.bridge.clip_pending.swap(false, Ordering::Relaxed) {
-            // 同一批事件里 pending_show 已经消费过；这里兜底清掉，防止残留把它切回搜索
-            self.bridge.pending_show.store(false, Ordering::Relaxed);
-            self.open_clipboard_view();
         }
     }
 
@@ -1651,6 +1653,10 @@ impl App {
                     ui.label(RichText::new(err).color(Color32::from_rgb(255, 140, 0)).small());
                 }
                 if self.prefs.hotkey_preset != self.active_hotkey_preset {
+                    // 必须先释放旧管理器：GlobalHotKeyManager 的 Drop 才注销热键，
+                    // 旧管理器还活着时新管理器注册 Ctrl+Shift+V 会因「被自己占用」失败并降级，
+                    // 随后旧管理器被替换 drop，剪切板热键就此整体失效。
+                    self.hotkey = None;
                     match integration::setup_hotkey(self.prefs.hotkey_preset, self.bridge.clone()) {
                         Ok(h) => {
                             if let Some(tray) = self.tray.as_ref() {

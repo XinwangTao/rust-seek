@@ -277,7 +277,25 @@ unsafe fn dib_to_rgba(ptr: *const u8, len: usize) -> Option<(Vec<u8>, u32, u32)>
     let top_down = hdr.bi_height < 0;
     let bytes_pp = (bpp / 8) as usize;
     let stride = ((w as usize * bytes_pp + 3) / 4) * 4;
-    let offset = hdr.bi_size as usize;
+    let mut offset = hdr.bi_size as usize;
+    // 40 字节 BITMAPINFOHEADER + BI_BITFIELDS：3 个 DWORD 颜色掩码紧跟在头后面，
+    // 像素起点是 bi_size + 12。掩码不是标准 0x00RRGGBB 布局时直接跳过——
+    // 宁可不记录这张图，也不要静默存一张错位/错色的图。
+    if hdr.bi_compression == BI_BITFIELDS && offset < 52 {
+        if len < offset + 12 {
+            return None;
+        }
+        let m = ptr.add(offset) as *const u32;
+        let masks = (
+            std::ptr::read_unaligned(m),
+            std::ptr::read_unaligned(m.add(1)),
+            std::ptr::read_unaligned(m.add(2)),
+        );
+        if masks != (0x00FF_0000, 0x0000_FF00, 0x0000_00FF) {
+            return None;
+        }
+        offset += 12;
+    }
     if offset + stride * h as usize > len {
         return None;
     }
@@ -498,8 +516,9 @@ impl Store {
         let mut existing: Option<ClipEntry> = None;
         if let Some(pos) = self.entries.iter().position(|e| e.kind == ClipKind::Text && e.hash == hash) {
             if pos == 0 {
+                // 已经在最前：只刷新时间戳。这里不能 save()——剪贴板同步工具会反复
+                // 重发同一段内容，每次全量重写 history.json 既无意义又卡 UI。
                 self.entries[0].created = now;
-                self.save();
                 return false;
             }
             existing = Some(self.entries.remove(pos));
@@ -532,17 +551,20 @@ impl Store {
         }
         let hash = hash_bytes(rgba);
         let now = chrono::Local::now().timestamp();
-        let mut existing: Option<ClipEntry> = None;
-        if let Some(pos) = self.entries.iter().position(|e| e.kind == ClipKind::Image && e.hash == hash) {
-            if pos == 0 {
-                self.entries[0].created = now;
-                self.save();
-                return false;
-            }
-            existing = Some(self.entries.remove(pos));
+        // 先只定位旧条目，不急 remove：写盘失败时旧条目必须原样留着，
+        // 否则内存里少一条、磁盘 history.json 还有，两边不一致。
+        let existing_pos = self
+            .entries
+            .iter()
+            .position(|e| e.kind == ClipKind::Image && e.hash == hash);
+        if existing_pos == Some(0) {
+            self.entries[0].created = now;
+            return false;
         }
-        let id = existing.as_ref().map(|e| e.id).unwrap_or_else(|| self.alloc_id());
-        let name = match existing.as_ref().and_then(|e| e.image.clone()) {
+        let existing_id = existing_pos.map(|p| self.entries[p].id);
+        let existing_name = existing_pos.and_then(|p| self.entries[p].image.clone());
+        let id = existing_id.unwrap_or_else(|| self.alloc_id());
+        let name = match existing_name {
             Some(n) if self.images_dir().join(&n).exists() => n,
             _ => {
                 let name = format!("{id}.png");
@@ -554,6 +576,9 @@ impl Store {
                 name
             }
         };
+        if let Some(p) = existing_pos {
+            self.entries.remove(p);
+        }
         let entry = ClipEntry {
             id,
             kind: ClipKind::Image,

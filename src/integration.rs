@@ -432,9 +432,14 @@ pub fn setup_hotkey(preset_index: usize, bridge: Arc<Bridge>) -> Result<HotkeySe
             bridge.toggle();
         } else if clip_id == Some(ev.id) {
             // 剪切板面板总是「呼出」而不是切换：避免按一次热键就把面板关掉。
-            // 注意顺序：先 show_panel（置 pending_show）再置 clip_pending——
-            // 反过来的话 App 可能先消费 clip_pending，再被稍后到达的 pending_show 切回搜索视图。
-            bridge.show_panel();
+            // 面板已可见时不要再走 show_panel()——它会置 pending_show，让 App 清空
+            // 当前关键词与结果，把用户正在进行的搜索冲掉。
+            let hwnd = bridge.hwnd.load(Ordering::Relaxed);
+            if hwnd != 0 && !win_is_visible(hwnd) {
+                // 注意顺序：先 show_panel（置 pending_show）再置 clip_pending——
+                // 反过来的话 App 可能先消费 clip_pending，再被稍后到达的 pending_show 切回搜索视图。
+                bridge.show_panel();
+            }
             bridge.clip_pending.store(true, Ordering::Relaxed);
         }
     }));
@@ -522,8 +527,11 @@ pub fn setup_tray(hotkey_label: &str, clip_label: Option<&str>, bridge: Arc<Brid
         if ev.id == m_show_id {
             b.toggle();
         } else if ev.id == m_clip_id {
-            // 同热键：先显示窗口（置 pending_show）再请求剪切板视图，避免被切回搜索
-            b.show_panel();
+            // 同热键：面板隐藏时才显示（置 pending_show），避免冲掉正在进行的搜索
+            let hwnd = b.hwnd.load(Ordering::Relaxed);
+            if hwnd != 0 && !win_is_visible(hwnd) {
+                b.show_panel();
+            }
             b.clip_pending.store(true, Ordering::Relaxed);
         } else if m_clip_pause.with(|i| ev.id == i.id()) {
             let next = !b_pause.clip_paused.load(Ordering::Relaxed);
