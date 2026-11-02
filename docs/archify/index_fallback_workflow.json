@@ -2,16 +2,17 @@
   "schema_version": 2,
   "diagram_type": "workflow",
   "meta": {
-    "title": "Rust Seek 索引不完整时的兜底遍历",
+    "title": "Rust Seek 索引快照过期兜底与回填",
     "locale": "zh-CN",
     "quality_profile": "showcase"
   },
   "lanes": [
     { "id": "io", "label": "查询与响应" },
     { "id": "decide", "label": "索引判定" },
-    { "id": "fallback", "label": "兜底补齐" }
+    { "id": "fallback", "label": "兜底补齐" },
+    { "id": "maintain", "label": "维护与自愈" }
   ],
-  "mainPath": ["query", "index", "complete", "walk", "merge", "resp"],
+  "mainPath": ["query", "index", "fresh", "walk", "merge", "resp"],
   "nodes": [
     {
       "id": "query",
@@ -19,7 +20,7 @@
       "col": 0,
       "type": "frontend",
       "label": "搜索请求",
-      "sublabel": "search_files / 整机文件名",
+      "sublabel": "search_files · 整盘",
       "width": 142
     },
     {
@@ -30,6 +31,15 @@
       "label": "取索引候选",
       "sublabel": "index-v1.bin 内存索引",
       "width": 140
+    },
+    {
+      "id": "fresh",
+      "lane": "decide",
+      "col": 2,
+      "type": "security",
+      "label": "完整且新鲜？",
+      "sublabel": "complete + age + 命中数",
+      "width": 144
     },
     {
       "id": "hit",
@@ -47,17 +57,8 @@
       "col": 4,
       "type": "frontend",
       "label": "响应",
-      "sublabel": "带 index_complete",
-      "width": 128
-    },
-    {
-      "id": "complete",
-      "lane": "decide",
-      "col": 2,
-      "type": "security",
-      "label": "索引完整？",
-      "sublabel": "complete 标记",
-      "width": 132
+      "sublabel": "index_stale · maybe_stale",
+      "width": 148
     },
     {
       "id": "walk",
@@ -65,9 +66,9 @@
       "col": 2,
       "type": "backend",
       "label": "真实遍历补齐",
-      "sublabel": "预算独立计时",
-      "tag": "默认 60s",
-      "width": 138
+      "sublabel": "文件名 60s · 内容只读新文件",
+      "tag": "兜底",
+      "width": 156
     },
     {
       "id": "merge",
@@ -77,25 +78,64 @@
       "label": "合并去重",
       "sublabel": "索引 + 遍历",
       "width": 128
+    },
+    {
+      "id": "backfill",
+      "lane": "maintain",
+      "col": 4,
+      "type": "backend",
+      "label": "后台回填索引",
+      "sublabel": "10 分钟跨进程节流",
+      "width": 140
+    },
+    {
+      "id": "selfheal",
+      "lane": "maintain",
+      "col": 5,
+      "type": "security",
+      "label": "内存与构建自愈",
+      "sublabel": "空闲 10min 释放 · 构建 900s 复位",
+      "width": 168
     }
   ],
   "edges": [
     { "id": "query-index", "from": "query", "to": "index", "label": "整盘查询", "variant": "emphasis", "role": "main" },
-    { "id": "index-complete", "from": "index", "to": "complete", "label": "查完整性", "variant": "emphasis", "role": "main" },
-    { "id": "complete-hit", "from": "complete", "to": "hit", "label": "完整", "variant": "default", "role": "branch" },
-    { "id": "complete-walk", "from": "complete", "to": "walk", "label": "被上限截断", "variant": "emphasis", "role": "main" },
+    { "id": "index-fresh", "from": "index", "to": "fresh", "label": "查完整性与年龄", "variant": "emphasis", "role": "main" },
+    { "id": "fresh-hit", "from": "fresh", "to": "hit", "label": "完整且有命中", "variant": "default", "role": "branch" },
+    { "id": "fresh-walk", "from": "fresh", "to": "walk", "label": "截断 / 零命中过期", "variant": "emphasis", "role": "main" },
     { "id": "hit-resp", "from": "hit", "to": "resp", "label": "直接返回", "variant": "default", "role": "branch" },
     { "id": "walk-merge", "from": "walk", "to": "merge", "label": "带种子遍历", "variant": "emphasis", "role": "main" },
-    { "id": "merge-resp", "from": "merge", "to": "resp", "label": "index+walk", "variant": "emphasis", "role": "main" }
+    { "id": "merge-resp", "from": "merge", "to": "resp", "label": "index+walk / walk", "variant": "emphasis", "role": "main" },
+    { "id": "merge-backfill", "from": "merge", "to": "backfill", "label": "遍历完整结束", "variant": "dashed", "role": "async" },
+    { "id": "backfill-selfheal", "from": "backfill", "to": "selfheal", "label": "守住建库线程", "variant": "dashed", "role": "async" }
   ],
   "cards": [
     {
       "dot": "cyan",
       "title": "本次修复的契约变化",
       "items": [
-        "响应新增 index_complete：false 表示索引被条目上限截断，0 命中不再等于文件不存在",
-        "索引不完整且命中不足时回退真实遍历并合并，响应 source 为 index+walk",
-        "遍历预算从真正开始遍历时计时，不被前置建索引的 20-40s 吃光"
+        "index_stale:true 表示索引是过期快照，本次已回退真实遍历补齐",
+        "index_complete:false 只表示撞 800 万条目上限被截断，两条兜底路径分开标记",
+        "index_maybe_stale 在快照 ≥5 分钟时为 true；fresh:true 完全跳过索引",
+        "内容搜索兜底只读索引建立之后改动过的文件（recent_only），不整盘重读"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "资源与自愈",
+      "items": [
+        "内存索引约 570MB/进程，空闲 10 分钟自动释放，下次查询约 0.2s 重载",
+        "构建线程 panic 或超过 900s 卡死会自动复位，不会永久停在 building",
+        "回填带进程内 + 跨进程 10 分钟节流，多个 MCP 进程不会同时扫整盘"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "已知代价",
+      "items": [
+        "真正不存在的文件名：整盘要等 18-34s 才返回 0（用户已确认接受）",
+        "内容兜底约 20-30s；重命名且 mtime 未变的文件仍可能漏，用 fresh:true 兜底",
+        "USN 增量索引需要提权，GUI 普通权限读不了，不能作为默认路径"
       ]
     }
   ]

@@ -76,6 +76,10 @@ struct Index {
 
 static INDEX: Mutex<Option<Box<Index>>> = Mutex::new(None);
 static BUILDING: AtomicBool = AtomicBool::new(false);
+/// 构建状态的互斥锁：acquire / Drop / 卡死复位必须互斥。
+/// 否则「复位」与「新构建」交错时，新构建的 Drop 会因代次不匹配而不清标志，
+/// 进程永久停在 building；反过来旧构建也可能清掉新构建的标志。
+static BUILD_LOCK: Mutex<()> = Mutex::new(());
 /// 构建代次：每拿到一次构建权 +1。卡死复位后旧线程收尾时据此判断
 /// 「自己已经不是当前构建」，不会误清掉新构建的标志。
 static BUILD_GEN: AtomicU64 = AtomicU64::new(0);
@@ -91,9 +95,11 @@ struct BuildSlot(u64);
 
 impl BuildSlot {
     fn acquire() -> Option<BuildSlot> {
-        if BUILDING.swap(true, Ordering::SeqCst) {
+        let _g = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if BUILDING.load(Ordering::SeqCst) {
             return None;
         }
+        BUILDING.store(true, Ordering::SeqCst);
         let gen = BUILD_GEN.fetch_add(1, Ordering::SeqCst) + 1;
         BUILD_STARTED.store(now_unix(), Ordering::SeqCst);
         Some(BuildSlot(gen))
@@ -102,11 +108,25 @@ impl BuildSlot {
 
 impl Drop for BuildSlot {
     fn drop(&mut self) {
+        let _g = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if BUILD_GEN.load(Ordering::SeqCst) == self.0 {
             BUILDING.store(false, Ordering::SeqCst);
             BUILD_STARTED.store(0, Ordering::SeqCst);
         }
     }
+}
+
+/// 构建超过 [`BUILD_STUCK_SECS`] 仍未结束：视为卡死并复位，允许重新构建。
+/// `observed_started` 是调用方看到的时间戳：期间若已开始新构建则不复位。
+fn reset_stuck_build(observed_started: u64) -> bool {
+    let _g = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if !BUILDING.load(Ordering::SeqCst) || BUILD_STARTED.load(Ordering::SeqCst) != observed_started {
+        return false;
+    }
+    BUILDING.store(false, Ordering::SeqCst);
+    BUILD_GEN.fetch_add(1, Ordering::SeqCst);
+    BUILD_STARTED.store(0, Ordering::SeqCst);
+    true
 }
 /// 兜底遍历后回填索引的节流时钟（unix 秒）
 static LAST_REFRESH_REQ: AtomicU64 = AtomicU64::new(0);
@@ -388,9 +408,7 @@ pub fn is_building() -> bool {
     }
     let started = BUILD_STARTED.load(Ordering::Relaxed);
     if started > 0 && now_unix().saturating_sub(started) > BUILD_STUCK_SECS {
-        if BUILDING.swap(false, Ordering::SeqCst) {
-            BUILD_GEN.fetch_add(1, Ordering::SeqCst);
-        }
+        reset_stuck_build(started);
         return false;
     }
     true
@@ -612,6 +630,10 @@ fn build_with_match(
     match_exts: Option<&HashSet<String>>,
     max: usize,
 ) -> Option<(Index, Vec<Hit>)> {
+    // 索引代表「开始遍历那一刻」的文件系统，而不是结束时刻：
+    // 遍历过程中新建的文件可能落在已扫过的目录里而没进索引。
+    // 用开始时间做新鲜度基准，零命中兜底才不会被刚建完的索引误判为「已最新」。
+    let build_started = now_unix();
     let roots: Vec<PathBuf> = integration::local_drives()
         .into_iter()
         .map(|d| PathBuf::from(format!("{d}/")))
@@ -717,7 +739,7 @@ fn build_with_match(
         });
     }
 
-    let index = Index { blob, items, built_unix: now_unix(), complete };
+    let index = Index { blob, items, built_unix: build_started, complete };
     Some((index, hits.into_inner().unwrap_or_default()))
 }
 

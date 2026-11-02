@@ -133,7 +133,7 @@ index_maybe_stale:true means the result is usable but files created/renamed afte
             "description": "Search file contents with a regex (ripgrep semantics: parallel walk, binary files and huge files skipped). \
 Returns one entry per file with line numbers and matching lines. \
 When roots are drive roots and exts is given, candidates come from the name index and only those files are read (source:\"index\"), skipping the ~19s whole-drive walk. \
-The index is a snapshot: a zero-hit index scan also falls back to a walk that reads only files modified after the index snapshot (source:\"walk\", index_fallback:true, recent_only:true), so files created after the index was built are still found. Files renamed after the snapshot without a new mtime can still be missed — pass fresh:true for absolute certainty. \
+The index is a snapshot: a zero-hit index scan also falls back to a walk that reads only files modified after the index snapshot (source:\"walk\", index_fallback:true, recent_only:true), so files created after the index was built are still found. Files renamed after the snapshot without a new mtime can still be missed — pass fresh:true to walk everything (raise budget_ms if a whole-drive content scan needs more than the default ~60s). \
 Without an explicit budget_ms, a fallback walk may run up to ~60s; pass budget_ms to cap it. \
 index_maybe_stale:true means candidates may miss files created/renamed after the index snapshot.",
             "inputSchema": {
@@ -343,8 +343,10 @@ fn run_search_files(args: &Value) -> Result<String, String> {
                 }
             }
     }
-    // 整盘查询顺手把索引准备好，后续同类查询就只剩内存扫描
-    if is_drive_query || force_index {
+    // 整盘查询顺手把索引准备好，后续同类查询就只剩内存扫描。
+    // fresh=true 时不建：调用方明确要遍历，后台再起一趟整盘建索引只会抢 I/O；
+    // 遍历完整结束后会由 refresh_after_full_walk 回填。
+    if (is_drive_query || force_index) && !fresh {
         index::ensure_ready();
     }
 
@@ -573,8 +575,9 @@ fn run_search_text(args: &Value) -> Result<String, String> {
     let timeout_c = timed_out.clone();
     let recent_c = recent_after.map(|s| UNIX_EPOCH + Duration::from_secs(s));
     // 同上：索引不完整退回遍历时，预算从遍历开始计，不吃建索引的时间；
-    // 索引兜底（截断 / 可能过期）默认给 60s，否则 10s 走不完整盘，结果会静默不全。
-    let walk_budget_ms = if !budget_explicit && index_fallback {
+    // 索引兜底（截断 / 可能过期）或显式 fresh 默认给 60s，否则 10s 走不完整盘，
+    // 结果会静默不全（fresh 的契约是「绝对最新」，不能 10s 就截断）。
+    let walk_budget_ms = if !budget_explicit && (fresh || index_fallback) {
         60_000u128
     } else {
         budget_ms
