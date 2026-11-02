@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 enum SearchMsg {
     Result(SearchResult),
+    /// 中途状态提示（如「索引零命中，正在深度扫描」）
+    Status(String),
     /// 结束：耗时、遍历到的条目数、实际搜索范围（便于看清整机到底搜了哪些盘）
     Done { ms: u128, visited: u64, scope: String },
 }
@@ -846,6 +848,11 @@ impl App {
 
     /// record_history=false 用于实时搜索的中间态，避免刷爆历史记录
     fn start_search(&mut self, record_history: bool) {
+        self.start_search_ex(record_history, false);
+    }
+
+    /// force_walk=true：跳过索引直接遍历整机（保证最新，约 20-40 秒）
+    fn start_search_ex(&mut self, record_history: bool, force_walk: bool) {
         if self.pattern.is_empty() { return; }
         // 只保留真实存在的根：拔掉的 U 盘、失效的映射盘直接跳过，而不是整体报错
         let roots: Vec<String> = self
@@ -931,6 +938,9 @@ impl App {
         // 索引的剪枝规则和「整机 + 剪系统目录」完全一致，只有这种组合能走索引：
         // 单盘/指定目录的范围语义不同（不剪系统目录），走了会少结果。
         let use_index =
+            !force_walk && prune_system && matches!(mode, SearchMode::Filename) && matches!(self.scope, Scope::Machine);
+        // 与 use_index 同口径，但不管本次是否绕过索引：走完遍历后都值得回填索引
+        let indexable =
             prune_system && matches!(mode, SearchMode::Filename) && matches!(self.scope, Scope::Machine);
         let walk_roots: Vec<std::path::PathBuf> =
             roots.iter().map(std::path::PathBuf::from).collect();
@@ -946,7 +956,7 @@ impl App {
             if use_index && (index::is_ready() || index::try_load()) {
                 let ext_set: HashSet<String> =
                     exts.iter().map(|e| e.to_ascii_lowercase()).collect();
-                if let Some((hits, _, _, _, complete)) =
+                if let Some((hits, _, age, _, complete)) =
                     index::query(&re, &roots, &ext_set, MAX_RESULTS + 1, None)
                 {
                     {
@@ -967,15 +977,40 @@ impl App {
                             break;
                         }
                     }
-                    if complete {
+                    // 索引是建立那一刻的快照：完整索引却零命中，且索引不是刚建好的，
+                    // 说明可能有之后新建的文件没进索引（本例：16:02 建的文件查不到）。
+                    // 这时不能直接下「没有结果」，继续遍历补齐。
+                    let stale = index::suspicious_miss(hits.len(), age, complete);
+                    if complete && !stale {
+                        // 索引快照可能不含刚建的文件：状态栏如实标注，别让用户误以为搜全了
+                        let suffix = if index::maybe_stale(age) {
+                            "索引快照（可能不含新建文件）"
+                        } else {
+                            "索引"
+                        };
                         let _ = tx.send(SearchMsg::Done {
                             ms: start.elapsed().as_millis(),
                             visited: hits.len() as u64,
-                            scope: format!("{scope_label} · 索引"),
+                            scope: format!("{scope_label} · {suffix}"),
                         });
                         return;
                     }
-                    // 索引被条目上限截断：先显示索引命中，继续遍历补齐剩余目录
+                    if stale {
+                        let _ = tx.send(SearchMsg::Status(
+                            "索引无命中（可能是新建文件未收录），正在深度扫描…".to_string(),
+                        ));
+                        // 实时搜索只是打字中间态：先等 400ms，期间继续输入就取消，
+                        // 避免每敲一个字都启动一次整盘遍历。回车/点搜索立即扫。
+                        if !record_history {
+                            for _ in 0..8 {
+                                if cancelled.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                thread::sleep(Duration::from_millis(50));
+                            }
+                        }
+                    }
+                    // 索引被条目上限截断，或零命中但索引可能过期：继续遍历补齐剩余目录
                 }
             }
 
@@ -1024,9 +1059,11 @@ impl App {
                 }
                 Step::Continue
             });
-            // 整机首搜走完再后台建索引：不和本次遍历抢磁盘 I/O，下次搜索就是毫秒级
-            if use_index {
+            // 整机遍历走完（含「深搜」绕过索引的情况）就后台回填索引：
+            // 有节流；用户取消或结果已满时不回填，避免用不完整的结果覆盖索引。
+            if indexable && !cancelled.load(Ordering::Relaxed) {
                 index::ensure_ready();
+                index::refresh_after_full_walk();
             }
             let _ = tx.send(SearchMsg::Done {
                 ms: start.elapsed().as_millis(),
@@ -1114,6 +1151,9 @@ impl eframe::App for App {
                             }
                         }
                         got = true;
+                    }
+                    Ok(SearchMsg::Status(s)) => {
+                        self.status = s;
                     }
                     Ok(SearchMsg::Done { ms, visited, scope }) => {
                         self.sort_results();
@@ -1356,6 +1396,12 @@ impl eframe::App for App {
                     }
                 } else if ui.button("🔍 搜索").clicked() {
                     self.start_search(true);
+                } else if ui
+                    .button("⏬ 深搜")
+                    .on_hover_text("跳过索引，遍历整机（约 20-40 秒），保证包含刚新建的文件")
+                    .clicked()
+                {
+                    self.start_search_ex(true, true);
                 }
 
                 ui.separator();

@@ -21,7 +21,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -101,11 +101,13 @@ fn tool_defs() -> Value {
         {
             "name": "search_files",
             "description": "Search the local machine for files by name/path. Returns absolute paths with size and mtime. \
-Traversal stops as soon as max_results matches are collected or budget_ms expires, so it never blocks for long. \
+Traversal stops as soon as max_results matches are collected or budget_ms expires. Whole-drive queries without an explicit budget_ms may run up to ~60s (fresh, or index fallback); pass budget_ms to cap it. \
 roots defaults to the server's working directory (normally your project); pass roots like [\"C:/\",\"D:/\"] to search elsewhere or the whole machine. \
 node_modules/.git/target/WinSxS and drive-root system directories are pruned by default. \
 Whole-drive searches are served from an in-memory name index: the first such query builds it in a single ~19s pass (answering the query in the same walk) instead of running a competing background walk; once built, repeat queries come back in ~0.1-0.5s with source:\"index\". \
-The result carries index_complete; if the index hit its entry cap on a very large machine, the call automatically falls back to a real walk and merges both result sets (source:\"index+walk\", index_complete:false) instead of returning a false negative.",
+The result carries index_complete; if the index hit its entry cap on a very large machine, the call automatically falls back to a real walk and merges both result sets (source:\"index+walk\", index_complete:false) instead of returning a false negative. \
+The index is a snapshot: a zero-hit index query on a non-fresh index also falls back to a real walk (source:\"index+walk\", index_stale:true) so files created after the index was built are still found. \
+index_maybe_stale:true means the result is usable but files created/renamed after the index snapshot may be missing; pass fresh:true to force a fresh walk.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -120,7 +122,8 @@ The result carries index_complete; if the index hit its entry cap on a very larg
                     "budget_ms": { "type": "integer", "default": 10000, "description": "Wall-clock budget for the traversal in ms (0 = unlimited). On expiry the partial result comes back with timed_out:true." },
                     "skip_dirs": { "type": "array", "items": { "type": "string" }, "description": "Extra directory names to prune, on top of the defaults." },
                     "refresh_index": { "type": "boolean", "default": false, "description": "Rebuild the whole-drive name index (takes ~20s in the background) instead of querying it. Results for this call come from a normal walk." },
-                    "use_index": { "type": "boolean", "default": false, "description": "Also serve large subdirectory roots from the name index (whole-drive roots already do). Much faster but results may lag the index by up to 24h, so newly created files can be missing." }
+                    "use_index": { "type": "boolean", "default": false, "description": "Also serve large subdirectory roots from the name index (whole-drive roots already do). Much faster but results may lag the index by up to 4h, so newly created files can be missing." },
+                    "fresh": { "type": "boolean", "default": false, "description": "Skip the name index entirely and walk the filesystem (always up to date; whole-drive searches take ~20-40s)." }
                 },
                 "required": ["pattern"]
             }
@@ -129,7 +132,10 @@ The result carries index_complete; if the index hit its entry cap on a very larg
             "name": "search_text",
             "description": "Search file contents with a regex (ripgrep semantics: parallel walk, binary files and huge files skipped). \
 Returns one entry per file with line numbers and matching lines. \
-When roots are drive roots and exts is given, candidates come from the name index and only those files are read (source:\"index\"), skipping the ~19s whole-drive walk.",
+When roots are drive roots and exts is given, candidates come from the name index and only those files are read (source:\"index\"), skipping the ~19s whole-drive walk. \
+The index is a snapshot: a zero-hit index scan also falls back to a walk that reads only files modified after the index snapshot (source:\"walk\", index_fallback:true, recent_only:true), so files created after the index was built are still found. Files renamed after the snapshot without a new mtime can still be missed — pass fresh:true for absolute certainty. \
+Without an explicit budget_ms, a fallback walk may run up to ~60s; pass budget_ms to cap it. \
+index_maybe_stale:true means candidates may miss files created/renamed after the index snapshot.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -144,7 +150,8 @@ When roots are drive roots and exts is given, candidates come from the name inde
                     "prune_system": { "type": "boolean", "default": true, "description": "Skip whole-machine noise: C:\\Windows, Program Files, ProgramData, $Recycle.Bin and similar directories directly under a drive root. Set false to traverse them (much slower)." },
                     "budget_ms": { "type": "integer", "default": 10000, "description": "Wall-clock budget for the traversal in ms (0 = unlimited). On expiry the partial result comes back with timed_out:true." },
                     "skip_dirs": { "type": "array", "items": { "type": "string" } },
-                    "use_index": { "type": "boolean", "default": false, "description": "Also serve subdirectory roots from the name index (drive roots already do, when exts is given). Much faster but newly created files can be missing until the index refreshes." }
+                    "use_index": { "type": "boolean", "default": false, "description": "Also serve subdirectory roots from the name index (drive roots already do, when exts is given). Much faster but newly created files can be missing until the index refreshes." },
+                    "fresh": { "type": "boolean", "default": false, "description": "Skip the name index entirely and walk the filesystem (always up to date; much slower on whole drives)." }
                 },
                 "required": ["pattern"]
             }
@@ -221,6 +228,8 @@ fn files_index_result(
         "index_age_ms": age_ms,
         "index_state": index::status(),
         "index_complete": complete,
+        "index_stale": false,
+        "index_maybe_stale": index::maybe_stale(age_ms),
         "elapsed_ms": elapsed.as_millis(),
         "truncated": truncated,
         "timed_out": timed_out,
@@ -247,28 +256,35 @@ fn run_search_files(args: &Value) -> Result<String, String> {
         .map_or(false, |a| !a.is_empty());
     let refresh = arg_bool(args, "refresh_index", false);
     let force_index = arg_bool(args, "use_index", false);
+    // fresh=true：完全跳过索引，直接遍历（永远最新，但整盘约 20-40s）
+    let fresh = arg_bool(args, "fresh", false);
 
     let start = Instant::now();
 
-    // 索引不完整（撞条目上限）且命中不足时的种子结果：先返回索引命中，
-    // 再继续走真实遍历补齐，避免「索引 ready 但文件没进索引」的假阴性。
-    let mut seed: Option<(Vec<index::Hit>, u64, u128)> = None;
+    // 命中不足时的种子结果：先返回索引命中，再继续走真实遍历补齐。
+    // 两种触发：①索引撞条目上限（complete=false）截断；②索引完整但零命中，
+    // 而索引只是建立时的快照，之后新建的文件不在里面（suspicious miss）。
+    // 不兜底就会把「文件刚建、索引还没刷」误报成「文件不存在」。
+    let mut seed: Option<(Vec<index::Hit>, u64, u128, bool)> = None;
 
     // 整盘查询优先走索引：只有剪枝参数与建索引时完全一致才用，保证结果集不变。
     // 索引没建过时：先试磁盘缓存（约 0.2s）；真冷启动则一趟遍历同时建索引 + 答查询，
     // 避免后台建索引与兜底遍历并发抢 I/O（否则首次整盘查询会慢到 ~55s）。
     // 子目录查询默认不走索引（可能要刚建的文件），传 use_index: true 才强制用。
     let is_drive_query = roots_are_drives(&roots);
-    if prune_system
+    // refresh_index 是显式请求：即使本次 fresh 也照样重建索引
+    if refresh {
+        index::ensure_ready();
+        index::rebuild();
+    }
+    if !fresh
+        && !refresh
+        && prune_system
         && !include_hidden
         && !extra_skip
         && (is_drive_query || force_index)
     {
-        if refresh {
-            index::ensure_ready();
-            index::rebuild();
-        } else {
-            let budget = if budget_ms > 0 {
+        let budget = if budget_ms > 0 {
                 Some(Duration::from_millis(budget_ms as u64))
             } else {
                 None
@@ -297,7 +313,7 @@ fn run_search_files(args: &Value) -> Result<String, String> {
                             start.elapsed(),
                         ));
                     }
-                    seed = Some((hits, entries, 0));
+                    seed = Some((hits, entries, 0, false));
                     seeded_from_build = true;
                 }
             }
@@ -306,7 +322,9 @@ fn run_search_files(args: &Value) -> Result<String, String> {
                 if let Some((hits, entries, age, full, complete)) =
                     index::query(&re, &roots, &exts, max_results, budget)
                 {
-                    if complete || hits.len() >= max_results {
+                    // 索引完整但零命中：缓存可能比新文件旧，继续遍历兜底
+                    let stale = index::suspicious_miss(hits.len(), age, complete);
+                    if (complete && !stale) || hits.len() >= max_results {
                         return Ok(files_index_result(
                             &pattern,
                             &roots,
@@ -319,11 +337,11 @@ fn run_search_files(args: &Value) -> Result<String, String> {
                             start.elapsed(),
                         ));
                     }
-                    // 索引被截断：留着当种子，下面遍历补齐后再合并
-                    seed = Some((hits, entries, age));
+                    // 撞上限（complete=false）或零命中但可能过期（stale）：留着当种子，
+                    // 下面遍历补齐后再合并
+                    seed = Some((hits, entries, age, stale));
                 }
             }
-        }
     }
     // 整盘查询顺手把索引准备好，后续同类查询就只剩内存扫描
     if is_drive_query || force_index {
@@ -335,12 +353,16 @@ fn run_search_files(args: &Value) -> Result<String, String> {
     let timed_out = Arc::new(AtomicBool::new(false));
     // 索引不完整时这次遍历是「补齐」而不是「整机搜索」：默认 10s 通常走不完
     // 整盘（实测 ~40s），调用方没显式给 budget_ms 时放宽到 60s，宁可慢也别漏。
-    let walk_budget_ms =
-        if seed.is_some() && !budget_explicit { 60_000u128 } else { budget_ms };
+    // fresh=true 是显式要求「跳过索引、拿最新全量」，同样必须放宽，否则 10s 就截断。
+    let walk_budget_ms = if !budget_explicit && (seed.is_some() || fresh || is_drive_query) {
+        60_000u128
+    } else {
+        budget_ms
+    };
     let seen: Arc<Mutex<std::collections::HashSet<String>>> =
         Arc::new(Mutex::new(std::collections::HashSet::new()));
-    let seed_meta = seed.as_ref().map(|(h, entries, age)| (h.len(), *entries, *age));
-    if let Some((seed_hits, _, _)) = &seed {
+    let seed_meta = seed.as_ref().map(|(h, entries, age, stale)| (h.len(), *entries, *age, *stale));
+    if let Some((seed_hits, _, _, _)) = &seed {
         let mut hg = hits.lock().unwrap();
         let mut sg = seen.lock().unwrap();
         for h in seed_hits {
@@ -418,12 +440,20 @@ fn run_search_files(args: &Value) -> Result<String, String> {
         "count": count,
         "files": files,
     });
-    if let Some((seeded, entries, age)) = seed_meta {
+    // 完整走完整盘（索引兜底或 fresh 全量）后后台回填索引，下次搜索直接命中
+    if !timed_out && count < max_results && (seed_meta.is_some() || (fresh && is_drive_query)) {
+        index::refresh_after_full_walk();
+    }
+    if let Some((seeded, entries, age, stale)) = seed_meta {
         // 本次结果是「索引命中 + 遍历补齐」的并集；索引只覆盖了一部分目录
         out["source"] = json!("index+walk");
         out["index_entries"] = json!(entries);
         out["index_age_ms"] = json!(age);
-        out["index_complete"] = json!(false);
+        // stale=true：索引本身完整，只是快照比新文件旧（零命中后遍历补齐）；
+        // 否则是撞条目上限截断
+        out["index_complete"] = json!(stale);
+        out["index_stale"] = json!(stale);
+        out["index_maybe_stale"] = json!(index::maybe_stale(age));
         out["seeded_from_index"] = json!(seeded);
     }
     Ok(out.to_string())
@@ -438,6 +468,7 @@ fn run_search_text(args: &Value) -> Result<String, String> {
     let max_bytes = arg_usize(args, "max_file_size_mb", 10, 1, 200) as u64 * 1024 * 1024;
     let include_hidden = arg_bool(args, "include_hidden", false);
     let prune_system = arg_bool(args, "prune_system", true);
+    let budget_explicit = args.get("budget_ms").is_some();
     let budget_ms = arg_usize(args, "budget_ms", 10_000, 0, 600_000) as u128;
     let exts = lower_list(args, "exts");
     let skip = skip_set(args);
@@ -451,7 +482,18 @@ fn run_search_text(args: &Value) -> Result<String, String> {
         .and_then(Value::as_array)
         .map_or(false, |a| !a.is_empty());
     let force_index = arg_bool(args, "use_index", false);
-    if !exts.is_empty()
+    // fresh=true：完全跳过索引，直接遍历（永远最新，但整盘约 20-40s）
+    let fresh = arg_bool(args, "fresh", false);
+    // 本次是否因索引不可信而退回遍历（截断 / 零命中但快照可能过期）
+    let mut index_fallback = false;
+    // 零命中过期兜底时只补扫「索引建立之后修改过」的文件（缺的正是这些）；
+    // 截断兜底仍需全量遍历，故为 None。
+    let mut recent_after: Option<u64> = None;
+    // 索引候选扫描本身是否超时/被候选上限截断（零命中兜底时带进最终结果）
+    let mut index_scan_timed_out = false;
+    let mut index_scan_trunc = false;
+    if !fresh
+        && !exts.is_empty()
         && prune_system
         && !include_hidden
         && !extra_skip
@@ -474,28 +516,48 @@ fn run_search_text(args: &Value) -> Result<String, String> {
         {
             // 索引被条目上限截断时候选集不全，直接退回遍历，宁可慢也不给假阴性
             if complete {
-                let (mut files, timed_out) = search_text_candidates(
+                let (mut files, cand_timed_out) = search_text_candidates(
                     &cands, &re, max_bytes, per_file, max_files, budget_ms, search_start,
                 );
                 files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
                 files.truncate(max_files);
                 let count = files.len();
-                return Ok(json!({
-                    "pattern": pattern,
-                    "roots": roots,
-                    "source": "index",
-                    "index_entries": entries,
-                    "index_age_ms": age,
-                    "index_state": index::status(),
-                    "index_complete": true,
-                    "scanned": cands.len(),
-                    "elapsed_ms": start.elapsed().as_millis(),
-                    "truncated": timed_out || cand_trunc || count >= max_files,
-                    "timed_out": timed_out,
-                    "count": count,
-                    "files": files,
-                })
-                .to_string());
+                // 索引是快照：完整索引却零命中，可能只是文件新建后还没进索引
+                // （与文件名搜索的 suspicious_miss 同口径）。此时退回遍历补齐，
+                // 否则内容搜索会把新建文件误报成「不存在」。
+                // 零命中即使候选扫描已超时也要补扫：超时只是「老文件没查完」，
+                // 而补扫看的是索引之后的新文件，二者不冲突。
+                let stale = index::suspicious_miss(count, age, true);
+                if !stale {
+                    return Ok(json!({
+                        "pattern": pattern,
+                        "roots": roots,
+                        "source": "index",
+                        "index_entries": entries,
+                        "index_age_ms": age,
+                        "index_state": index::status(),
+                        "index_complete": true,
+                        "index_stale": false,
+                        "index_maybe_stale": index::maybe_stale(age),
+                        "scanned": cands.len(),
+                        "elapsed_ms": start.elapsed().as_millis(),
+                        "truncated": cand_timed_out || cand_trunc || count >= max_files,
+                        "timed_out": cand_timed_out,
+                        "count": count,
+                        "files": files,
+                    })
+                    .to_string());
+                }
+                // 零命中且快照可能过期：落到下面的遍历兜底。
+                // 只补扫索引建立之后修改过的文件（缺的正是这些），
+                // 文件名遍历约 30s，但内容只读新文件，不会整盘重读。
+                recent_after =
+                    Some(now_unix_secs().saturating_sub(age as u64 / 1000 + 60));
+                index_fallback = true;
+                index_scan_timed_out = cand_timed_out;
+                index_scan_trunc = cand_trunc;
+            } else {
+                index_fallback = true;
             }
         }
     }
@@ -509,10 +571,17 @@ fn run_search_text(args: &Value) -> Result<String, String> {
     let exts_c = exts.clone();
     let skip_c = skip.clone();
     let timeout_c = timed_out.clone();
-    // 同上：索引不完整退回遍历时，预算从遍历开始计，不吃建索引的时间
+    let recent_c = recent_after.map(|s| UNIX_EPOCH + Duration::from_secs(s));
+    // 同上：索引不完整退回遍历时，预算从遍历开始计，不吃建索引的时间；
+    // 索引兜底（截断 / 可能过期）默认给 60s，否则 10s 走不完整盘，结果会静默不全。
+    let walk_budget_ms = if !budget_explicit && index_fallback {
+        60_000u128
+    } else {
+        budget_ms
+    };
     let walk_start = Instant::now();
     let scanned = walk_roots(&roots, include_hidden, stop.clone(), move |path, info| {
-        if budget_ms > 0 && walk_start.elapsed().as_millis() >= budget_ms {
+        if walk_budget_ms > 0 && walk_start.elapsed().as_millis() >= walk_budget_ms {
             timeout_c.store(true, Ordering::Relaxed);
             return Step::Quit;
         }
@@ -524,6 +593,12 @@ fn run_search_text(args: &Value) -> Result<String, String> {
         }
         if info.is_dir {
             return Step::Continue;
+        }
+        // 零命中过期兜底：只读索引建立之后新建/改过的文件
+        if let Some(cut) = recent_c {
+            if info.modified.map_or(true, |m| m < cut) {
+                return Step::Continue;
+            }
         }
         if !exts_c.is_empty() && !ext_matches(path, &exts_c) {
             return Step::Continue;
@@ -553,13 +628,22 @@ fn run_search_text(args: &Value) -> Result<String, String> {
     let count = files.len();
     let timed_out = timed_out.load(Ordering::Relaxed);
 
+    // 索引兜底遍历完整走完后回填索引：下次同一内容搜索直接走候选，不再整盘读文件
+    if index_fallback && !timed_out && count < max_files && roots_are_drives(&roots) {
+        index::refresh_after_full_walk();
+    }
+
     Ok(json!({
         "pattern": pattern,
         "roots": roots,
+        "source": "walk",
+        "index_fallback": index_fallback,
+        "recent_only": recent_after.is_some(),
+        "index_state": index::status(),
         "scanned": scanned,
         "elapsed_ms": start.elapsed().as_millis(),
-        "truncated": timed_out || count >= max_files,
-        "timed_out": timed_out,
+        "truncated": timed_out || index_scan_timed_out || index_scan_trunc || count >= max_files,
+        "timed_out": timed_out || index_scan_timed_out,
         "count": count,
         "files": files,
     })
@@ -746,6 +830,13 @@ fn ext_matches(path: &Path, exts: &HashSet<String>) -> bool {
 fn fmt_time(t: std::time::SystemTime) -> String {
     let dt: chrono::DateTime<chrono::Local> = t.into();
     dt.format("%Y-%m-%d %H:%M").to_string()
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// roots 全是盘符根（`C:/`、`D:/`）时才可能有对应的整盘索引。
