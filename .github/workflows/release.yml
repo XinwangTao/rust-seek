@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build windows-${{ matrix.arch }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+          - target: aarch64-pc-windows-msvc
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/rust-seek.exe" out/
+          Copy-Item README.md out/ -ErrorAction SilentlyContinue
+          Copy-Item LICENSE* out/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path out/* -DestinationPath "rust-seek_${ver}_windows_${{ matrix.arch }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-seek-windows-${{ matrix.arch }}
+          path: rust-seek_*.zip
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
