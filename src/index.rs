@@ -21,7 +21,7 @@ use regex::Regex;
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -31,8 +31,10 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 const MAX_ENTRIES_DEFAULT: usize = 8_000_000;
 /// 缓存校验用的硬上限：即使当前配置调小，也不因此丢弃更大但合法的旧缓存
 const MAX_ENTRIES_CEIL: usize = 20_000_000;
-/// 缓存年龄超过这个值就在后台重建（旧索引继续服务）
-const TTL_SECS: u64 = 24 * 3600;
+/// 缓存年龄超过这个值就在后台重建（旧索引继续服务）。
+/// 索引是快照：TTL 越长，「索引命中但漏掉之后新建文件」的窗口越长。
+/// 重建约 40s 后台完成、不阻塞查询，4h 的 I/O 成本可忽略。
+const TTL_SECS: u64 = 4 * 3600;
 /// 超过这个年龄的缓存直接不用，重新遍历
 const MAX_CACHE_AGE_SECS: u64 = 7 * 24 * 3600;
 
@@ -74,6 +76,53 @@ struct Index {
 
 static INDEX: Mutex<Option<Box<Index>>> = Mutex::new(None);
 static BUILDING: AtomicBool = AtomicBool::new(false);
+/// 构建代次：每拿到一次构建权 +1。卡死复位后旧线程收尾时据此判断
+/// 「自己已经不是当前构建」，不会误清掉新构建的标志。
+static BUILD_GEN: AtomicU64 = AtomicU64::new(0);
+/// 本次构建开始时间（unix 秒），用于卡死检测
+static BUILD_STARTED: AtomicU64 = AtomicU64::new(0);
+/// 构建超过这个时间还没结束就视为卡死（正常整盘约 40s；本机有磁盘假死史）。
+/// 卡死时若不复位，进程会永远停在 building：索引不再刷新、内存也不再回收。
+const BUILD_STUCK_SECS: u64 = 900;
+
+/// 构建权守卫：acquire 时置 BUILDING，Drop 时（含 panic 展开）释放。
+/// 没有它，构建线程一次 panic 就会让该进程永久停在 building。
+struct BuildSlot(u64);
+
+impl BuildSlot {
+    fn acquire() -> Option<BuildSlot> {
+        if BUILDING.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        let gen = BUILD_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+        BUILD_STARTED.store(now_unix(), Ordering::SeqCst);
+        Some(BuildSlot(gen))
+    }
+}
+
+impl Drop for BuildSlot {
+    fn drop(&mut self) {
+        if BUILD_GEN.load(Ordering::SeqCst) == self.0 {
+            BUILDING.store(false, Ordering::SeqCst);
+            BUILD_STARTED.store(0, Ordering::SeqCst);
+        }
+    }
+}
+/// 兜底遍历后回填索引的节流时钟（unix 秒）
+static LAST_REFRESH_REQ: AtomicU64 = AtomicU64::new(0);
+/// 内存索引最后一次被查询的时间（unix 秒）
+static LAST_USE: AtomicU64 = AtomicU64::new(0);
+static REAPER: AtomicBool = AtomicBool::new(false);
+/// 内存索引约 600MB/进程（本机 620 万条）。空闲超过这个时间就释放，
+/// 下次查询从磁盘缓存重新载入（约 0.2s）。否则多个 MCP 进程 + GUI 会常驻 4GB+。
+/// `RUST_SEEK_IDLE_RELEASE_SECS` 可覆盖（测试/内存紧张时调小）。
+fn idle_release_secs() -> u64 {
+    std::env::var("RUST_SEEK_IDLE_RELEASE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n >= 10)
+        .unwrap_or(600)
+}
 
 pub struct Hit {
     pub path: String,
@@ -116,6 +165,7 @@ pub fn query(
 ) -> Option<(Vec<Hit>, u64, u128, bool, bool)> {
     let guard = lock();
     let index = guard.as_ref()?;
+    touch_index();
     let start = Instant::now();
     let mut hits = Vec::new();
     let mut truncated = false;
@@ -194,6 +244,7 @@ pub fn candidates(
 ) -> Option<(Vec<Hit>, u64, u128, bool, bool)> {
     let guard = lock();
     let index = guard.as_ref()?;
+    touch_index();
     let mut hits = Vec::new();
     let mut truncated = false;
 
@@ -298,9 +349,23 @@ fn prefix_bounds(index: &Index, prefix: &str) -> (usize, usize) {
     (lo, hi.max(lo))
 }
 
+/// 索引是「建好那一刻的快照」，之后新建/改名的文件不在里面。
+/// 完整索引却零命中，且索引不是刚刚建好的秒级缓存时，不能直接下「文件不存在」的结论，
+/// 调用方应回退真实遍历兜底（否则新建文件会静默搜不到）。
+pub fn suspicious_miss(hits: usize, age_ms: u128, complete: bool) -> bool {
+    const MIN_AGE_MS: u128 = 3_000;
+    complete && hits == 0 && age_ms >= MIN_AGE_MS
+}
+
+/// 结果仍可用，但索引可能不含「建立之后新建/改名」的文件。
+/// 仅用于结果标注，不触发兜底遍历（命中非零时兜底会把每次搜索拖慢到全盘级）。
+pub fn maybe_stale(age_ms: u128) -> bool {
+    age_ms >= 300_000
+}
+
 /// `idle` / `building` / `ready`
 pub fn status() -> &'static str {
-    if BUILDING.load(Ordering::Relaxed) {
+    if is_building() {
         return "building";
     }
     if lock().is_some() {
@@ -315,9 +380,20 @@ pub fn is_ready() -> bool {
     lock().is_some()
 }
 
-/// 后台是否正在建索引。
+/// 后台是否正在建索引。构建超时（疑似卡死）时复位标志并返回 false，
+/// 让调用方还能重新发起构建。
 pub fn is_building() -> bool {
-    BUILDING.load(Ordering::Relaxed)
+    if !BUILDING.load(Ordering::Relaxed) {
+        return false;
+    }
+    let started = BUILD_STARTED.load(Ordering::Relaxed);
+    if started > 0 && now_unix().saturating_sub(started) > BUILD_STUCK_SECS {
+        if BUILDING.swap(false, Ordering::SeqCst) {
+            BUILD_GEN.fetch_add(1, Ordering::SeqCst);
+        }
+        return false;
+    }
+    true
 }
 
 /// 同步载入磁盘缓存（不触发构建）。返回载入后是否有可用索引。
@@ -326,9 +402,9 @@ pub fn try_load() -> bool {
     if is_ready() {
         return true;
     }
-    if BUILDING.swap(true, Ordering::SeqCst) {
+    let Some(_slot) = BuildSlot::acquire() else {
         return false;
-    }
+    };
     let loaded = load_cache();
     let ok = loaded.is_some();
     {
@@ -337,7 +413,6 @@ pub fn try_load() -> bool {
             *guard = Some(Box::new(index));
         }
     }
-    BUILDING.store(false, Ordering::SeqCst);
     ok
 }
 
@@ -346,14 +421,15 @@ pub fn try_load() -> bool {
 pub fn ensure_ready() {
     match freshness() {
         Freshness::Fresh => {}
-        Freshness::Stale => rebuild(),
+        // 过期重建同样走跨进程节流：多个 MCP 进程不要同时扫整盘
+        Freshness::Stale => rebuild_throttled(),
         Freshness::Missing => {
             if try_load() {
                 if freshness() == Freshness::Stale {
-                    rebuild();
+                    rebuild_throttled();
                 }
-            } else if !BUILDING.swap(true, Ordering::SeqCst) {
-                spawn_build();
+            } else if let Some(slot) = BuildSlot::acquire() {
+                spawn_build(slot);
             }
         }
     }
@@ -377,15 +453,66 @@ fn freshness() -> Freshness {
 
 /// 强制重建；重建期间旧索引仍可查询。已在建则忽略。
 pub fn rebuild() {
-    if BUILDING.swap(true, Ordering::SeqCst) {
-        return;
+    if let Some(slot) = BuildSlot::acquire() {
+        spawn_build(slot);
     }
-    spawn_build();
 }
 
-fn spawn_build() {
-    // 调用前 BUILDING 已置 true
-    std::thread::spawn(|| {
+/// 索引需要刷新时调用：后台重建，但带节流，避免多个 MCP 进程 + GUI
+/// 在同一时间各扫一遍整盘。
+///
+/// - 已有构建在跑：直接返回（不写节流标记，让下次还有机会）；
+/// - 10 分钟内别的进程已请求过重建：返回（那个进程会写缓存，本次先继续用旧索引）。
+fn rebuild_throttled() {
+    const COOLDOWN_SECS: u64 = 600;
+    if is_building() || cross_process_recent_refresh(COOLDOWN_SECS) {
+        return;
+    }
+    let now = now_unix();
+    let last = LAST_REFRESH_REQ.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < COOLDOWN_SECS {
+        return;
+    }
+    if LAST_REFRESH_REQ
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        stamp_refresh_now();
+        rebuild();
+    }
+}
+
+/// 兜底遍历把整盘完整走完后调用：后台重建索引，下一次搜索就能直接命中，
+/// 不用再为同一个「新文件」反复整盘扫描。
+pub fn refresh_after_full_walk() {
+    rebuild_throttled();
+}
+
+/// 跨进程共享的「上次兜底回填时间」，与 index-v1.bin 同目录。
+fn refresh_stamp_path() -> Option<PathBuf> {
+    cache_path().map(|p| p.with_file_name("refresh-stamp"))
+}
+
+fn cross_process_recent_refresh(cooldown_secs: u64) -> bool {
+    let Some(path) = refresh_stamp_path() else { return false };
+    let Ok(text) = std::fs::read_to_string(&path) else { return false };
+    let Ok(last) = text.trim().parse::<u64>() else { return false };
+    now_unix().saturating_sub(last) < cooldown_secs
+}
+
+fn stamp_refresh_now() {
+    let Some(path) = refresh_stamp_path() else { return };
+    // 多进程并发读：先写临时文件再 rename，避免读到半截数字
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, now_unix().to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+fn spawn_build(slot: BuildSlot) {
+    // slot 移进线程：构建结束或被 panic 展开时由 Drop 释放 BUILDING
+    std::thread::spawn(move || {
+        let _slot = slot;
         let built = build();
         if let Some(index) = &built {
             save_cache(index);
@@ -394,23 +521,21 @@ fn spawn_build() {
         if let Some(index) = built {
             *guard = Some(Box::new(index));
         }
-        BUILDING.store(false, Ordering::SeqCst);
     });
 }
 
 /// 冷启动同步建索引（一趟遍历，阻塞当前线程），返回是否成功。
 /// 用于首次整盘内容搜索：先把索引建好再走 [`candidates`]，避免后台建索引与兜底遍历并发抢 I/O。
 pub fn build_sync() -> bool {
-    if BUILDING.swap(true, Ordering::SeqCst) {
+    let Some(_slot) = BuildSlot::acquire() else {
         return false;
-    }
+    };
     let outcome = build();
     let ok = outcome.is_some();
     if let Some(index) = outcome {
         save_cache(&index);
         *lock() = Some(Box::new(index));
     }
-    BUILDING.store(false, Ordering::SeqCst);
     ok
 }
 
@@ -423,11 +548,9 @@ pub fn build_and_match(
     exts: &HashSet<String>,
     max: usize,
 ) -> Option<(Vec<Hit>, u64, bool)> {
-    if BUILDING.swap(true, Ordering::SeqCst) {
-        return None;
-    }
+    let _slot = BuildSlot::acquire()?;
     let outcome = build_with_match(Some(re), Some(exts), max);
-    let result = match outcome {
+    match outcome {
         Some((index, hits)) => {
             let entries = index.items.len() as u64;
             let complete = index.complete;
@@ -436,9 +559,7 @@ pub fn build_and_match(
             Some((hits, entries, complete))
         }
         None => None,
-    };
-    BUILDING.store(false, Ordering::SeqCst);
-    result
+    }
 }
 
 fn lock() -> MutexGuard<'static, Option<Box<Index>>> {
@@ -450,6 +571,30 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// 记录索引被使用，并启动空闲回收线程（每个进程只启动一次）。
+fn touch_index() {
+    LAST_USE.store(now_unix(), Ordering::Relaxed);
+    if REAPER.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_secs(60));
+        let last = LAST_USE.load(Ordering::Relaxed);
+        if last == 0 || now_unix().saturating_sub(last) < idle_release_secs() {
+            continue;
+        }
+        // 正在重建时别释放：构建完成后会写回新索引
+        if is_building() {
+            continue;
+        }
+        let mut guard = lock();
+        if guard.is_some() {
+            *guard = None;
+            LAST_USE.store(now_unix(), Ordering::Relaxed);
+        }
+    });
 }
 
 // ---------- 构建 ----------
