@@ -187,10 +187,16 @@ pub fn is_noise_dir_name(name: &str) -> bool {
     )
 }
 
-/// 路径中任意一段是噪声目录。
+/// 路径中任意一段是整机噪声目录：回收站/系统还原/WinSxS，以及 node_modules、
+/// .git、target 等常见构建/依赖目录。
+///
+/// 口径必须与索引建库（`index::is_pruned`）一致：否则同一台机器的文件名搜索，
+/// 走索引和走遍历会返回不同结果集。
 pub fn path_in_noise_dir(path: &Path) -> bool {
     path.components().any(|c| match c {
-        std::path::Component::Normal(s) => s.to_str().map_or(false, is_noise_dir_name),
+        std::path::Component::Normal(s) => s.to_str().map_or(false, |n| {
+            is_noise_dir_name(n) || SKIP_DIRS.iter().any(|d| n.eq_ignore_ascii_case(d))
+        }),
         _ => false,
     })
 }

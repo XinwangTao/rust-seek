@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="generator" content="archify 2.16.0">
-  <title>Rust Seek 索引不完整时的兜底遍历</title>
+  <title>Rust Seek 索引快照过期兜底与回填</title>
   <script>
     // Resolve the theme before first paint so light-preference users don't
     // see a dark flash. The toolbar script below re-applies with UI state.
@@ -4955,7 +4955,7 @@
            data-preset-badge-blueprint="蓝图 / 修订 01"
            data-preset-badge-editorial="编辑风格 / 现场笔记">
         <div class="pulse-dot"></div>
-        <h1>Rust Seek 索引不完整时的兜底遍历</h1>
+        <h1>Rust Seek 索引快照过期兜底与回填</h1>
       </div>
     </div>
 
@@ -5004,8 +5004,8 @@
     <!-- Main Diagram -->
     <div class="diagram-container" data-detail-level="read"
          data-preset-badge-editorial-plate="ARCHIFY / 图版 04">
-      <svg viewBox="0 0 1014 534" role="img" lang="zh-CN" aria-labelledby="archify-diagram-title archify-diagram-description" data-preset="classic" data-quality-profile="showcase">
-        <title id="archify-diagram-title">Rust Seek 索引不完整时的兜底遍历</title>
+      <svg viewBox="0 0 1177 660" role="img" lang="zh-CN" aria-labelledby="archify-diagram-title archify-diagram-description" data-preset="classic" data-quality-profile="showcase">
+        <title id="archify-diagram-title">Rust Seek 索引快照过期兜底与回填</title>
         <desc id="archify-diagram-description">由 Archify 生成的工作流图。</desc>
         <!-- Definitions -->
         <defs>
@@ -5030,14 +5030,17 @@
         <rect width="100%" height="100%" fill="url(#grid)" />
 
         <!-- Swimlanes -->
-        <rect data-graph-role="structural-frame" data-composition-frame-kind="lane" data-composition-frame-id="lane-0" x="40" y="52" width="958" height="106" rx="10" class="c-lane" stroke-width="1"/>
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="lane" data-composition-frame-id="lane-0" x="40" y="52" width="1121" height="106" rx="10" class="c-lane" stroke-width="1"/>
         <text x="54" y="74" class="t-dim" font-size="10" font-weight="600">01 / 查询与响应</text>
 
-        <rect data-graph-role="structural-frame" data-composition-frame-kind="lane" data-composition-frame-id="lane-1" x="40" y="178" width="958" height="106" rx="10" class="c-lane" stroke-width="1"/>
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="lane" data-composition-frame-id="lane-1" x="40" y="178" width="1121" height="106" rx="10" class="c-lane" stroke-width="1"/>
         <text x="54" y="200" class="t-dim" font-size="10" font-weight="600">02 / 索引判定</text>
 
-        <rect data-graph-role="structural-frame" data-composition-frame-kind="lane" data-composition-frame-id="lane-2" x="40" y="304" width="958" height="106" rx="10" class="c-lane" stroke-width="1"/>
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="lane" data-composition-frame-id="lane-2" x="40" y="304" width="1121" height="106" rx="10" class="c-lane" stroke-width="1"/>
         <text x="54" y="326" class="t-dim" font-size="10" font-weight="600">03 / 兜底补齐</text>
+
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="lane" data-composition-frame-id="lane-3" x="40" y="430" width="1121" height="106" rx="10" class="c-lane" stroke-width="1"/>
+        <text x="54" y="452" class="t-dim" font-size="10" font-weight="600">04 / 维护与自愈</text>
 
         <!-- Phase headers -->
 
@@ -5046,17 +5049,19 @@
 
 
         <!-- Edge paths -->
-        <path data-edge-from="complete" data-edge-to="hit" data-edge-label="完整" data-edge-key="0" data-edge-id="complete-hit" data-composition-points="436.4,220;436.4,120;571.4,120" d="M 436.4 220 L 436.4 120 L 571.4 120" class="a-default" stroke-width="1.4" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="complete" data-edge-to="walk" data-edge-label="被上限截断" data-edge-key="1" data-edge-id="complete-walk" data-composition-points="370.4,246;20,246;20,372;367.4,372" d="M 370.4 246 L 20 246 L 20 372 L 367.4 372" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="hit" data-edge-to="resp" data-edge-label="直接返回" data-edge-key="2" data-edge-id="hit-resp" data-composition-points="699.4,120;755.8,120" d="M 699.4 120 L 755.8 120" class="a-default" stroke-width="1.4" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="index" data-edge-to="complete" data-edge-label="查完整性" data-edge-key="3" data-edge-id="index-complete" data-composition-points="316.4,146;316.4,168;436.4,168;436.4,220" d="M 316.4 146 L 316.4 168 L 436.4 168 L 436.4 220" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="merge" data-edge-to="resp" data-edge-label="index+walk" data-edge-key="4" data-edge-id="merge-resp" data-composition-points="699.4,372;819.8,372;819.8,146" d="M 699.4 372 L 819.8 372 L 819.8 146" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="query" data-edge-to="index" data-edge-label="整盘查询" data-edge-key="5" data-edge-id="query-index" data-composition-points="190,120;246.39999999999998,120" d="M 190 120 L 246.39999999999998 120" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="walk" data-edge-to="merge" data-edge-label="带种子遍历" data-edge-key="6" data-edge-id="walk-merge" data-composition-points="505.4,372;571.4,372" d="M 505.4 372 L 571.4 372" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="backfill" data-edge-to="selfheal" data-edge-label="守住建库线程" data-edge-key="0" data-edge-id="backfill-selfheal" data-composition-points="908.8,498;984.3999999999999,498" d="M 908.8 498 L 984.3999999999999 498" class="a-dashed" stroke-width="1.4" marker-end="url(#arrowhead-dashed)"/>
+        <path data-edge-from="fresh" data-edge-to="hit" data-edge-label="完整且有命中" data-edge-key="1" data-edge-id="fresh-hit" data-composition-points="436.4,220;436.4,120;580.4,120" d="M 436.4 220 L 436.4 120 L 580.4 120" class="a-default" stroke-width="1.4" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="fresh" data-edge-to="walk" data-edge-label="截断 / 零命中过期" data-edge-key="2" data-edge-id="fresh-walk" data-composition-points="364.4,246;20,246;20,372;358.4,372" d="M 364.4 246 L 20 246 L 20 372 L 358.4 372" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="hit" data-edge-to="resp" data-edge-label="直接返回" data-edge-key="3" data-edge-id="hit-resp" data-composition-points="708.4,120;764.8,120" d="M 708.4 120 L 764.8 120" class="a-default" stroke-width="1.4" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="index" data-edge-to="fresh" data-edge-label="查完整性与年龄" data-edge-key="4" data-edge-id="index-fresh" data-composition-points="316.4,146;316.4,168;436.4,168;436.4,220" d="M 316.4 146 L 316.4 168 L 436.4 168 L 436.4 220" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="merge" data-edge-to="backfill" data-edge-label="遍历完整结束" data-edge-key="5" data-edge-id="merge-backfill" data-composition-points="644.4,398;644.4,498;768.8,498" d="M 644.4 398 L 644.4 498 L 768.8 498" class="a-dashed" stroke-width="1.4" marker-end="url(#arrowhead-dashed)"/>
+        <path data-edge-from="merge" data-edge-to="resp" data-edge-label="index+walk / walk" data-edge-key="6" data-edge-id="merge-resp" data-composition-points="708.4,372;838.8,372;838.8,146" d="M 708.4 372 L 838.8 372 L 838.8 146" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="query" data-edge-to="index" data-edge-label="整盘查询" data-edge-key="7" data-edge-id="query-index" data-composition-points="190,120;246.39999999999998,120" d="M 190 120 L 246.39999999999998 120" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="walk" data-edge-to="merge" data-edge-label="带种子遍历" data-edge-key="8" data-edge-id="walk-merge" data-composition-points="514.4,372;580.4,372" d="M 514.4 372 L 580.4 372" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
 
         <!-- Nodes -->
-        <g id="node-query" data-node-id="query" data-node-label="搜索请求" tabindex="0" role="button" aria-label="聚焦搜索请求，search_files / 整机文件名, 查询与响应" aria-pressed="false" data-node-kind="frontend" data-node-sublabel="search_files / 整机文件名" data-node-context="查询与响应">
-          <title>搜索请求 · search_files / 整机文件名 · 查询与响应</title>
+        <g id="node-query" data-node-id="query" data-node-label="搜索请求" tabindex="0" role="button" aria-label="聚焦搜索请求，search_files · 整盘, 查询与响应" aria-pressed="false" data-node-kind="frontend" data-node-sublabel="search_files · 整盘" data-node-context="查询与响应">
+          <title>搜索请求 · search_files · 整盘 · 查询与响应</title>
           <rect x="48" y="94" width="142" height="52" rx="6" class="c-mask"/>
           <rect x="48" y="94" width="142" height="52" rx="6" class="c-frontend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="frontend" class="semantic-sigil s-frontend" transform="translate(54 100) scale(0.6875)">
@@ -5066,7 +5071,7 @@
             <circle cx="6.3" cy="4.8" r=".7" class="sigil-fill"/>
           </g>
           <text data-node-label="" data-detail-anchor="" x="119" y="115" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">搜索请求</text>
-          <text data-detail="context" x="119" y="132" class="t-muted" font-size="8" text-anchor="middle">search_files / 整机文件名</text>
+          <text data-detail="context" x="119" y="132" class="t-muted" font-size="8" text-anchor="middle">search_files · 整盘</text>
         </g>
 
         <g id="node-index" data-node-id="index" data-node-label="取索引候选" tabindex="0" role="button" aria-label="聚焦取索引候选，index-v1.bin 内存索引, 查询与响应" aria-pressed="false" data-node-kind="backend" data-node-sublabel="index-v1.bin 内存索引" data-node-context="查询与响应">
@@ -5082,114 +5087,145 @@
 
         <g id="node-hit" data-node-id="hit" data-node-label="索引命中" tabindex="0" role="button" aria-label="聚焦索引命中，source: index, 查询与响应" aria-pressed="false" data-node-kind="database" data-node-sublabel="source: index" data-node-tag="快路径" data-node-context="查询与响应">
           <title>索引命中 · source: index · 查询与响应 · 快路径</title>
-          <rect x="571.4" y="86" width="128" height="68" rx="6" class="c-mask"/>
-          <rect x="571.4" y="86" width="128" height="68" rx="6" class="c-database" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(577.4 92) scale(0.6875)">
+          <rect x="580.4" y="86" width="128" height="68" rx="6" class="c-mask"/>
+          <rect x="580.4" y="86" width="128" height="68" rx="6" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(586.4 92) scale(0.6875)">
             <ellipse cx="8" cy="4" rx="5" ry="2"/>
             <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="635.4" y="107" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">索引命中</text>
-          <text data-detail="context" x="635.4" y="124" class="t-muted" font-size="8" text-anchor="middle">source: index</text>
-        <text data-detail="fine" x="635.4" y="142" class="t-database" font-size="7" text-anchor="middle">快路径</text>
+          <text data-node-label="" data-detail-anchor="" x="644.4" y="107" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">索引命中</text>
+          <text data-detail="context" x="644.4" y="124" class="t-muted" font-size="8" text-anchor="middle">source: index</text>
+        <text data-detail="fine" x="644.4" y="142" class="t-database" font-size="7" text-anchor="middle">快路径</text>
         </g>
 
-        <g id="node-resp" data-node-id="resp" data-node-label="响应" tabindex="0" role="button" aria-label="聚焦响应，带 index_complete, 查询与响应" aria-pressed="false" data-node-kind="frontend" data-node-sublabel="带 index_complete" data-node-context="查询与响应">
-          <title>响应 · 带 index_complete · 查询与响应</title>
-          <rect x="755.8" y="94" width="128" height="52" rx="6" class="c-mask"/>
-          <rect x="755.8" y="94" width="128" height="52" rx="6" class="c-frontend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="frontend" class="semantic-sigil s-frontend" transform="translate(761.8 100) scale(0.6875)">
+        <g id="node-resp" data-node-id="resp" data-node-label="响应" tabindex="0" role="button" aria-label="聚焦响应，index_stale · maybe_stale, 查询与响应" aria-pressed="false" data-node-kind="frontend" data-node-sublabel="index_stale · maybe_stale" data-node-context="查询与响应">
+          <title>响应 · index_stale · maybe_stale · 查询与响应</title>
+          <rect x="764.8" y="94" width="148" height="52" rx="6" class="c-mask"/>
+          <rect x="764.8" y="94" width="148" height="52" rx="6" class="c-frontend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="frontend" class="semantic-sigil s-frontend" transform="translate(770.8 100) scale(0.6875)">
             <rect x="2" y="3" width="12" height="10" rx="2"/>
             <path d="M2 6.5h12"/>
             <circle cx="4.1" cy="4.8" r=".7" class="sigil-fill"/>
             <circle cx="6.3" cy="4.8" r=".7" class="sigil-fill"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="819.8" y="115" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">响应</text>
-          <text data-detail="context" x="819.8" y="132" class="t-muted" font-size="8" text-anchor="middle">带 index_complete</text>
+          <text data-node-label="" data-detail-anchor="" x="838.8" y="115" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">响应</text>
+          <text data-detail="context" x="838.8" y="132" class="t-muted" font-size="8" text-anchor="middle">index_stale · maybe_stale</text>
         </g>
 
-        <g id="node-complete" data-node-id="complete" data-node-label="索引完整？" tabindex="0" role="button" aria-label="聚焦索引完整？，complete 标记, 索引判定" aria-pressed="false" data-node-kind="security" data-node-sublabel="complete 标记" data-node-context="索引判定">
-          <title>索引完整？ · complete 标记 · 索引判定</title>
-          <rect x="370.4" y="220" width="132" height="52" rx="6" class="c-mask"/>
-          <rect x="370.4" y="220" width="132" height="52" rx="6" class="c-security" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="security" class="semantic-sigil s-security" transform="translate(376.4 226) scale(0.6875)">
+        <g id="node-fresh" data-node-id="fresh" data-node-label="完整且新鲜？" tabindex="0" role="button" aria-label="聚焦完整且新鲜？，complete + age + 命中数, 索引判定" aria-pressed="false" data-node-kind="security" data-node-sublabel="complete + age + 命中数" data-node-context="索引判定">
+          <title>完整且新鲜？ · complete + age + 命中数 · 索引判定</title>
+          <rect x="364.4" y="220" width="144" height="52" rx="6" class="c-mask"/>
+          <rect x="364.4" y="220" width="144" height="52" rx="6" class="c-security" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="security" class="semantic-sigil s-security" transform="translate(370.4 226) scale(0.6875)">
             <path d="M8 2.2 13 4v3.5c0 3.1-1.8 5.4-5 6.5-3.2-1.1-5-3.4-5-6.5V4Z"/>
             <path d="m5.8 8 1.5 1.5 3-3"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="436.4" y="241" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">索引完整？</text>
-          <text data-detail="context" x="436.4" y="258" class="t-muted" font-size="8" text-anchor="middle">complete 标记</text>
+          <text data-node-label="" data-detail-anchor="" x="436.4" y="241" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">完整且新鲜？</text>
+          <text data-detail="context" x="436.4" y="258" class="t-muted" font-size="8" text-anchor="middle">complete + age + 命中数</text>
         </g>
 
-        <g id="node-walk" data-node-id="walk" data-node-label="真实遍历补齐" tabindex="0" role="button" aria-label="聚焦真实遍历补齐，预算独立计时, 兜底补齐" aria-pressed="false" data-node-kind="backend" data-node-sublabel="预算独立计时" data-node-tag="默认 60s" data-node-context="兜底补齐">
-          <title>真实遍历补齐 · 预算独立计时 · 兜底补齐 · 默认 60s</title>
-          <rect x="367.4" y="338" width="138" height="68" rx="6" class="c-mask"/>
-          <rect x="367.4" y="338" width="138" height="68" rx="6" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(373.4 344) scale(0.6875)">
+        <g id="node-walk" data-node-id="walk" data-node-label="真实遍历补齐" tabindex="0" role="button" aria-label="聚焦真实遍历补齐，文件名 60s · 内容只读新文件, 兜底补齐" aria-pressed="false" data-node-kind="backend" data-node-sublabel="文件名 60s · 内容只读新文件" data-node-tag="兜底" data-node-context="兜底补齐">
+          <title>真实遍历补齐 · 文件名 60s · 内容只读新文件 · 兜底补齐 · 兜底</title>
+          <rect x="358.4" y="338" width="156" height="68" rx="6" class="c-mask"/>
+          <rect x="358.4" y="338" width="156" height="68" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(364.4 344) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
           <text data-node-label="" data-detail-anchor="" x="436.4" y="359" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">真实遍历补齐</text>
-          <text data-detail="context" x="436.4" y="376" class="t-muted" font-size="8" text-anchor="middle">预算独立计时</text>
-        <text data-detail="fine" x="436.4" y="394" class="t-backend" font-size="7" text-anchor="middle">默认 60s</text>
+          <text data-detail="context" x="436.4" y="376" class="t-muted" font-size="8" text-anchor="middle">文件名 60s · 内容只读新文件</text>
+        <text data-detail="fine" x="436.4" y="394" class="t-backend" font-size="7" text-anchor="middle">兜底</text>
         </g>
 
         <g id="node-merge" data-node-id="merge" data-node-label="合并去重" tabindex="0" role="button" aria-label="聚焦合并去重，索引 + 遍历, 兜底补齐" aria-pressed="false" data-node-kind="backend" data-node-sublabel="索引 + 遍历" data-node-context="兜底补齐">
           <title>合并去重 · 索引 + 遍历 · 兜底补齐</title>
-          <rect x="571.4" y="346" width="128" height="52" rx="6" class="c-mask"/>
-          <rect x="571.4" y="346" width="128" height="52" rx="6" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(577.4 352) scale(0.6875)">
+          <rect x="580.4" y="346" width="128" height="52" rx="6" class="c-mask"/>
+          <rect x="580.4" y="346" width="128" height="52" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(586.4 352) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="635.4" y="367" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">合并去重</text>
-          <text data-detail="context" x="635.4" y="384" class="t-muted" font-size="8" text-anchor="middle">索引 + 遍历</text>
+          <text data-node-label="" data-detail-anchor="" x="644.4" y="367" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">合并去重</text>
+          <text data-detail="context" x="644.4" y="384" class="t-muted" font-size="8" text-anchor="middle">索引 + 遍历</text>
+        </g>
+
+        <g id="node-backfill" data-node-id="backfill" data-node-label="后台回填索引" tabindex="0" role="button" aria-label="聚焦后台回填索引，10 分钟跨进程节流, 维护与自愈" aria-pressed="false" data-node-kind="backend" data-node-sublabel="10 分钟跨进程节流" data-node-context="维护与自愈">
+          <title>后台回填索引 · 10 分钟跨进程节流 · 维护与自愈</title>
+          <rect x="768.8" y="472" width="140" height="52" rx="6" class="c-mask"/>
+          <rect x="768.8" y="472" width="140" height="52" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(774.8 478) scale(0.6875)">
+            <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
+          </g>
+          <text data-node-label="" data-detail-anchor="" x="838.8" y="493" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">后台回填索引</text>
+          <text data-detail="context" x="838.8" y="510" class="t-muted" font-size="8" text-anchor="middle">10 分钟跨进程节流</text>
+        </g>
+
+        <g id="node-selfheal" data-node-id="selfheal" data-node-label="内存与构建自愈" tabindex="0" role="button" aria-label="聚焦内存与构建自愈，空闲 10min 释放 · 构建 900s 复位, 维护与自愈" aria-pressed="false" data-node-kind="security" data-node-sublabel="空闲 10min 释放 · 构建 900s 复位" data-node-context="维护与自愈">
+          <title>内存与构建自愈 · 空闲 10min 释放 · 构建 900s 复位 · 维护与自愈</title>
+          <rect x="984.3999999999999" y="472" width="168" height="52" rx="6" class="c-mask"/>
+          <rect x="984.3999999999999" y="472" width="168" height="52" rx="6" class="c-security" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="security" class="semantic-sigil s-security" transform="translate(990.3999999999999 478) scale(0.6875)">
+            <path d="M8 2.2 13 4v3.5c0 3.1-1.8 5.4-5 6.5-3.2-1.1-5-3.4-5-6.5V4Z"/>
+            <path d="m5.8 8 1.5 1.5 3-3"/>
+          </g>
+          <text data-node-label="" data-detail-anchor="" x="1068.3999999999999" y="493" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">内存与构建自愈</text>
+          <text data-detail="context" x="1068.3999999999999" y="510" class="t-muted" font-size="8" text-anchor="middle">空闲 10min 释放 · 构建 900s 复位</text>
         </g>
 
         <!-- Edge labels -->
-        <g data-detail="context" data-edge-from="complete" data-edge-to="hit" data-edge-label="完整" data-edge-key="0" data-edge-id="complete-hit">
-          <rect x="488.9" y="100" width="30" height="14" rx="3" class="c-mask"/>
-          <text x="503.9" y="110" class="t-muted" font-size="8" text-anchor="middle">完整</text>
+        <g data-detail="context" data-edge-from="backfill" data-edge-to="selfheal" data-edge-label="守住建库线程" data-edge-key="0" data-edge-id="backfill-selfheal">
+          <rect x="912.8" y="478" width="67.6" height="14" rx="3" class="c-mask"/>
+          <text x="946.5999999999999" y="488" class="t-database" font-size="8" text-anchor="middle">守住建库线程</text>
         </g>
-        <g data-detail="context" data-edge-from="complete" data-edge-to="walk" data-edge-label="被上限截断" data-edge-key="1" data-edge-id="complete-walk">
-          <rect x="166.2" y="226" width="58" height="14" rx="3" class="c-mask"/>
-          <text x="195.2" y="236" class="t-backend" font-size="8" text-anchor="middle">被上限截断</text>
+        <g data-detail="context" data-edge-from="fresh" data-edge-to="hit" data-edge-label="完整且有命中" data-edge-key="1" data-edge-id="fresh-hit">
+          <rect x="474.59999999999997" y="100" width="67.6" height="14" rx="3" class="c-mask"/>
+          <text x="508.4" y="110" class="t-muted" font-size="8" text-anchor="middle">完整且有命中</text>
         </g>
-        <g data-detail="context" data-edge-from="hit" data-edge-to="resp" data-edge-label="直接返回" data-edge-key="2" data-edge-id="hit-resp">
-          <rect x="703.3999999999999" y="100" width="48.4" height="14" rx="3" class="c-mask"/>
-          <text x="727.5999999999999" y="110" class="t-muted" font-size="8" text-anchor="middle">直接返回</text>
+        <g data-detail="context" data-edge-from="fresh" data-edge-to="walk" data-edge-label="截断 / 零命中过期" data-edge-key="2" data-edge-id="fresh-walk">
+          <rect x="146.39999999999998" y="226" width="91.6" height="14" rx="3" class="c-mask"/>
+          <text x="192.2" y="236" class="t-backend" font-size="8" text-anchor="middle">截断 / 零命中过期</text>
         </g>
-        <g data-detail="context" data-edge-from="index" data-edge-to="complete" data-edge-label="查完整性" data-edge-key="3" data-edge-id="index-complete">
-          <rect x="352.2" y="148" width="48.4" height="14" rx="3" class="c-mask"/>
-          <text x="376.4" y="158" class="t-backend" font-size="8" text-anchor="middle">查完整性</text>
+        <g data-detail="context" data-edge-from="hit" data-edge-to="resp" data-edge-label="直接返回" data-edge-key="3" data-edge-id="hit-resp">
+          <rect x="712.3999999999999" y="100" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="736.5999999999999" y="110" class="t-muted" font-size="8" text-anchor="middle">直接返回</text>
         </g>
-        <g data-detail="context" data-edge-from="merge" data-edge-to="resp" data-edge-label="index+walk" data-edge-key="4" data-edge-id="merge-resp">
-          <rect x="730.5999999999999" y="352" width="58" height="14" rx="3" class="c-mask"/>
-          <text x="759.5999999999999" y="362" class="t-backend" font-size="8" text-anchor="middle">index+walk</text>
+        <g data-detail="context" data-edge-from="index" data-edge-to="fresh" data-edge-label="查完整性与年龄" data-edge-key="4" data-edge-id="index-fresh">
+          <rect x="337.79999999999995" y="148" width="77.2" height="14" rx="3" class="c-mask"/>
+          <text x="376.4" y="158" class="t-backend" font-size="8" text-anchor="middle">查完整性与年龄</text>
         </g>
-        <g data-detail="context" data-edge-from="query" data-edge-to="index" data-edge-label="整盘查询" data-edge-key="5" data-edge-id="query-index">
+        <g data-detail="context" data-edge-from="merge" data-edge-to="backfill" data-edge-label="遍历完整结束" data-edge-key="5" data-edge-id="merge-backfill">
+          <rect x="672.8" y="478" width="67.6" height="14" rx="3" class="c-mask"/>
+          <text x="706.5999999999999" y="488" class="t-database" font-size="8" text-anchor="middle">遍历完整结束</text>
+        </g>
+        <g data-detail="context" data-edge-from="merge" data-edge-to="resp" data-edge-label="index+walk / walk" data-edge-key="6" data-edge-id="merge-resp">
+          <rect x="727.8" y="352" width="91.6" height="14" rx="3" class="c-mask"/>
+          <text x="773.5999999999999" y="362" class="t-backend" font-size="8" text-anchor="middle">index+walk / walk</text>
+        </g>
+        <g data-detail="context" data-edge-from="query" data-edge-to="index" data-edge-label="整盘查询" data-edge-key="7" data-edge-id="query-index">
           <rect x="194" y="100" width="48.4" height="14" rx="3" class="c-mask"/>
           <text x="218.2" y="110" class="t-backend" font-size="8" text-anchor="middle">整盘查询</text>
         </g>
-        <g data-detail="context" data-edge-from="walk" data-edge-to="merge" data-edge-label="带种子遍历" data-edge-key="6" data-edge-id="walk-merge">
-          <rect x="509.4" y="352" width="58" height="14" rx="3" class="c-mask"/>
-          <text x="538.4" y="362" class="t-backend" font-size="8" text-anchor="middle">带种子遍历</text>
+        <g data-detail="context" data-edge-from="walk" data-edge-to="merge" data-edge-label="带种子遍历" data-edge-key="8" data-edge-id="walk-merge">
+          <rect x="518.4" y="352" width="58" height="14" rx="3" class="c-mask"/>
+          <text x="547.4" y="362" class="t-backend" font-size="8" text-anchor="middle">带种子遍历</text>
         </g>
 
         <!-- Legend -->
         <g data-legend="" data-legend-bridge="">
-          <text x="20" y="434" class="t-primary" font-size="12" font-weight="650">图例</text>
-          <g data-legend-semantic-kind="frontend" data-legend-kind="frontend" data-legend-label="用户界面" data-legend-x="20" data-legend-baseline="454" data-legend-width="78">
-            <rect x="20" y="446" width="14" height="9" rx="2" class="c-frontend" stroke-width="1"/>
-            <text x="42" y="454" class="t-muted" font-size="7.5" font-weight="500">用户界面</text>
+          <text x="20" y="560" class="t-primary" font-size="12" font-weight="650">图例</text>
+          <g data-legend-semantic-kind="frontend" data-legend-kind="frontend" data-legend-label="用户界面" data-legend-x="20" data-legend-baseline="580" data-legend-width="78">
+            <rect x="20" y="572" width="14" height="9" rx="2" class="c-frontend" stroke-width="1"/>
+            <text x="42" y="580" class="t-muted" font-size="7.5" font-weight="500">用户界面</text>
           </g>
-          <g data-legend-semantic-kind="backend" data-legend-kind="backend" data-legend-label="Agent 逻辑" data-legend-x="105" data-legend-baseline="454" data-legend-width="87">
-            <rect x="105" y="446" width="14" height="9" rx="2" class="c-backend" stroke-width="1"/>
-            <text x="127" y="454" class="t-muted" font-size="7.5" font-weight="500">Agent 逻辑</text>
+          <g data-legend-semantic-kind="backend" data-legend-kind="backend" data-legend-label="Agent 逻辑" data-legend-x="105" data-legend-baseline="580" data-legend-width="87">
+            <rect x="105" y="572" width="14" height="9" rx="2" class="c-backend" stroke-width="1"/>
+            <text x="127" y="580" class="t-muted" font-size="7.5" font-weight="500">Agent 逻辑</text>
           </g>
-          <g data-legend-semantic-kind="security" data-legend-kind="security" data-legend-label="策略" data-legend-x="199" data-legend-baseline="454" data-legend-width="61">
-            <rect x="199" y="446" width="14" height="9" rx="2" class="c-security" stroke-width="1"/>
-            <text x="221" y="454" class="t-muted" font-size="7.5" font-weight="500">策略</text>
+          <g data-legend-semantic-kind="security" data-legend-kind="security" data-legend-label="策略" data-legend-x="199" data-legend-baseline="580" data-legend-width="61">
+            <rect x="199" y="572" width="14" height="9" rx="2" class="c-security" stroke-width="1"/>
+            <text x="221" y="580" class="t-muted" font-size="7.5" font-weight="500">策略</text>
           </g>
-          <g data-legend-semantic-kind="database" data-legend-kind="database" data-legend-label="上下文 / 追踪" data-legend-x="267" data-legend-baseline="454" data-legend-width="100">
-            <rect x="267" y="446" width="14" height="9" rx="2" class="c-database" stroke-width="1"/>
-            <text x="289" y="454" class="t-muted" font-size="7.5" font-weight="500">上下文 / 追踪</text>
+          <g data-legend-semantic-kind="database" data-legend-kind="database" data-legend-label="上下文 / 追踪" data-legend-x="267" data-legend-baseline="580" data-legend-width="100">
+            <rect x="267" y="572" width="14" height="9" rx="2" class="c-database" stroke-width="1"/>
+            <text x="289" y="580" class="t-muted" font-size="7.5" font-weight="500">上下文 / 追踪</text>
           </g>
         </g>
       </svg>
@@ -5384,9 +5420,34 @@
           <h3>本次修复的契约变化</h3>
         </div>
         <ul>
-          <li>&bull; 响应新增 index_complete：false 表示索引被条目上限截断，0 命中不再等于文件不存在</li>
-          <li>&bull; 索引不完整且命中不足时回退真实遍历并合并，响应 source 为 index+walk</li>
-          <li>&bull; 遍历预算从真正开始遍历时计时，不被前置建索引的 20-40s 吃光</li>
+          <li>&bull; index_stale:true 表示索引是过期快照，本次已回退真实遍历补齐</li>
+          <li>&bull; index_complete:false 只表示撞 800 万条目上限被截断，两条兜底路径分开标记</li>
+          <li>&bull; index_maybe_stale 在快照 ≥5 分钟时为 true；fresh:true 完全跳过索引</li>
+          <li>&bull; 内容搜索兜底只读索引建立之后改动过的文件（recent_only），不整盘重读</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot emerald"></div>
+          <h3>资源与自愈</h3>
+        </div>
+        <ul>
+          <li>&bull; 内存索引约 570MB/进程，空闲 10 分钟自动释放，下次查询约 0.2s 重载</li>
+          <li>&bull; 构建线程 panic 或超过 900s 卡死会自动复位，不会永久停在 building</li>
+          <li>&bull; 回填带进程内 + 跨进程 10 分钟节流，多个 MCP 进程不会同时扫整盘</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot amber"></div>
+          <h3>已知代价</h3>
+        </div>
+        <ul>
+          <li>&bull; 真正不存在的文件名：整盘要等 18-34s 才返回 0（用户已确认接受）</li>
+          <li>&bull; 内容兜底约 20-30s；重命名且 mtime 未变的文件仍可能漏，用 fresh:true 兜底</li>
+          <li>&bull; USN 增量索引需要提权，GUI 普通权限读不了，不能作为默认路径</li>
         </ul>
       </div>
     </div>
