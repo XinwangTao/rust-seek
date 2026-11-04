@@ -43,22 +43,72 @@ pub fn search_filename_meta<F>(
 where
     F: FnOnce() -> Option<(u64, Option<std::time::SystemTime>)>,
 {
+    search_filename_meta_path(path, pattern, false, meta)
+}
+
+/// 同 [`search_filename_meta`]，`match_path=true` 时拿完整路径去匹配。
+///
+/// 用户经常直接粘贴一个完整路径（`D:/a/b/c.html`）而不是文件名；只比
+/// `file_name` 的话这种输入永远 0 命中，看着就是「搜不到」。
+pub fn search_filename_meta_path<F>(
+    path: &Path,
+    pattern: &Regex,
+    match_path: bool,
+    meta: F,
+) -> Option<SearchResult>
+where
+    F: FnOnce() -> Option<(u64, Option<std::time::SystemTime>)>,
+{
+    let (display_path, win_path) = make_paths(path);
     let name = path.file_name()?.to_string_lossy();
+    let target = if match_path { display_path.as_str() } else { name.as_ref() };
     let mut ranges = Vec::new();
-    for m in pattern.find_iter(name.as_ref()) {
+    for m in pattern.find_iter(target) {
         ranges.push((m.start(), m.end()));
     }
-    if ranges.is_empty() { return None; }
-    let (display_path, win_path) = make_paths(path);
+    // 粘贴的是反斜杠路径：正斜杠形式匹配不上时再试原生形式（两者长度一致，偏移可复用）
+    if ranges.is_empty() && match_path {
+        for m in pattern.find_iter(win_path.as_str()) {
+            ranges.push((m.start(), m.end()));
+        }
+    }
+    if ranges.is_empty() {
+        return None;
+    }
     let icon = file_icon(&display_path);
     let (file_size, modified) = meta().unwrap_or((0, None));
+    let line = if match_path { display_path.clone() } else { name.into_owned() };
     Some(SearchResult {
         icon, win_path, path: display_path, file_size, modified,
         matches: vec![Match {
-            line_num: 0, line: name.into_owned(), ranges,
+            line_num: 0, line, ranges,
             context_before: None, context_after: None,
         }],
     })
+}
+
+/// 搜索模式清洗：粘贴来的文件名常带 BOM / 零宽字符 / 首尾空白，
+/// 按字面匹配就永远 0 命中（看着就是「搜不到」）。
+/// 返回 `(清洗后的模式, 去掉的字符数)`。
+pub fn clean_pattern(s: &str) -> (String, usize) {
+    const INVISIBLE: &[char] = &['\u{feff}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{00a0}'];
+    let mut out = String::with_capacity(s.len());
+    let mut removed = 0usize;
+    for ch in s.chars() {
+        if INVISIBLE.contains(&ch) {
+            removed += 1;
+        } else {
+            out.push(ch);
+        }
+    }
+    let trimmed = out.trim().to_string();
+    removed += out.chars().count() - trimmed.chars().count();
+    (trimmed, removed)
+}
+
+/// 模式里带路径分隔符 ⇒ 用户粘的是路径片段，应按完整路径匹配。
+pub fn looks_like_path(s: &str) -> bool {
+    s.contains('/') || s.contains('\\')
 }
 
 const MAX_LINE_LEN: usize = 512;

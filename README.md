@@ -5,7 +5,7 @@
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue?logo=windows)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Version](https://img.shields.io/badge/version-4.9.0-brightgreen)
+![Version](https://img.shields.io/badge/version-5.0.0-brightgreen)
 
 ---
 
@@ -40,16 +40,19 @@ Most search tools are either too slow, too complex, or require a runtime environ
 
 ### Search
 - **Plain-text filenames by default** — 文件名模式默认按纯文本匹配（`F` 默认勾选），粘贴带 `( ) + . [ ]` 的标题/文件名直接能搜到；要正则就取消 `F`
+- **Paste cleanup** — 搜索前自动去掉 BOM / 零宽字符 / 首尾空白（从网页、文档、Obsidian 复制文件名时最容易带上），状态栏提示「已忽略 N 个不可见字符」
+- **Path matching when you paste a path** — 模式里含 `/` 或 `\` 就按完整路径匹配，否则只比文件名（粘贴 `D:/a/b/c.html` 这种路径也能直接命中）
 - **Regex search in text mode** — 文本内容模式默认按正则匹配（`F` 默认不勾），可用任意合法正则
 - **Literal string mode** (`F` checkbox) — 当前模式的覆盖开关：勾上 = 纯文本，取消 = 正则；切换模式或重启会回到该模式的默认
 - **Case-insensitive mode** (`Aa` checkbox) — match regardless of letter case
-- **Search scope** — 整机（所有本地磁盘，默认）/ 单个磁盘（`C:` `D:` …）/ 指定目录，顶部一键切换
+- **Search scope** — 整机（所有本地磁盘，默认）/ 单个磁盘（`C:` `D:` …）/ 指定目录，顶部一键切换；整机与单盘都走索引（0.1s 量级），指定目录走遍历
 - **File type filter** — 按「类型」分组过滤（文档 / 图片 / 视频 / 音频 / 代码 / 压缩包），或直接在「后缀」框输入 `rs,toml`（自定义后缀优先于类型）
 - **Live search** — 文件名模式下输入即出结果（150ms 防抖），无需按回车；整机范围改为回车触发，避免全盘反复空扫
 - **Sort results** — 按路径 / 修改时间（最新在前）/ 大小（最大在前）
 - **Search-stage pruning** — 类型/后缀在遍历阶段就剪枝，整机搜索不会去读无关文件
 - **System dir pruning** — 整机搜索默认跳过盘符下的 `Windows` / `Program Files` / `ProgramData` / 回收站等系统目录（设置里可开关，只认盘符根下两层，不会误伤项目里的同名文件夹）
 - **Whole-drive index (MCP)** — MCP server 常驻内存的文件名索引 + 磁盘缓存，整盘搜索从 19s 降到 0.1s，见 [整盘索引](#整盘索引)
+- **Incremental index refresh** — 靠「目录自身 LastWriteTime 变了才重扫」做增量刷新，全盘 620 万文件里通常只有几十个脏目录，刷新耗时几十毫秒；新建文件不用等整盘重建就能搜到
 - **Keyboard navigation** — ↑/↓ 选中结果、Enter 直接打开（无结果时 Enter 触发搜索）
 - **Modified time & size** — 每条文件结果显示修改时间和大小
 - **Binary file detection** — automatically skips binary files, no garbage output
@@ -141,12 +144,15 @@ claude mcp add rust-seek -- "F:\path\to\rust-seek.exe" --mcp
 
 | 工具 | 作用 | 关键参数 |
 |------|------|----------|
-| `search_files` | 按文件名/路径找文件，返回绝对路径 + 大小 + 修改时间 | `pattern`、`roots`、`exts`、`max_results`（默认 100）、`use_index`、`refresh_index` |
+| `search_files` | 按文件名/路径找文件，返回绝对路径 + 大小 + 修改时间 | `pattern`、`roots`、`exts`、`max_results`（默认 100）、`use_index`、`refresh_index`、`fresh` |
 | `search_text` | 按内容找（ripgrep 语义，并行、跳二进制、跳大文件） | `pattern`、`roots`、`exts`、`max_files`（默认 50）、`max_matches_per_file`、`use_index` |
 | `list_drives` | 列出可搜索的本地磁盘 | — |
 
 `roots` 省略时搜索 MCP server 的工作目录（客户端通常把它设成当前项目），
 传 `["C:/","D:/",…]` 才是整盘；`pattern` 默认按正则解释，`regex: false` 走纯文本子串。
+
+`pattern` 的处理跟 GUI 完全一致：先去掉 BOM / 零宽字符 / 首尾空白；
+含 `/` 或 `\` 时**按完整路径匹配**（否则只比文件名）。
 
 ### 整盘索引
 
@@ -161,19 +167,69 @@ claude mcp add rust-seek -- "F:\path\to\rust-seek.exe" --mcp
 | 进程重启后首次查询（从磁盘缓存载入） | **0.12s** |
 | 项目内查询（不走索引） | < 10ms |
 
-- 缓存位置 `%LOCALAPPDATA%\rust-seek\index-v1.bin`（约 213MB），24 小时后自动后台刷新，7 天后强制重建
-- 常驻内存约 220MB；只存文件（不存目录），剪枝规则和普通搜索一致，所以结果集相同
+- 缓存位置 `%LOCALAPPDATA%\rust-seek\index-v1.bin`（约 590MB），**每 2 分钟没刷新过就先做一次增量刷新**，24 小时以上才排一次后台整盘重建，7 天后强制重建
+- 常驻内存约 800MB（620 万条）；只存文件（目录只存“路径 + mtime” 用于增量刷新），剪枝规则和普通搜索一致，所以结果集相同
+
+### 增量刷新（v5.0.0）
+
+索引是快照，旧的做法要么整盘重建（19–38s）要么容忍快照变旧（新建文件搜不到）。现在改成**目录级增量刷新**：
+
+- 建索引时顺手记下每个目录自己的 `LastWriteTime`（全盘 30 万目录，约 10MB）
+- 刷新时只看目录：**mtime 没变就整棵子树原样复用**，不再枚举、不再逐文件 stat；mtime 变了的目录才重新列一遍
+- 全盘 620 万文件 / 30 万目录，脏目录通常几十个，所以一次刷新是**几毫秒到 1 秒**，而不是 19–38 秒
+
+### 目录变更监听（v5.0.0）
+
+光靠 stat 巡还不够：本机 31.7 万个目录，单次 stat 约 30µs（NVMe 上也是这个量级，
+主要是文件系统过滤器的成本），全量一轮 ≈ **10s**。挂在搜索路径上不可接受，
+而「新建文件要等 10s 才能搜到」在用户看来仍然是「搜不到」。
+
+所以每个本地盘开一个 `ReadDirectoryChangesW` 监听线程（**普通用户权限，不需要管理员**），
+系统把增删改名事件直接推过来，只记「哪个目录变了」；查询前的刷新只重枚举这几个目录：
+
+| 场景 | 耗时 |
+|------|------|
+| 常态：查一个已存在的文件 | **0.04–0.08s**（618 万条目分段并行扫描） |
+| 刚新建/删除的文件，立刻再查 | **0.1–0.3s**（事件驱动，无需等待） |
+| 新进程（新的一次 AI 会话）首次查询 | **~0.9s**（回放变更日志，见下） |
+| 同上，但变更日志缺失/停机过久 | **10–17s**（退回全量 stat 对账，一次性） |
+
+- 监听缓冲区溢出（超忙的盘）或盘数量变化 → 标记需要重新对账，退回全量 stat 巡，保证最终一致
+- 监听可信时索引就是当前文件系统的权威视图，零命中直接回「没有」，
+  不必再花 20–50s 走一遍全盘遍历
+
+### 变更日志（v5.0.0）
+
+监听只在进程活着时有效。新进程启动时，「上次退出到现在」发生了什么并不知道——
+旧做法是启动后做一次全量 stat 对账（31.7 万目录约 10–15s），于是**每次新开会话的第一次搜索都要等十几秒**。
+
+现在把监听收到的变更顺手记进一个小日志（`%LOCALAPPDATA%\rust-seek\journal-v1.txt`）：
+
+- 文件头记着「对应哪一份缓存」（缓存的 `built_unix`）；每行一个变过的目录
+- 新进程载入缓存后直接**回放日志**，只重枚举这几个目录，代价毫秒级 → 首次查询 **10–17s → 0.9s**
+- 只追加不重写：整批事件一次 `write`，代价与变更量成正比、与索引规模无关（实测 2100 条 / 159KB）
+- 缓存重建时日志自动删除（新缓存意味着空窗归零），头部对不上也自动作废
+- **只信任「头部匹配 + 最近 120s 内还被写过」的日志**：否则说明这段空窗没有进程在看盘，
+  直接退回全量对账——宁可多花 10s，也不给假阴性
+- 日志里若出现盘符根（`D:`），说明盘根下直接有增删，回放它等于重扫整盘，同样退回全量对账
+- 秒级 mtime 有“同一秒内新建又删除”的盲区，所以 mtime 距本次刷新不足 2s 的目录一律重新枚举（宁可多枚举一个目录，不漏一个文件）
+- 新路径只往路径池尾部追加，旧偏移全部保留，不重拷 590MB 文本；被删条目留下的空洞累计超 25% 才整理一次
+- 刷新丢掉超过 20% 条目时判定枚举出了系统性问题（盘没就绪 / 权限），直接放弃本次刷新、继续用旧快照
 - **索引有条目上限（默认 800 万，`RUST_SEEK_MAX_ENTRIES` 可调）**：超大机器撞上限时索引只能覆盖一部分目录，
   响应里 `index_complete: false`。此时整盘查询会自动回退真实遍历并合并两边结果（`source: "index+walk"`），
   不会把「索引里没有」当成「文件不存在」；回调没显式给 `budget_ms` 时这条兜底遍历的预算放宽到 60s。
   想把上限调小省内存（每 100 万条约 75MB）就设 `RUST_SEEK_MAX_ENTRIES`。
 - 条目按路径排序，子目录查询用二分定位区间，只扫那一段：`use_index: true` 可让任意大目录也走索引
+- 扫描按 64k 条目切块、多线程并行（块数远大于线程数，天然负载均衡）；
+  截断时先按路径排序再取前 N 条，保证同一查询的结果集稳定可复现
 - **整盘内容搜索也走索引**：`search_text` 的 `roots` 是盘符根且带 `exts` 时，先从索引取候选文件
   （按扩展名筛，通常只剩几千个），再并行读这些文件，跳过十几秒的目录遍历。
   实测 F 盘搜 `.tex` 内容：遍历 **12.0s** → 索引 **0.32s**（92 个候选文件）
-- GUI 的「整机 + 文件名」搜索同样走索引（状态栏标「· 索引」）；单盘 / 指定目录仍走遍历（那两种范围不剪系统目录，语义不同）
+- GUI 的「整机 / 单盘 + 文件名」搜索同样走索引（状态栏标「· 索引」）；指定目录仍走遍历
+  （索引建库时剪掉了系统与噪声目录，所以只有同样剪枝的口径能走索引；单盘走索引后
+  `D:` 盘实测 **28.6s → 0.1s**。如果你关掉「跳过系统目录」开关，会自动降级回遍历以保持结果集一致）
 - `refresh_index: true` 强制重建，本次调用仍走遍历
-- 响应里的 `source`（`index` / `index+walk` / `walk`）、`index_age_ms`、`index_entries`、`index_complete` 说明数据来源、新鲜度与覆盖范围
+- 响应里的 `source`（`index` / `index+walk` / `walk`）、`index_age_ms`、`index_built_at`、`index_entries`、`index_complete`、`index_incomplete_dirs` 说明数据来源、新鲜度与覆盖范围
 
 ### 为速度做的取舍
 
