@@ -1,6 +1,6 @@
 [package]
 name = "rust-seek"
-version = "5.0.0"
+version = "5.1.0"
 edition = "2021"
 description = "A high-performance file and text search tool"
 
@@ -23,9 +23,11 @@ tray-icon = "0.26.1"
 winreg = "0.56.0"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 png = "0.18"
+ureq = "2"
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_Security"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_Security", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 opt-level = 3
