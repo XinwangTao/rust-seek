@@ -19,7 +19,7 @@ use crate::integration;
 use crate::searcher::{is_noise_dir_name, path_is_system_root, SKIP_DIRS};
 use regex::Regex;
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -234,8 +234,6 @@ pub fn query(
     let index = guard.as_ref()?;
     touch_index();
     let start = Instant::now();
-    let mut hits = Vec::new();
-    let mut truncated = false;
 
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut loose: Vec<String> = Vec::new();
@@ -254,25 +252,80 @@ pub fn query(
         }
     }
 
-    'scan: for (lo, hi) in ranges {
-        for item in &index.items[lo..hi] {
-            if hits.len() >= max {
-                truncated = true;
-                break 'scan;
-            }
-            if let Some(b) = budget {
-                if start.elapsed() >= b {
-                    truncated = true;
-                    break 'scan;
-                }
-            }
-            if match_item(index, item, re, exts, &mut hits, match_path).is_some() && hits.len() >= max {
-                truncated = true;
-                break 'scan;
-            }
+    // 全盘 618 万条目顺序扫一遍约 0.5s，是每次搜索的固定成本。
+    // 按 64k 条目切块并行扫：块数远大于线程数，天然负载均衡，
+    // 也不用担心某个盘/某段路径特别慢把整体拖住。
+    const CHUNK: usize = 64 * 1024;
+    let mut tasks: Vec<(usize, usize)> = Vec::new();
+    for (lo, hi) in &ranges {
+        let mut a = *lo;
+        while a < *hi {
+            let b = (a + CHUNK).min(*hi);
+            tasks.push((a, b));
+            a = b;
         }
     }
 
+    let max = max.max(1);
+    let mut hits: Vec<Hit> = Vec::new();
+    let mut truncated = false;
+
+    if !tasks.is_empty() {
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        let out: Mutex<Vec<Hit>> = Mutex::new(Vec::new());
+        let workers = num_cpus::get().clamp(1, 16).min(tasks.len());
+
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let cursor = &cursor;
+                let stop = &stop;
+                let out = &out;
+                let tasks = &tasks;
+                scope.spawn(move || {
+                    let mut local: Vec<Hit> = Vec::new();
+                    loop {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if let Some(b) = budget {
+                            if start.elapsed() >= b {
+                                stop.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                        let i = cursor.fetch_add(1, Ordering::Relaxed);
+                        let Some((lo, hi)) = tasks.get(i).copied() else { break };
+                        for item in &index.items[lo..hi] {
+                            // 单线程也设上限：命中上万的模式（比如搜 "a"）不该把结果集撑爆
+                            if local.len() >= max {
+                                stop.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            match_item(index, item, re, exts, &mut local, match_path);
+                        }
+                    }
+                    if !local.is_empty() {
+                        out.lock().unwrap().extend(local);
+                    }
+                });
+            }
+        });
+
+        hits = out.into_inner().unwrap_or_default();
+        // 截断时先按路径排序再取前 max 条：并行扫的顺序随线程调度变化，
+        // 不排序的话同一查询两次可能给出不同结果集。
+        if hits.len() > max {
+            truncated = true;
+            hits.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+            hits.truncate(max);
+        }
+        if stop.load(Ordering::Relaxed) {
+            truncated = true;
+        }
+    }
+
+    // 大小写和磁盘不一致时二分找不到区间，退化成线性比（罕见路径，保持串行）
     if !loose.is_empty() {
         for item in &index.items {
             if hits.len() >= max {
@@ -503,13 +556,36 @@ pub fn try_load() -> bool {
     };
     let loaded = load_cache();
     let ok = loaded.is_some();
+    let built = loaded.as_ref().map_or(0, |ix| ix.built_unix);
     {
         let mut guard = lock();
         if let Some(index) = loaded {
             *guard = Some(Box::new(index));
         }
     }
+    if ok {
+        adopt_cache(built);
+    }
     ok
+}
+
+/// 载入磁盘缓存后：记下它对应哪份日志，并尝试回放日志补齐「进程没在跑的那段空窗」。
+///
+/// 回放成功 ⇒ 我们相信自己对文件系统的了解是完整的 ⇒ 不用再做全量 stat 巡
+/// （316k 目录约 10-15s，这是新进程首次查询慢的唯一原因）。
+fn adopt_cache(cache_unix: u64) {
+    if cache_unix == 0 {
+        return;
+    }
+    JOURNAL_CACHE_UNIX.store(cache_unix, Ordering::Relaxed);
+    JOURNAL_READY.store(false, Ordering::Relaxed);
+    if let Some(dirs) = journal_replay(cache_unix) {
+        {
+            let mut g = DIRTY_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+            g.extend(dirs);
+        }
+        NEED_FULL_SCAN.store(false, Ordering::Relaxed);
+    }
 }
 
 /// 保证索引可用：已有就检查是否需要刷新（增量，不整盘重扫）；
@@ -543,7 +619,7 @@ pub fn ensure_ready() {
 /// 例外：索引已经旧到「零命中也要回退整盘遍历」的程度（> 60s）时，直接同步扫完更划算
 /// （10-20s vs 遍历 20-50s），而且结果一定是当前真相，不会给假阴性。
 fn refresh_smart() -> bool {
-    if WATCH_ACTIVE.load(Ordering::Relaxed) && !NEED_FULL_SCAN.load(Ordering::Relaxed) {
+    if !NEED_FULL_SCAN.load(Ordering::Relaxed) {
         return refresh_now();
     }
     let badly_stale = current_age_secs().map_or(true, |a| a > 60);
@@ -659,6 +735,7 @@ fn spawn_build(slot: BuildSlot) {
         let built = build();
         if let Some(index) = &built {
             save_cache(index);
+            adopt_cache(index.built_unix);
         }
         let mut guard = lock();
         if let Some(index) = built {
@@ -677,7 +754,9 @@ pub fn build_sync() -> bool {
     let ok = outcome.is_some();
     if let Some(index) = outcome {
         save_cache(&index);
+        let built = index.built_unix;
         *lock() = Some(Box::new(index));
+        adopt_cache(built);
     }
     ok
 }
@@ -699,7 +778,9 @@ pub fn build_and_match(
             let entries = index.items.len() as u64;
             let complete = index.complete;
             save_cache(&index);
+            let built = index.built_unix;
             *lock() = Some(Box::new(index));
+            adopt_cache(built);
             Some((hits, entries, complete))
         }
         None => None,
@@ -794,6 +875,10 @@ pub fn spawn_refresh_async() -> bool {
         // 扫盘阶段：不持锁
         let (mut dirty, stat_failed) = scan_dirty_dirs(&dir_blob, &dirs, now_unix());
         drop(dir_blob);
+        if !dirty.is_empty() {
+            let keys: Vec<String> = dirty.iter().map(|(k, _)| k.clone()).collect();
+            journal_append(JOURNAL_CACHE_UNIX.load(Ordering::Relaxed), &keys);
+        }
         dirty.extend(take_dirty().into_iter().map(|k| (k, 0u64)));
         dirty.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
@@ -836,8 +921,9 @@ fn refresh_with(index: &mut Index) -> bool {
     if integration::local_drives().len() as u64 != WATCHED_DRIVES.load(Ordering::Relaxed) {
         NEED_FULL_SCAN.store(true, Ordering::Relaxed);
     }
-    let watching = WATCH_ACTIVE.load(Ordering::Relaxed);
-    if watching && !NEED_FULL_SCAN.load(Ordering::Relaxed) {
+    // NEED_FULL_SCAN=false 表示「我们相信自己对变更的了解是完整的」——
+    // 要么监听在跑，要么刚回放过变更日志。这时只应用脏目录，代价可忽略。
+    if !NEED_FULL_SCAN.load(Ordering::Relaxed) {
         let dirty = take_dirty();
         if dirty.is_empty() {
             // 没有任何变更事件：索引就是最新的，只更新新鲜度戳（O(1)）
@@ -864,6 +950,12 @@ fn refresh_with(index: &mut Index) -> bool {
 // 监听没起来（或缓冲区溢出丢事件）时退回全量 stat 巡，保证最终一致。
 
 static DIRTY_DIRS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// 变更日志对应的「哪一份磁盘缓存」（= 那份缓存的 built_unix）。
+/// 日志记的是「这份缓存写就之后，哪些目录变过」，新进程载入同一份缓存时直接回放，
+/// 免掉 31.7 万目录的全量 stat 巡（约 10-15s）。
+static JOURNAL_CACHE_UNIX: AtomicU64 = AtomicU64::new(0);
+/// 本进程已确认日志头部与当前缓存匹配（每个进程只校验一次）
+static JOURNAL_READY: AtomicBool = AtomicBool::new(false);
 /// 至少有一个盘的监听在跑
 static WATCH_ACTIVE: AtomicBool = AtomicBool::new(false);
 static WATCH_STARTED: AtomicBool = AtomicBool::new(false);
@@ -882,6 +974,110 @@ pub fn start_watchers() {
         let root = format!("{d}/");
         std::thread::spawn(move || watch_volume(&root));
     }
+}
+
+/// 日志多久没被写过就不再信任：说明这段时间没有进程在看盘（空窗未知），
+/// 必须退回全量 stat 巡。
+const JOURNAL_SLACK_SECS: u64 = 120;
+/// 日志体积上限：超了就丢掉重来（下次退回全量扫描），别无限长
+const JOURNAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const JOURNAL_HEADER: &str = "#rust-seek-journal v1";
+
+fn journal_path() -> Option<PathBuf> {
+    cache_path().map(|p| p.with_file_name("journal-v1.txt"))
+}
+
+/// 把「这些目录变过」追加进变更日志。
+///
+/// 只追加、不重写（每个进程各自 append，整批一次 write），所以代价与变更量成正比、
+/// 与索引规模无关。头部记着对应缓存的 built_unix：缓存重建后头部对不上，
+/// 日志自动作废（`save_cache` 也会直接删掉它）。
+fn journal_append(cache_unix: u64, dirs: &[String]) {
+    if cache_unix == 0 || dirs.is_empty() {
+        return;
+    }
+    let Some(path) = journal_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if !JOURNAL_READY.load(Ordering::Relaxed) {
+        // 首次写：确认头部匹配现有缓存，不匹配就重建
+        let header_ok = std::fs::read(&path)
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|t| t.lines().next().map(str::to_string))
+            .map_or(false, |h| h == format!("{JOURNAL_HEADER} {cache_unix}"));
+        if !header_ok {
+            let mut head = format!("{JOURNAL_HEADER} {cache_unix}\n");
+            for d in dirs {
+                head.push_str(d);
+                head.push('\n');
+            }
+            let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+            if std::fs::write(&tmp, head).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            JOURNAL_READY.store(true, Ordering::Relaxed);
+            return;
+        }
+        JOURNAL_READY.store(true, Ordering::Relaxed);
+    }
+    if std::fs::metadata(&path).map_or(false, |m| m.len() > JOURNAL_MAX_BYTES) {
+        // 太长就别再追加了：等下次缓存重建时它会被删掉
+        NEED_FULL_SCAN.store(true, Ordering::Relaxed);
+        return;
+    }
+    let mut batch = String::with_capacity(dirs.len() * 48);
+    for d in dirs {
+        batch.push_str(d);
+        batch.push('\n');
+    }
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&path) {
+        let _ = f.write_all(batch.as_bytes());
+    }
+}
+
+/// 回放变更日志：返回「自这份缓存写就以来变过的目录」。
+///
+/// 只信任两种情况：头部匹配 + 日志最近还在被写（说明这段空窗有进程在看盘）。
+/// 否则返回 None，调用方退回全量 stat 巡——宁可多花 10s，也不给假阴性。
+fn journal_replay(cache_unix: u64) -> Option<Vec<String>> {
+    let path = journal_path()?;
+    let meta = std::fs::metadata(&path).ok()?;
+    if meta.len() > JOURNAL_MAX_BYTES {
+        return None;
+    }
+    let age = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .map(|t| now_unix().saturating_sub(t))
+        .unwrap_or(u64::MAX);
+    if age > JOURNAL_SLACK_SECS {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != format!("{JOURNAL_HEADER} {cache_unix}") {
+        return None;
+    }
+    let mut dirs: Vec<String> = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        // 盘符根（"D:"）在日志里意味着「盘根下直接有增删」：回放它等于重扫整盘，
+        // 还不如直接退回全量扫描（扫描本来就更省事，也不会漏）。
+        if line.len() <= 2 && line.ends_with(':') {
+            return None;
+        }
+        dirs.push(line.to_string());
+    }
+    dirs.sort_unstable();
+    dirs.dedup();
+    Some(dirs)
 }
 
 fn note_dirty(dir: &str) {
@@ -930,10 +1126,14 @@ fn watch_volume(root: &str) {
         )
     };
     if handle == INVALID_HANDLE_VALUE {
+        // 监听起不来：只能靠全量扫描，标记必须扫
+        NEED_FULL_SCAN.store(true, Ordering::Relaxed);
         return;
     }
     WATCH_ACTIVE.store(true, Ordering::Relaxed);
-    NEED_FULL_SCAN.store(true, Ordering::Relaxed);
+    // 注意：这里**不**置 NEED_FULL_SCAN。
+    // 「进程启动前的空窗」由变更日志回放负责；置 true 会让日志白回放、每次启动都全扫。
+    // 初始值本来就是 true，只有日志回放成功才清掉。
 
     let mut buf = vec![0u8; 256 * 1024];
     loop {
@@ -969,6 +1169,8 @@ fn collect_changes(root: &str, buf: &[u8]) {
 
     // FILE_ACTION_ADDED=1 / REMOVED=2 / MODIFIED=3 / RENAMED_OLD=4 / RENAMED_NEW=5
     const ACTIONS: [u32; 4] = [1, 2, 4, 5];
+    // 一批事件的脏目录攒起来，末尾一次性追加进变更日志（一次 write，不是每事件一次）
+    let mut batch: Vec<String> = Vec::new();
     let mut off = 0usize;
     loop {
         if off + 12 > buf.len() {
@@ -983,7 +1185,9 @@ fn collect_changes(root: &str, buf: &[u8]) {
             if ACTIONS.contains(&rec.Action) {
                 let full = format!("{}{}", root, rel.replace('\\', "/"));
                 if let Some(i) = full.rfind('/') {
-                    note_dirty(&full[..i]);
+                    let dir = &full[..i];
+                    note_dirty(dir);
+                    batch.push(dir.to_string());
                 }
             }
         }
@@ -991,6 +1195,9 @@ fn collect_changes(root: &str, buf: &[u8]) {
             break;
         }
         off += rec.NextEntryOffset as usize;
+    }
+    if !batch.is_empty() {
+        journal_append(JOURNAL_CACHE_UNIX.load(Ordering::Relaxed), &batch);
     }
 }
 
@@ -1044,6 +1251,13 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
     };
     let scan_ms = t_start.elapsed().as_millis();
     dirty.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    // 把「这些目录变过」记进变更日志：下一个进程载入同一份缓存时直接回放，
+    // 就不用再花 10-15s 做全量 stat 巡。监听路径也会写，重复无妨（回放时会去重）。
+    if !dirty.is_empty() {
+        let keys: Vec<String> = dirty.iter().map(|(k, _)| k.clone()).collect();
+        journal_append(index.built_unix, &keys);
+    }
 
     // 一个脏目录都没有：文件系统没动过，刷新只是一次 stat 巡。
     if dirty.is_empty() {
@@ -1788,8 +2002,11 @@ fn load_cache() -> Option<Index> {
     if len < HDR as u64 + MAGIC.len() as u64 || len > 4_000_000_000 {
         return None;
     }
-    let mut buf = Vec::with_capacity(len as usize);
-    std::fs::File::open(&path).ok()?.read_to_end(&mut buf).ok()?;
+    // 用 mmap 读：600MB 缓存先 read_to_end 到 Vec 再切片复制，等于白占 600MB 堆；
+    // mmap 只映射虚拟地址，真正复制的是后面必须 own 的路径池和数据段。
+    let file = std::fs::File::open(&path).ok()?;
+    let map = unsafe { memmap2::Mmap::map(&file).ok()? };
+    let buf: &[u8] = &map;
 
     if buf.len() < HDR || &buf[..8] != MAGIC {
         return None;
@@ -1922,5 +2139,10 @@ fn save_cache(index: &Index) {
     drop(file);
     if std::fs::rename(&tmp, &path).is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    // 新缓存代表「此刻的文件系统」，之前那份日志描述的空窗已经归零
+    if let Some(j) = journal_path() {
+        let _ = std::fs::remove_file(j);
     }
 }
