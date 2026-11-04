@@ -1,0 +1,195 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "rust-seek 自动更新流程",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "output": "docs/archify/auto_update_workflow.html"
+  },
+  "lanes": [
+    {
+      "id": "github",
+      "label": "GitHub Releases"
+    },
+    {
+      "id": "seek",
+      "label": "Rust Seek 主程序"
+    },
+    {
+      "id": "exception",
+      "label": "例外出口",
+      "variant": "exception"
+    }
+  ],
+  "mainPath": [
+    "tick",
+    "api",
+    "cmp",
+    "prompt",
+    "download",
+    "swap"
+  ],
+  "nodes": [
+    {
+      "id": "tick",
+      "lane": "seek",
+      "col": 0,
+      "type": "backend",
+      "label": "定时检查",
+      "sublabel": "启动 30s 后 + 每 6h",
+      "tag": "仅 GUI 进程",
+      "width": 160
+    },
+    {
+      "id": "api",
+      "lane": "github",
+      "col": 1,
+      "type": "cloud",
+      "label": "GET releases/latest",
+      "sublabel": "tag_name + 资产清单",
+      "width": 160
+    },
+    {
+      "id": "cmp",
+      "lane": "seek",
+      "col": 2,
+      "type": "backend",
+      "label": "版本比较",
+      "sublabel": "远端 > 本地 5.1.0 ？",
+      "width": 160
+    },
+    {
+      "id": "prompt",
+      "lane": "seek",
+      "col": 3,
+      "type": "security",
+      "label": "系统弹窗确认",
+      "sublabel": "是 / 否",
+      "tag": "人工节点 · 用户点击",
+      "width": 140
+    },
+    {
+      "id": "download",
+      "lane": "seek",
+      "col": 4,
+      "type": "backend",
+      "label": "下载 + 校验",
+      "sublabel": "新 exe 落临时目录，SHA-256 比对",
+      "width": 190
+    },
+    {
+      "id": "swap",
+      "lane": "seek",
+      "col": 5,
+      "type": "backend",
+      "label": "替换并重启",
+      "sublabel": "旧 exe 改名 .old，写入新 exe，延迟拉起",
+      "width": 200
+    },
+    {
+      "id": "up_to_date",
+      "lane": "exception",
+      "col": 2,
+      "type": "external",
+      "label": "已是最新",
+      "sublabel": "版本相同，等下一轮",
+      "width": 120
+    },
+    {
+      "id": "declined",
+      "lane": "exception",
+      "col": 3,
+      "type": "external",
+      "label": "用户拒绝",
+      "sublabel": "用户点「否」，记住该版本",
+      "width": 130
+    },
+    {
+      "id": "dl_fail",
+      "lane": "exception",
+      "col": 4,
+      "type": "external",
+      "label": "下载 / 校验失败",
+      "sublabel": "超时或哈希不符，保留旧版",
+      "width": 150
+    }
+  ],
+  "edges": [
+    {
+      "from": "tick",
+      "to": "api",
+      "label": "后台线程"
+    },
+    {
+      "from": "api",
+      "to": "cmp",
+      "label": "最新 tag"
+    },
+    {
+      "from": "cmp",
+      "to": "prompt",
+      "label": "有新版本",
+      "variant": "emphasis"
+    },
+    {
+      "from": "cmp",
+      "to": "up_to_date",
+      "role": "return",
+      "variant": "dashed"
+    },
+    {
+      "from": "prompt",
+      "to": "download",
+      "label": "用户点「是」",
+      "variant": "security"
+    },
+    {
+      "from": "prompt",
+      "to": "declined",
+      "role": "error",
+      "variant": "dashed"
+    },
+    {
+      "from": "download",
+      "to": "swap",
+      "label": "校验通过",
+      "variant": "emphasis"
+    },
+    {
+      "from": "download",
+      "to": "dl_fail",
+      "role": "error",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "主路径",
+      "items": [
+        "启动 30 秒后后台查一次，之后每 6 小时一次",
+        "只比较版本号，不上传任何信息",
+        "用户点「是」才下载，下载完自动替换重启"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "不更新的出口",
+      "items": [
+        "已是最新：静默退出，等下一轮",
+        "用户拒绝：记住该版本，同一版本不再弹",
+        "下载或校验失败：保留旧版并提示"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "边界与约束",
+      "items": [
+        "--mcp 进程不参与检查与替换",
+        "运行中的 exe 不能覆盖，改名后再写入",
+        "替换失败时旧版仍可启动"
+      ]
+    }
+  ]
+}

@@ -15,6 +15,9 @@ jobs:
   build:
     name: build windows-${{ matrix.arch }}
     runs-on: windows-latest
+    # 单条架构腿失败（如交叉编译工具链问题）不再连累整次发布；
+    # 产物缺失时 latest.json 会少对应架构，自动更新只在该架构上跳过。
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -48,12 +51,19 @@ jobs:
           Copy-Item README.md out/ -ErrorAction SilentlyContinue
           Copy-Item LICENSE* out/ -ErrorAction SilentlyContinue
           Compress-Archive -Path out/* -DestinationPath "rust-seek_${ver}_windows_${{ matrix.arch }}.zip"
+          # 自动更新用：裸 exe + 单架构 sha256（release job 汇总成 latest.json）
+          Copy-Item "target/${{ matrix.target }}/release/rust-seek.exe" "rust-seek_${ver}_windows_${{ matrix.arch }}.exe"
+          $sha = (Get-FileHash "rust-seek_${ver}_windows_${{ matrix.arch }}.exe" -Algorithm SHA256).Hash.ToLower()
+          "$sha  rust-seek_${ver}_windows_${{ matrix.arch }}.exe" | Out-File -Encoding ascii "sha256_${{ matrix.arch }}.txt"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: rust-seek-windows-${{ matrix.arch }}
-          path: rust-seek_*.zip
+          path: |
+            rust-seek_*.zip
+            rust-seek_*.exe
+            sha256_*.txt
           if-no-files-found: error
 
   release:
@@ -68,9 +78,41 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Compose latest.json
+        shell: bash
+        env:
+          VER: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import glob, json, os
+          ver = os.environ["VER"].lstrip("vV")
+          repo = os.environ["REPO"]
+          keys = {"x64": "x86_64", "arm64": "aarch64"}
+          assets = {}
+          for f in sorted(glob.glob("dist/sha256_*.txt")):
+              arch = os.path.basename(f).replace("sha256_", "").replace(".txt", "")
+              sha = open(f).read().split()[0].strip().lower()
+              name = f"rust-seek_{ver}_windows_{arch}.exe"
+              if not os.path.exists(f"dist/{name}"):
+                  print(f"::warning::missing {name}")
+                  continue
+              assets[keys[arch]] = {
+                  "url": f"https://github.com/{repo}/releases/download/v{ver}/{name}",
+                  "sha256": sha,
+              }
+          if not assets:
+              raise SystemExit("no update assets found")
+          json.dump({"version": ver, "assets": assets}, open("dist/latest.json", "w"), indent=2)
+          print(open("dist/latest.json").read())
+          PY
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.zip
+          files: |
+            dist/*.zip
+            dist/*.exe
+            dist/latest.json
           generate_release_notes: true
           fail_on_unmatched_files: true

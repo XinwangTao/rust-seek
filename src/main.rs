@@ -6,6 +6,7 @@ mod index;
 mod integration;
 mod mcp;
 mod searcher;
+mod updater;
 
 fn main() -> eframe::Result {
     // `--mcp`：作为 MCP server 跑在 stdio 上，供 AI Agent 调用。
@@ -23,6 +24,8 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let start_hidden = std::env::args().any(|a| a == "--hidden");
+    // 自动更新检查（仅 GUI 模式；--mcp 已在上面提前返回）
+    updater::spawn();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Rust Seek")
         .with_inner_size([900.0, 600.0])

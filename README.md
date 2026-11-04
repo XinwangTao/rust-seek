@@ -5,7 +5,7 @@
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue?logo=windows)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Version](https://img.shields.io/badge/version-5.0.0-brightgreen)
+![Version](https://img.shields.io/badge/version-5.1.0-brightgreen)
 
 ---
 
@@ -274,6 +274,17 @@ claude mcp add rust-seek -- "F:\path\to\rust-seek.exe" --mcp
 3. Unzip and double-click `rust-seek.exe` — that's it
 
 Releases are built automatically by GitHub Actions on every `v*` tag, with the app icon and version info embedded in the executable.
+
+### 自动更新（v5.1.0）
+
+程序启动 30 秒后，并在之后每 6 小时，会在后台读取 GitHub Releases 上的 `latest.json`：
+
+- 只比较版本号，不上传任何本地信息；
+- 发现新版本弹系统对话框，只有点「是」才下载；
+- 下载后按清单里的 SHA-256 校验，通过才替换，替换失败自动回滚旧版；
+- 用户点「否」会记住该版本，同一版本不再打扰。
+
+更新流程见 [docs/archify/auto_update_workflow.html](docs/archify/auto_update_workflow.html)。可用环境变量 `RUST_SEEK_NO_UPDATE=1` 关闭检查。
 
 > ✅ No .NET, no Java, no Python, no Visual C++ Redistributable required.
 > Works on Windows 10 and above.
