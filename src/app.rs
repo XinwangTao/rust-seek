@@ -3,7 +3,8 @@ use crate::fastwalk::{self, Step};
 use crate::index;
 use crate::integration;
 use crate::searcher::{
-    path_in_noise_dir, path_is_system_root, search_file, search_filename_meta, SearchResult,
+    clean_pattern, looks_like_path, path_in_noise_dir, path_is_system_root, search_file,
+    search_filename_meta_path, SearchResult,
 };
 use eframe::egui;
 use egui::{Color32, RichText, ScrollArea, TextEdit, Ui};
@@ -854,6 +855,13 @@ impl App {
     /// force_walk=true：跳过索引直接遍历整机（保证最新，约 20-40 秒）
     fn start_search_ex(&mut self, record_history: bool, force_walk: bool) {
         if self.pattern.is_empty() { return; }
+        // 粘贴来的模式常带 BOM / 零宽字符 / 首尾空白：不清洗就永远 0 命中，
+        // 用户看到的就是「搜不到」。清洗结果直接回写到输入框（反正看不见）。
+        let (clean, invisible) = clean_pattern(&self.pattern);
+        if clean.is_empty() { return; }
+        if invisible > 0 {
+            self.pattern = clean;
+        }
         // 只保留真实存在的根：拔掉的 U 盘、失效的映射盘直接跳过，而不是整体报错
         let roots: Vec<String> = self
             .search_roots()
@@ -923,7 +931,11 @@ impl App {
         self.live_count = 0;
         self.live_matches = 0;
         self.searching = true;
-        self.status = "搜索中…".to_string();
+        self.status = if invisible > 0 {
+            format!("搜索中…（已忽略 {invisible} 个不可见字符）")
+        } else {
+            "搜索中…".to_string()
+        };
 
         let (tx, rx): (Sender<SearchMsg>, Receiver<SearchMsg>) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -933,15 +945,20 @@ impl App {
         let threads = num_cpus::get();
         let mode = self.mode;
         let exts = self.ext_filter_active();
-        // 整机搜索时跳过系统目录里的条目；用户手动指定目录时不干预
-        let prune_system = self.prefs.prune_system && matches!(self.scope, Scope::Machine);
-        // 索引的剪枝规则和「整机 + 剪系统目录」完全一致，只有这种组合能走索引：
-        // 单盘/指定目录的范围语义不同（不剪系统目录），走了会少结果。
-        let use_index =
-            !force_walk && prune_system && matches!(mode, SearchMode::Filename) && matches!(self.scope, Scope::Machine);
+        // 粘的是路径片段（含 / 或 \）时按完整路径匹配，否则只看文件名
+        let match_path = looks_like_path(&self.pattern);
+        // 剪掉系统大头目录（Windows/Program Files/回收站/WinSxS）
+        let prune_noise = self.prefs.prune_system;
+        // 索引建库时就剪掉了这些目录，所以只有「同样剪枝」的口径能走索引，否则会少结果。
+        // 单盘也要走索引：不然每次搜索都是 20–30s 裸遍历（实测 D: 盘 28.6s）。
+        let indexable_scope = matches!(self.scope, Scope::Machine | Scope::Drive(_));
+        let prune_system = prune_noise && indexable_scope;
+        let use_index = !force_walk
+            && prune_system
+            && matches!(mode, SearchMode::Filename)
+            && indexable_scope;
         // 与 use_index 同口径，但不管本次是否绕过索引：走完遍历后都值得回填索引
-        let indexable =
-            prune_system && matches!(mode, SearchMode::Filename) && matches!(self.scope, Scope::Machine);
+        let indexable = prune_system && matches!(mode, SearchMode::Filename) && indexable_scope;
         let walk_roots: Vec<std::path::PathBuf> =
             roots.iter().map(std::path::PathBuf::from).collect();
 
@@ -954,10 +971,13 @@ impl App {
             // 常驻索引：整机 250 万条目 19s → 0.1s。没建过就先同步载入磁盘缓存
             // （约 0.2s）；仍然没有就照常遍历，遍历结束后再在后台建。
             if use_index && (index::is_ready() || index::try_load()) {
+                // 索引是快照：先做一次目录级增量刷新（只重扫 mtime 变了的子树，
+                // 通常几十毫秒），新建文件才不会被漏掉。
+                index::ensure_fresh(index::auto_refresh_secs());
                 let ext_set: HashSet<String> =
                     exts.iter().map(|e| e.to_ascii_lowercase()).collect();
                 if let Some((hits, _, age, _, complete)) =
-                    index::query(&re, &roots, &ext_set, MAX_RESULTS + 1, None)
+                    index::query(&re, &roots, &ext_set, MAX_RESULTS + 1, None, match_path)
                 {
                     {
                         let mut sg = seen.lock().unwrap();
@@ -969,7 +989,7 @@ impl App {
                         }
                         let path = std::path::Path::new(&h.path);
                         let Some(result) =
-                            search_filename_meta(path, &re, || Some((h.size, h.modified())))
+                            search_filename_meta_path(path, &re, match_path, || Some((h.size, h.modified())))
                         else {
                             continue;
                         };
@@ -983,7 +1003,9 @@ impl App {
                     let stale = index::suspicious_miss(hits.len(), age, complete);
                     if complete && !stale {
                         // 索引快照可能不含刚建的文件：状态栏如实标注，别让用户误以为搜全了
-                        let suffix = if index::maybe_stale(age) {
+                        let suffix = if index::incomplete_dirs() {
+                            "索引（部分目录未同步）"
+                        } else if index::maybe_stale(age) {
                             "索引快照（可能不含新建文件）"
                         } else {
                             "索引"
@@ -1036,7 +1058,9 @@ impl App {
                 let result = match mode {
                     // 大小/时间直接用目录枚举带回的，命中时零系统调用
                     SearchMode::Filename => {
-                        search_filename_meta(path, &re, || Some((info.size, info.modified)))
+                        search_filename_meta_path(path, &re, match_path, || {
+                            Some((info.size, info.modified))
+                        })
                     }
                     SearchMode::Text => {
                         if info.is_dir {

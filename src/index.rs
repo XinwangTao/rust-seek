@@ -31,18 +31,20 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 const MAX_ENTRIES_DEFAULT: usize = 8_000_000;
 /// 缓存校验用的硬上限：即使当前配置调小，也不因此丢弃更大但合法的旧缓存
 const MAX_ENTRIES_CEIL: usize = 20_000_000;
-/// 缓存年龄超过这个值就在后台重建（旧索引继续服务）。
-/// 索引是快照：TTL 越长，「索引命中但漏掉之后新建文件」的窗口越长。
-/// 重建约 40s 后台完成、不阻塞查询，4h 的 I/O 成本可忽略。
-const TTL_SECS: u64 = 4 * 3600;
+/// 缓存年龄超过这个值就整盘重建一次（旧索引继续服务，增量刷新解决不了的情形兜底）。
+/// 平时靠增量刷新保新鲜，这个只负责定期清掉增量可能的边角隐患。
+const TTL_SECS: u64 = 24 * 3600;
 /// 超过这个年龄的缓存直接不用，重新遍历
 const MAX_CACHE_AGE_SECS: u64 = 7 * 24 * 3600;
 
-/// 缓存格式 v3：header 从 32 扩到 40 字节，多一个 flags 位记录「索引是否完整」。
-/// 旧 v2 缓存因 MAGIC 不匹配自动作废，重新建一次即可。
-const MAGIC: &[u8; 8] = b"RSKIDX\x03\x00";
-const HDR: usize = 40;
+/// 缓存格式 v4：在 v3 基础上加一张「目录表」（目录路径 + 该目录自身的 LastWriteTime）。
+/// 目录 mtime 不变 ⇒ 里面没有增删改名 ⇒ 整棵子树可以整段复用，增量刷新不用重扫全盘。
+/// 旧版本缓存因 MAGIC 不匹配自动作废，重新建一次即可。
+const MAGIC: &[u8; 8] = b"RSKIDX\x04\x00";
+const HDR: usize = 56;
 const FLAG_COMPLETE: u64 = 1 << 0;
+/// 刷新时有目录读不到：该子树按旧快照给出，结果里要如实标注
+const FLAG_INCOMPLETE_DIRS: u64 = 1 << 1;
 
 fn max_entries() -> usize {
     std::env::var("RUST_SEEK_MAX_ENTRIES")
@@ -53,6 +55,21 @@ fn max_entries() -> usize {
         .unwrap_or(MAX_ENTRIES_DEFAULT)
 }
 const ITEM_BYTES: usize = 32;
+const DIR_BYTES: usize = 16;
+/// 目录 mtime 距本次刷新不足这么多秒时，不敢用「mtime 没变 = 子树没变」判定：
+/// 秒级 mtime 下「同一秒内新建又删除」不会留下痕迹，留 2s 余量、重新枚举一遍即可。
+const DIR_SLACK_SECS: u64 = 2;
+
+/// 索引超过这么久就同步做一次目录级增量刷新。
+/// 刷新只枚举 mtime 变了的目录（空闲时几十毫秒），所以阈值放得很小：
+/// 宁可每次整盘查询多花几十毫秒，也不要给用户一个「看不见刚建文件」的快照。
+/// `RUST_SEEK_REFRESH_SECS` 可覆盖（调试时可调大）。
+pub fn auto_refresh_secs() -> u64 {
+    std::env::var("RUST_SEEK_REFRESH_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(2)
+}
 
 #[derive(Clone, Copy)]
 struct Item {
@@ -64,14 +81,27 @@ struct Item {
     mtime: u64,
 }
 
+/// 目录表条目：目录路径（在 `dir_blob` 里的偏移）+ 上次枚举它时的 LastWriteTime。
+#[derive(Clone, Copy)]
+struct DirRec {
+    path_off: u32,
+    path_len: u32,
+    mtime: u64,
+}
+
 struct Index {
     /// 所有路径按顺序拼接（`F:/a/b.rs` 形式），条目用偏移引用
     blob: String,
     items: Vec<Item>,
+    /// 已进索引的目录（路径升序，不含盘符根）+ 它们的路径文本
+    dir_blob: String,
+    dirs: Vec<DirRec>,
     built_unix: u64,
     /// false = 构建时撞到条目上限提前收尾，这台机器有文件没进索引。
     /// 查询方必须据此回退真实遍历，否则会拿到假阴性。
     complete: bool,
+    /// 上次增量刷新有目录读不到：该子树仍按旧快照给出，结果需标注
+    incomplete_dirs: bool,
 }
 
 static INDEX: Mutex<Option<Box<Index>>> = Mutex::new(None);
@@ -162,12 +192,28 @@ impl Hit {
 
 impl Index {
     fn path(&self, item: &Item) -> &str {
-        &self.blob[item.path_off as usize..(item.path_off + item.path_len) as usize]
+        path_of(&self.blob, item)
     }
 
     fn name(&self, item: &Item) -> &str {
         &self.blob[item.name_off as usize..(item.name_off + item.name_len) as usize]
     }
+}
+
+/// 条目的路径文本。独立成自由函数：增量刷新会先把旧条目表 take 出去，
+/// 只剩 `blob` 可借，此时还能照旧读路径。
+fn path_of<'a>(blob: &'a str, item: &Item) -> &'a str {
+    &blob[item.path_off as usize..(item.path_off + item.path_len) as usize]
+}
+
+fn dir_path_of<'a>(dir_blob: &'a str, rec: &DirRec) -> &'a str {
+    &dir_blob[rec.path_off as usize..(rec.path_off + rec.path_len) as usize]
+}
+
+fn unix_secs(t: Option<std::time::SystemTime>) -> u64 {
+    t.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// 索引可用时按文件名匹配；不可用返回 None，调用方照常走目录遍历。
@@ -182,6 +228,7 @@ pub fn query(
     exts: &HashSet<String>,
     max: usize,
     budget: Option<Duration>,
+    match_path: bool,
 ) -> Option<(Vec<Hit>, u64, u128, bool, bool)> {
     let guard = lock();
     let index = guard.as_ref()?;
@@ -219,7 +266,7 @@ pub fn query(
                     break 'scan;
                 }
             }
-            if match_item(index, item, re, exts, &mut hits).is_some() && hits.len() >= max {
+            if match_item(index, item, re, exts, &mut hits, match_path).is_some() && hits.len() >= max {
                 truncated = true;
                 break 'scan;
             }
@@ -244,7 +291,7 @@ pub fn query(
                     .map_or(false, |head| head.eq_ignore_ascii_case(p))
             });
             if hit_prefix {
-                match_item(index, item, re, exts, &mut hits);
+                match_item(index, item, re, exts, &mut hits, match_path);
             }
         }
     }
@@ -329,12 +376,14 @@ fn match_item(
     re: &Regex,
     exts: &HashSet<String>,
     hits: &mut Vec<Hit>,
+    match_path: bool,
 ) -> Option<()> {
     let name = index.name(item);
     if !exts.is_empty() && !ext_matches(name, exts) {
         return None;
     }
-    if !re.is_match(name) {
+    let target = if match_path { index.path(item) } else { name };
+    if !re.is_match(target) {
         return None;
     }
     hits.push(Hit { path: index.path(item).to_string(), size: item.size, mtime: item.mtime });
@@ -357,13 +406,31 @@ fn norm_prefix(root: &str) -> String {
 /// 排序后所有以 `prefix` 开头的条目是连续区间 `[lo, hi)`。
 /// 上界用「前缀末字节 +1」定位（前缀必然以 `/` 结尾，`/`+1 = `0`），不用逐条判前缀。
 fn prefix_bounds(index: &Index, prefix: &str) -> (usize, usize) {
-    let lo = index.items.partition_point(|it| index.path(it) < prefix);
+    prefix_bounds_raw(&index.blob, &index.items, prefix)
+}
+
+/// 同上，但直接接旧条目表：增量刷新会把 items 先 take 出去。
+fn prefix_bounds_raw(blob: &str, items: &[Item], prefix: &str) -> (usize, usize) {
+    let lo = items.partition_point(|it| path_of(blob, it) < prefix);
     let mut upper = prefix.as_bytes().to_vec();
     if let Some(last) = upper.last_mut() {
         *last = last.wrapping_add(1);
     }
     let hi = match std::str::from_utf8(&upper) {
-        Ok(u) => index.items.partition_point(|it| index.path(it) < u),
+        Ok(u) => items.partition_point(|it| path_of(blob, it) < u),
+        Err(_) => lo,
+    };
+    (lo, hi.max(lo))
+}
+
+fn dir_prefix_bounds_raw(dir_blob: &str, dirs: &[DirRec], prefix: &str) -> (usize, usize) {
+    let lo = dirs.partition_point(|rec| dir_path_of(dir_blob, rec) < prefix);
+    let mut upper = prefix.as_bytes().to_vec();
+    if let Some(last) = upper.last_mut() {
+        *last = last.wrapping_add(1);
+    }
+    let hi = match std::str::from_utf8(&upper) {
+        Ok(u) => dirs.partition_point(|rec| dir_path_of(dir_blob, rec) < u),
         Err(_) => lo,
     };
     (lo, hi.max(lo))
@@ -374,7 +441,18 @@ fn prefix_bounds(index: &Index, prefix: &str) -> (usize, usize) {
 /// 调用方应回退真实遍历兜底（否则新建文件会静默搜不到）。
 pub fn suspicious_miss(hits: usize, age_ms: u128, complete: bool) -> bool {
     const MIN_AGE_MS: u128 = 3_000;
-    complete && hits == 0 && age_ms >= MIN_AGE_MS
+    /// 索引超过这个年龄还没被刷新掉，说明刷新本身没成功（盘掉线/权限/抢锁）：
+    /// 此时即便有命中也不能保证是全量，得回退真实遍历。
+    const REFRESH_STALE_MS: u128 = 60_000;
+    if !complete {
+        return false;
+    }
+    // 监听在跑：索引就是当前文件系统的权威视图，零命中/有命中都直接信它。
+    // 否则「查一个刚删掉的文件」会先等 20-48s 的全盘遍历才回「没有」。
+    if watcher_trusted() {
+        return age_ms >= REFRESH_STALE_MS;
+    }
+    age_ms >= MIN_AGE_MS && (hits == 0 || age_ms >= REFRESH_STALE_MS)
 }
 
 /// 结果仍可用，但索引可能不含「建立之后新建/改名」的文件。
@@ -434,18 +512,24 @@ pub fn try_load() -> bool {
     ok
 }
 
-/// 保证索引可用：已有就检查是否需要后台刷新；没有就尝试磁盘缓存；再没有就后台建。
-/// 磁盘缓存载入是同步的（约 0.2s），因为调用方可能马上要查。
+/// 保证索引可用：已有就检查是否需要刷新（增量，不整盘重扫）；
+/// 没有就尝试磁盘缓存；再没有就后台建。缓存载入是同步的（约 0.2s），因为调用方可能马上要查。
 pub fn ensure_ready() {
-    match freshness() {
-        Freshness::Fresh => {}
-        // 过期重建同样走跨进程节流：多个 MCP 进程不要同时扫整盘
-        Freshness::Stale => rebuild_throttled(),
-        Freshness::Missing => {
+    start_watchers();
+    let age = current_age_secs();
+    match age {
+        Some(a) if a <= auto_refresh_secs() && !has_pending_changes() => {}
+        Some(a) => {
+            refresh_smart();
+            // 很久没整盘重建过：顺手排一次后台全量重建（跨进程节流），
+            // 用来清掉增量刷新可能漏掉的边角（mtime 撒谎 / 幽灵条目）。
+            if a > TTL_SECS {
+                rebuild_throttled();
+            }
+        }
+        None => {
             if try_load() {
-                if freshness() == Freshness::Stale {
-                    rebuild_throttled();
-                }
+                refresh_smart();
             } else if let Some(slot) = BuildSlot::acquire() {
                 spawn_build(slot);
             }
@@ -453,20 +537,61 @@ pub fn ensure_ready() {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum Freshness {
-    Fresh,
-    Stale,
-    Missing,
+/// 同步刷新（只是应用监听到的变更时代价可忽略）；需要全量扫描时交给后台，
+/// 本次先用当前快照作答——全量扫描约 10-20s，不能挂在搜索路径上。
+///
+/// 例外：索引已经旧到「零命中也要回退整盘遍历」的程度（> 60s）时，直接同步扫完更划算
+/// （10-20s vs 遍历 20-50s），而且结果一定是当前真相，不会给假阴性。
+fn refresh_smart() -> bool {
+    if WATCH_ACTIVE.load(Ordering::Relaxed) && !NEED_FULL_SCAN.load(Ordering::Relaxed) {
+        return refresh_now();
+    }
+    let badly_stale = current_age_secs().map_or(true, |a| a > 60);
+    if badly_stale {
+        return refresh_now();
+    }
+    spawn_refresh_async();
+    is_ready()
 }
 
-fn freshness() -> Freshness {
-    let guard = lock();
-    match guard.as_ref() {
-        Some(index) if now_unix().saturating_sub(index.built_unix) > TTL_SECS => Freshness::Stale,
-        Some(_) => Freshness::Fresh,
-        None => Freshness::Missing,
+/// 确保索引比 `max_age_secs` 新：不够新就同步跑一次增量刷新。
+/// 返回刷新后是否有可用索引（索引不存在时返回 false，调用方自己决定要不要遍历）。
+pub fn ensure_fresh(max_age_secs: u64) -> bool {
+    start_watchers();
+    match current_age_secs() {
+        // 年龄够新、但监听还攒着没应用的变更（刚才建的文件就在里面）也得刷一下
+        Some(a) if a <= max_age_secs && !has_pending_changes() => true,
+        Some(_) => refresh_smart(),
+        None => false,
     }
+}
+
+/// 监听是否攒着还没应用的变更事件。
+fn has_pending_changes() -> bool {
+    DIRTY_DIRS
+        .try_lock()
+        .map(|g| !g.is_empty())
+        .unwrap_or(false)
+}
+
+/// 内存索引的年龄（秒）；没有索引时 None。
+pub fn current_age_secs() -> Option<u64> {
+    let guard = lock();
+    guard
+        .as_ref()
+        .map(|index| now_unix().saturating_sub(index.built_unix))
+}
+
+/// 索引快照的建立时间（unix 秒）；没有索引时 0。
+pub fn built_unix() -> u64 {
+    let guard = lock();
+    guard.as_ref().map_or(0, |index| index.built_unix)
+}
+
+/// 上次增量刷新/构建时有目录读不到：该子树的文件可能滞后于磁盘。
+pub fn incomplete_dirs() -> bool {
+    let guard = lock();
+    guard.as_ref().map_or(false, |index| index.incomplete_dirs)
 }
 
 /// 强制重建；重建期间旧索引仍可查询。已在建则忽略。
@@ -565,9 +690,10 @@ pub fn build_and_match(
     re: &Regex,
     exts: &HashSet<String>,
     max: usize,
+    match_path: bool,
 ) -> Option<(Vec<Hit>, u64, bool)> {
     let _slot = BuildSlot::acquire()?;
-    let outcome = build_with_match(Some(re), Some(exts), max);
+    let outcome = build_with_match(Some(re), Some(exts), max, match_path);
     match outcome {
         Some((index, hits)) => {
             let entries = index.items.len() as u64;
@@ -619,8 +745,861 @@ fn touch_index() {
 
 type RawItem = (Box<str>, u64, u64);
 
+// ---------- 增量刷新 ----------
+
+static REFRESHING: AtomicBool = AtomicBool::new(false);
+
+/// 刷新权：同一进程只让一个线程做增量刷新，其余线程先用当前快照作答。
+struct RefreshSlot;
+
+impl RefreshSlot {
+    fn acquire() -> Option<RefreshSlot> {
+        REFRESHING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| RefreshSlot)
+    }
+}
+
+impl Drop for RefreshSlot {
+    fn drop(&mut self) {
+        REFRESHING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 同步做一次「目录级增量刷新」：只重新枚举 mtime 变了的子树。
+/// 返回是否真的刷成了（索引不存在或有别的线程在刷时返回 false，调用方继续用旧快照）。
+pub fn refresh_now() -> bool {
+    let Some(_slot) = RefreshSlot::acquire() else { return false };
+    let mut guard = lock();
+    let Some(index) = guard.as_mut() else { return false };
+    refresh_with(index)
+}
+
+/// 后台刷新：不阻塞查询。
+///
+/// 全量 stat 巡约 10s，如果持着索引锁跑，后面所有查询都会堵在那儿。
+/// 所以扫描阶段只用「目录表快照」（20MB 量级），扫完再抢锁合并。
+pub fn spawn_refresh_async() -> bool {
+    let Some(slot) = RefreshSlot::acquire() else { return false };
+    std::thread::spawn(move || {
+        let _slot = slot;
+        let snapshot = {
+            let guard = lock();
+            guard
+                .as_ref()
+                .map(|ix| (ix.dir_blob.clone(), ix.dirs.clone()))
+        };
+        let Some((dir_blob, dirs)) = snapshot else { return };
+        // 扫盘阶段：不持锁
+        let (mut dirty, stat_failed) = scan_dirty_dirs(&dir_blob, &dirs, now_unix());
+        drop(dir_blob);
+        dirty.extend(take_dirty().into_iter().map(|k| (k, 0u64)));
+        dirty.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        let mut guard = lock();
+        let Some(index) = guard.as_mut() else { return };
+        if dirty.is_empty() {
+            index.built_unix = now_unix();
+            index.incomplete_dirs = stat_failed;
+            NEED_FULL_SCAN.store(false, Ordering::Relaxed);
+            return;
+        }
+        let hint: Vec<String> = dirty.into_iter().map(|(k, _)| k).collect();
+        if refresh_in_place(index, Some(hint)) {
+            NEED_FULL_SCAN.store(false, Ordering::Relaxed);
+        }
+        // 扫盘期间（约 10s）又攒下的变更，接着补上，最多 3 轮
+        for _ in 0..3 {
+            let more = take_dirty();
+            if more.is_empty() {
+                break;
+            }
+            if !refresh_in_place(index, Some(more)) {
+                break;
+            }
+        }
+    });
+    true
+}
+
+/// 监听在跑、也没丢过事件：这时索引可以当作「当前文件系统」的权威视图，
+/// 零命中可以直接回「没有」，不必再花 20-48s 走一遍全盘遍历。
+fn watcher_trusted() -> bool {
+    WATCH_ACTIVE.load(Ordering::Relaxed) && !NEED_FULL_SCAN.load(Ordering::Relaxed)
+}
+
+/// 刷新策略：
+/// - 监听在跑且没溢出 ⇒ 只重枚举「有变更的目录」（通常几个，耗时可忽略）
+/// - 首次 / 监听溢出 / 盘数量变了 ⇒ 全量 stat 巡（约 10s，交给后台）
+fn refresh_with(index: &mut Index) -> bool {
+    if integration::local_drives().len() as u64 != WATCHED_DRIVES.load(Ordering::Relaxed) {
+        NEED_FULL_SCAN.store(true, Ordering::Relaxed);
+    }
+    let watching = WATCH_ACTIVE.load(Ordering::Relaxed);
+    if watching && !NEED_FULL_SCAN.load(Ordering::Relaxed) {
+        let dirty = take_dirty();
+        if dirty.is_empty() {
+            // 没有任何变更事件：索引就是最新的，只更新新鲜度戳（O(1)）
+            index.built_unix = now_unix();
+            return true;
+        }
+        return refresh_in_place(index, Some(dirty));
+    }
+    let ok = refresh_in_place(index, None);
+    if ok {
+        NEED_FULL_SCAN.store(false, Ordering::Relaxed);
+    }
+    ok
+}
+
+// ---------- 目录变更监听（ReadDirectoryChangesW） ----------
+//
+// 为什么必须事件驱动：本机 31.7 万个目录，单次 stat 约 30µs（NVMe 上也这个量级，
+// 主要是文件系统过滤器成本），全量 stat 一轮 ≈ 10s。放在查询路径上不可接受，而
+// 「新建文件要等 10s 才能搜到」在用户看来仍然是「搜不到」。
+//
+// 所以每个本地盘开一个监听线程（普通用户权限即可，不需要管理员）：系统把增删改名
+// 事件直接推过来，我们只记「哪个目录变了」。查询前的刷新只重枚举这几个目录。
+// 监听没起来（或缓冲区溢出丢事件）时退回全量 stat 巡，保证最终一致。
+
+static DIRTY_DIRS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// 至少有一个盘的监听在跑
+static WATCH_ACTIVE: AtomicBool = AtomicBool::new(false);
+static WATCH_STARTED: AtomicBool = AtomicBool::new(false);
+/// 启动后 / 监听溢出 / 盘数量变化：必须做一次全量扫描才敢说索引是全的
+static NEED_FULL_SCAN: AtomicBool = AtomicBool::new(true);
+static WATCHED_DRIVES: AtomicU64 = AtomicU64::new(0);
+
+/// 启动目录监听（幂等）。GUI 与 MCP 都会调，重复调用无代价。
+pub fn start_watchers() {
+    if WATCH_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let drives = integration::local_drives();
+    WATCHED_DRIVES.store(drives.len() as u64, Ordering::Relaxed);
+    for d in drives {
+        let root = format!("{d}/");
+        std::thread::spawn(move || watch_volume(&root));
+    }
+}
+
+fn note_dirty(dir: &str) {
+    let mut g = DIRTY_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+    // 上限保护：疯狂抖动时别把内存吃穿，超了就让下一次退化成全量扫描
+    if g.len() >= 20_000 {
+        NEED_FULL_SCAN.store(true, Ordering::Relaxed);
+        g.clear();
+        return;
+    }
+    g.push(dir.to_string());
+}
+
+fn take_dirty() -> Vec<String> {
+    let mut g = DIRTY_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut v = std::mem::take(&mut *g);
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+#[cfg(windows)]
+fn watch_volume(root: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY,
+        FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let native = root.replace('/', "\\");
+    let wide: Vec<u16> = std::ffi::OsStr::new(&native)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return;
+    }
+    WATCH_ACTIVE.store(true, Ordering::Relaxed);
+    NEED_FULL_SCAN.store(true, Ordering::Relaxed);
+
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let mut returned: u32 = 0;
+        let ok = unsafe {
+            ReadDirectoryChangesW(
+                handle,
+                buf.as_mut_ptr() as *mut core::ffi::c_void,
+                buf.len() as u32,
+                1, // 递归监听整盘
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME,
+                &mut returned,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+        if ok == 0 || returned == 0 {
+            // 句柄失效 / 缓冲区溢出丢事件：标脏，退回全量扫描保最终一致
+            NEED_FULL_SCAN.store(true, Ordering::Relaxed);
+            if ok == 0 {
+                break;
+            }
+            continue;
+        }
+        collect_changes(root, &buf[..returned as usize]);
+    }
+    unsafe { CloseHandle(handle) };
+}
+
+#[cfg(windows)]
+fn collect_changes(root: &str, buf: &[u8]) {
+    use windows_sys::Win32::Storage::FileSystem::FILE_NOTIFY_INFORMATION;
+
+    // FILE_ACTION_ADDED=1 / REMOVED=2 / MODIFIED=3 / RENAMED_OLD=4 / RENAMED_NEW=5
+    const ACTIONS: [u32; 4] = [1, 2, 4, 5];
+    let mut off = 0usize;
+    loop {
+        if off + 12 > buf.len() {
+            break;
+        }
+        let rec = unsafe { &*(buf.as_ptr().add(off) as *const FILE_NOTIFY_INFORMATION) };
+        let chars = rec.FileNameLength as usize / 2;
+        if chars > 0 && off + 12 + chars * 2 <= buf.len() {
+            let units = unsafe { std::slice::from_raw_parts(rec.FileName.as_ptr(), chars) };
+            let rel = String::from_utf16_lossy(units);
+            // MODIFIED 只是内容变了，名字集合不受影响，不用刷索引
+            if ACTIONS.contains(&rec.Action) {
+                let full = format!("{}{}", root, rel.replace('\\', "/"));
+                if let Some(i) = full.rfind('/') {
+                    note_dirty(&full[..i]);
+                }
+            }
+        }
+        if rec.NextEntryOffset == 0 {
+            break;
+        }
+        off += rec.NextEntryOffset as usize;
+    }
+}
+
+#[cfg(not(windows))]
+fn watch_volume(_root: &str) {}
+
+/// 目录级增量刷新（原地、不拷整份 blob）。
+///
+/// 核心假设：目录自身的 LastWriteTime 变了，才可能有增删改名；没变就能把整棵子树
+/// 的旧条目原样搬过来，不用枚举、不用给每个文件 stat。全盘 620 万文件 / 30 万目录，
+/// 脏目录通常几十个，所以整次刷新通常在几十毫秒量级。
+///
+/// 返回 false 表示这次刷新不可信（旧内容原样恢复，调用方继续用旧快照）。
+fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
+    let t_start = Instant::now();
+    let started = now_unix();
+    let roots: Vec<PathBuf> = integration::local_drives()
+        .into_iter()
+        .map(|d| PathBuf::from(format!("{d}/")))
+        .collect();
+    if roots.is_empty() {
+        return false;
+    }
+
+    let old_items = std::mem::take(&mut index.items);
+    let old_dirs = std::mem::take(&mut index.dirs);
+    let was_complete = index.complete;
+
+    // ---- 第 1 步：找出「哪些目录变了」 ----
+    //
+    // 两种来源：
+    // - hint=Some：监听线程（ReadDirectoryChangesW）直接推过来的脏目录 —— 常态，代价可忽略
+    // - hint=None：全量 stat 巡 —— 只在首次启动/监听丢事件时做，本机 31.7 万目录约 10-15s
+    //
+    // 为什么不能只靠「父目录 mtime 没变 ⇒ 子树没变」：改动落在深层目录时，只有它自己
+    // 的 mtime 会变，祖先一个都不动。按祖先剪枝会把整棵 `D:/auto` 判成没变，于是深层
+    // 新建/删除的文件永远刷不进来（这正是「刚建的文件搜不到」的成因之一）。
+    // stat 一个目录 = 1 次系统调用，枚举一个目录 = 1 + N 次，所以全量巡也用 stat 而不是遍历。
+    // hint=Some 时是「监听推过来的脏目录」，不需要全量 stat 巡。
+    // 落在剪枝路径里的（node_modules/target/回收站…）直接丢掉：索引本来就不收这些，
+    // 把它们当根会把目录表污染成「遍历和索引结果集不一致」。
+    let (mut dirty, stat_failed) = match hint {
+        Some(dirs) => (
+            dirs.into_iter()
+                .filter(|d| !is_pruned(Path::new(d)))
+                .map(|d| (d, 0u64))
+                .collect(),
+            false,
+        ),
+        None => scan_dirty_dirs(&index.dir_blob, &old_dirs, started),
+    };
+    let scan_ms = t_start.elapsed().as_millis();
+    dirty.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    // 一个脏目录都没有：文件系统没动过，刷新只是一次 stat 巡。
+    if dirty.is_empty() {
+        index.items = old_items;
+        index.dirs = old_dirs;
+        index.built_unix = started;
+        index.incomplete_dirs = stat_failed;
+        return true;
+    }
+
+    // 枚举只从「最上层」的脏目录开始：脏目录的脏后代会被这趟遍历顺着走下去，
+    // 重复当根会把同一棵子树枚举两遍、产出重复条目。
+    let dirty_all: HashSet<&str> = dirty.iter().map(|(k, _)| k.as_str()).collect();
+    let mut worklist: Vec<String> = Vec::with_capacity(dirty.len());
+    for (key, _) in &dirty {
+        let mut ancestor_dirty = false;
+        let mut probe = key.as_str();
+        while let Some(pos) = probe.rfind('/') {
+            probe = &probe[..pos];
+            // 先判是不是脏祖先，再看要不要停：盘符根（"D:"）本身也可能是脏的
+            // （文件直接建在盘根下时就是这个键）；先 break 会把 D: 和 D:/x 都当根，
+            // 同一棵树枚举两遍 ⇒ 索引里出现重复条目。
+            if dirty_all.contains(probe) {
+                ancestor_dirty = true;
+                break;
+            }
+            if probe.len() <= 2 {
+                break;
+            }
+        }
+        if !ancestor_dirty {
+            worklist.push(key.clone());
+        }
+    }
+
+    // ---- 第 2 步：只枚举脏目录及其新增子树 ----
+    let fresh_files: Mutex<Vec<RawItem>> = Mutex::new(Vec::new());
+    let fresh_dirs: Mutex<Vec<(Box<str>, u64)>> = Mutex::new(Vec::new());
+    let enumerated: Mutex<Vec<Box<str>>> = Mutex::new(Vec::new());
+    let cap = max_entries();
+    let count = std::sync::atomic::AtomicUsize::new(0);
+    let overflow = AtomicBool::new(false);
+    let cancel = AtomicBool::new(false);
+
+    // 脏目录自己也要更新记录（它的 mtime 变了），而且它是被枚举的根。
+    for key in &worklist {
+        // 根源目录的 mtime 只能现场取一次（遍历不会回调根自己）；根的数量很少
+        let mtime = dir_mtime_secs(key).unwrap_or(0);
+        fresh_dirs.lock().unwrap().push((key.as_str().into(), mtime));
+        enumerated.lock().unwrap().push(key.as_str().into());
+    }
+
+    {
+        let dir_blob_snapshot = index.dir_blob.as_str();
+        let walk_roots: Vec<PathBuf> = worklist.iter().map(PathBuf::from).collect();
+        fastwalk::walk(
+            &walk_roots,
+            &fastwalk::Options { include_hidden: false, threads: num_cpus::get() },
+            &cancel,
+            |path, info| {
+                if is_pruned(path) {
+                    return if info.is_dir { Step::Skip } else { Step::Continue };
+                }
+                if info.is_dir {
+                    let key = path.to_string_lossy().replace('\\', "/");
+                    let mtime = unix_secs(info.modified);
+                    // 索引里没有这个目录（新建的）也必须枚举，否则它的子树文件全丢
+                    let known = old_dirs
+                        .binary_search_by(|rec| {
+                            dir_path_of(dir_blob_snapshot, rec).cmp(key.as_str())
+                        })
+                        .is_ok();
+                    let is_dirty = dirty_all.contains(key.as_str()) || !known;
+                    fresh_dirs.lock().unwrap().push((key.as_str().into(), mtime));
+                    if is_dirty {
+                        // 脏：枚举它，并且要往下走
+                        enumerated.lock().unwrap().push(key.into_boxed_str());
+                        return Step::Continue;
+                    }
+                    // 不脏：子树没变，整棵复用（记录已登记，挂在被枚举的父目录下）
+                    return Step::Skip;
+                }
+                if count.fetch_add(1, Ordering::Relaxed) >= cap {
+                    overflow.store(true, Ordering::Relaxed);
+                    return Step::Quit;
+                }
+                fresh_files.lock().unwrap().push((
+                    path.to_string_lossy().replace('\\', "/").into_boxed_str(),
+                    info.size,
+                    unix_secs(info.modified),
+                ));
+                Step::Continue
+            },
+        );
+    }
+
+    let mut fresh = fresh_files.into_inner().unwrap_or_default();
+    fresh.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    // 兜底去重：万一某棵子树被枚举了两次（重命名的两个事件、重叠的工作根），
+    // 也不能把同一路径插进索引两遍——条目表必须严格升序。
+    fresh.dedup_by(|a, b| a.0 == b.0);
+    let mut fresh_d = fresh_dirs.into_inner().unwrap_or_default();
+    fresh_d.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    fresh_d.dedup_by(|a, b| a.0 == b.0);
+    let mut enumer = enumerated.into_inner().unwrap_or_default();
+    enumer.sort_unstable();
+    enumer.dedup();
+
+    // ---- 第 3 步：算要丢掉的旧条目 ----
+    //
+    // 规则：**被枚举过的目录，其整棵子树里的旧条目一律作废**（用这次枚举的结果替换），
+    // 唯一例外是「不脏、被跳过」的子目录——它的子树整棵复用。
+    //
+    // 不能只丢「直接子项」：字典序下直接子项和后代是交错的
+    // （`docs/sub/b.html` 排在 `docs/z.html` 前面），按连续区间取「直接子项」会漏掉
+    // 一部分，漏掉的又被新枚举插一遍 ⇒ 索引里出现重复路径，二分区间查询跟着错位。
+    let mut enumer_sub: Vec<(usize, usize)> = Vec::new();
+    let mut enumer_dir_sub: Vec<(usize, usize)> = Vec::new();
+    for dir in &enumer {
+        let prefix = format!("{dir}/");
+        let (lo, hi) = prefix_bounds_raw(&index.blob, &old_items, &prefix);
+        if hi > lo {
+            enumer_sub.push((lo, hi));
+        }
+        let (dlo, dhi) = dir_prefix_bounds_raw(&index.dir_blob, &old_dirs, &prefix);
+        if dhi > dlo {
+            enumer_dir_sub.push((dlo, dhi));
+        }
+    }
+    let enumer_set: HashSet<&str> = enumer.iter().map(|k| k.as_ref()).collect();
+    let mut keep_sub: Vec<(usize, usize)> = Vec::new();
+    let mut keep_dir_sub: Vec<(usize, usize)> = Vec::new();
+    for (key, _) in &fresh_d {
+        if enumer_set.contains(key.as_ref()) {
+            continue; // 被枚举的目录不算「没变」，不豁免
+        }
+        let prefix = format!("{key}/");
+        let (lo, hi) = prefix_bounds_raw(&index.blob, &old_items, &prefix);
+        if hi > lo {
+            keep_sub.push((lo, hi));
+        }
+        let (dlo, dhi) = dir_prefix_bounds_raw(&index.dir_blob, &old_dirs, &prefix);
+        if dhi > dlo {
+            keep_dir_sub.push((dlo, dhi));
+        }
+    }
+
+    let t_ranges = t_start.elapsed().as_millis();
+    let mut item_drop = subtract(&merge_ranges(enumer_sub), &merge_ranges(keep_sub));
+    let mut dir_drop = subtract(&merge_ranges(enumer_dir_sub), &merge_ranges(keep_dir_sub));
+
+    // 脏目录自己的旧记录（挂在没被枚举的父目录下，不在上面任何子树里）换成新 mtime
+    for key in &worklist {
+        if let Ok(i) =
+            old_dirs.binary_search_by(|rec| dir_path_of(&index.dir_blob, rec).cmp(key.as_str()))
+        {
+            dir_drop.push((i, i + 1));
+        }
+    }
+
+    item_drop.sort_unstable();
+    dir_drop.sort_unstable();
+
+    // ---- 第 4 步：拼新表 ----
+    let kept_len = old_items.len() - covered(&item_drop);
+    let kept_dirs_len = old_dirs.len() - covered(&dir_drop);
+
+    // 丢太多 ⇒ 枚举出了系统性问题（盘没就绪 / 权限 / 拔盘），不信这次结果。
+    if old_items.len() >= 10_000 && kept_len * 5 < old_items.len() * 4 {
+        eprintln!(
+            "rust-seek: incremental refresh would drop {} of {} entries; keeping previous index",
+            old_items.len() - kept_len,
+            old_items.len()
+        );
+        index.items = old_items;
+        index.dirs = old_dirs;
+        return false;
+    }
+
+    let t_drop = t_start.elapsed().as_millis();
+    if fresh.is_empty() && kept_len == old_items.len() {
+        index.items = old_items;
+    } else {
+        let mut kept: Vec<Item> = Vec::with_capacity(kept_len);
+        copy_gaps(&old_items, &item_drop, &mut kept);
+        drop(old_items);
+
+        // 新路径追加到 blob 尾部：旧偏移全部保留，不重拷 580MB 文本。
+        let mut appended: Vec<Item> = Vec::with_capacity(fresh.len());
+        for (path, size, mtime) in &fresh {
+            if index.blob.len() + path.len() > u32::MAX as usize {
+                break;
+            }
+            let path_off = index.blob.len() as u32;
+            index.blob.push_str(path);
+            let path_len = path.len() as u32;
+            let rel = path.rfind('/').map_or(0, |i| i + 1) as u32;
+            appended.push(Item {
+                path_off,
+                path_len,
+                name_off: path_off + rel,
+                name_len: path_len - rel,
+                size: *size,
+                mtime: *mtime,
+            });
+        }
+
+        // 归并：新条目相对全盘很少，用二分定位插入点再一次拼好，
+        // 避免走 620 万条路径的全量字符串归并（那要 0.5s+）。
+        let dbg = std::env::var_os("RUST_SEEK_DEBUG_REFRESH").is_some();
+        let blob = index.blob.as_str();
+        if dbg {
+            let mut bad = 0usize;
+            for w in kept.windows(2) {
+                if path_of(blob, &w[0]) >= path_of(blob, &w[1]) {
+                    bad += 1;
+                    if bad <= 3 {
+                        eprintln!(
+                            "  kept-bad: {:?} -> {:?}",
+                            path_of(blob, &w[0]),
+                            path_of(blob, &w[1])
+                        );
+                    }
+                }
+            }
+            let mut abad = 0usize;
+            for w in appended.windows(2) {
+                if path_of(blob, &w[0]) >= path_of(blob, &w[1]) {
+                    abad += 1;
+                }
+            }
+            eprintln!(
+                "  pre-merge: kept={} kept_bad={} appended={} appended_bad={}",
+                kept.len(),
+                bad,
+                appended.len(),
+                abad
+            );
+        }
+        let mut merges: Vec<(usize, usize)> = Vec::with_capacity(appended.len());
+        for (i, item) in appended.iter().enumerate() {
+            let target = path_of(blob, item);
+            let mut pos = kept.partition_point(|it| path_of(blob, it) < target);
+            // 同一路径已存在（例如上一轮刷新把条目撞重了）：用新条目顶掉，不再插入，
+            // 否则条目表里会出现重复路径，二分区间查询会连带出错。
+            if pos < kept.len() && path_of(blob, &kept[pos]) == target {
+                kept.remove(pos);
+                pos = kept.partition_point(|it| path_of(blob, it) < target);
+            }
+            merges.push((pos, i));
+        }
+        let mut merged: Vec<Item> = Vec::with_capacity(kept.len() + appended.len());
+        let mut prev = 0usize;
+        for (pos, idx) in merges {
+            let pos = pos.max(prev);
+            merged.extend_from_slice(&kept[prev..pos]);
+            merged.push(appended[idx]);
+            prev = pos;
+        }
+        merged.extend_from_slice(&kept[prev..]);
+        index.items = merged;
+    }
+
+    if fresh_d.is_empty() && kept_dirs_len == old_dirs.len() {
+        index.dirs = old_dirs;
+    } else {
+        let mut kept_dirs: Vec<DirRec> = Vec::with_capacity(kept_dirs_len);
+        copy_gaps(&old_dirs, &dir_drop, &mut kept_dirs);
+        drop(old_dirs);
+
+        let mut appended_d: Vec<DirRec> = Vec::with_capacity(fresh_d.len());
+        for (path, mtime) in &fresh_d {
+            if index.dir_blob.len() + path.len() > u32::MAX as usize {
+                break;
+            }
+            let path_off = index.dir_blob.len() as u32;
+            index.dir_blob.push_str(path);
+            appended_d.push(DirRec { path_off, path_len: path.len() as u32, mtime: *mtime });
+        }
+
+        let dir_blob = index.dir_blob.as_str();
+        let mut merges: Vec<(usize, usize)> = Vec::with_capacity(appended_d.len());
+        for (i, rec) in appended_d.iter().enumerate() {
+            let target = dir_path_of(dir_blob, rec);
+            let mut pos = kept_dirs.partition_point(|r| dir_path_of(dir_blob, r) < target);
+            if pos < kept_dirs.len() && dir_path_of(dir_blob, &kept_dirs[pos]) == target {
+                kept_dirs.remove(pos);
+                pos = kept_dirs.partition_point(|r| dir_path_of(dir_blob, r) < target);
+            }
+            merges.push((pos, i));
+        }
+        let mut merged: Vec<DirRec> = Vec::with_capacity(kept_dirs.len() + appended_d.len());
+        let mut prev = 0usize;
+        for (pos, idx) in merges {
+            let pos = pos.max(prev);
+            merged.extend_from_slice(&kept_dirs[prev..pos]);
+            merged.push(appended_d[idx]);
+            prev = pos;
+        }
+        merged.extend_from_slice(&kept_dirs[prev..]);
+        index.dirs = merged;
+    }
+
+    let t_merge = t_start.elapsed().as_millis();
+    if std::env::var_os("RUST_SEEK_DEBUG_REFRESH").is_some() {
+        // 结构自检：条目表必须严格升序（等价于无重复）——二分区间查询全靠它
+        let mut bad = 0usize;
+        for w in index.items.windows(2) {
+            if path_of(&index.blob, &w[0]) >= path_of(&index.blob, &w[1]) {
+                bad += 1;
+                if bad <= 3 {
+                    eprintln!(
+                        "rust-seek BAD ORDER: {:?} -> {:?}",
+                        path_of(&index.blob, &w[0]),
+                        path_of(&index.blob, &w[1])
+                    );
+                }
+            }
+        }
+        let mut dbad = 0usize;
+        for w in index.dirs.windows(2) {
+            if dir_path_of(&index.dir_blob, &w[0]) >= dir_path_of(&index.dir_blob, &w[1]) {
+                dbad += 1;
+            }
+        }
+        eprintln!(
+            "rust-seek selfcheck: item_order_violations={} dir_order_violations={}", bad, dbad
+        );
+        eprintln!(
+            "rust-seek refresh: dirty={} roots={} enumerated={} fresh_files={} kept={}/{} dirs_kept={}/{} scan={}ms ranges={}ms drop={}ms merge={}ms total={}ms stat_failed={}",
+            dirty.len(),
+            worklist.len(),
+            enumer.len(),
+            fresh.len(),
+            index.items.len(),
+            kept_len,
+            index.dirs.len(),
+            kept_dirs_len,
+            scan_ms,
+            t_ranges,
+            t_drop,
+            t_merge,
+            t_start.elapsed().as_millis(),
+            stat_failed
+        );
+    }
+    index.built_unix = started;
+    index.complete = was_complete && !overflow.load(Ordering::Relaxed);
+    index.incomplete_dirs = stat_failed;
+    // 刷新只往 blob 尾部追加，被删掉的路径会留下空洞；累计浪费超过 25% 才整理一次
+    repack(index);
+    true
+}
+
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_PATH_NOT_FOUND: u32 = 3;
+
+/// 取目录自身的 LastWriteTime（unix 秒）。
+///
+/// 不用 `std::fs::metadata`：Windows 上它要 CreateFile 拿到句柄再查信息，
+/// 单次约 90µs；`GetFileAttributesExW` 只查元数据，快一个数量级。
+/// 30 万个目录下这就是 29s 和 0.3s 的区别。
+#[cfg(windows)]
+fn dir_mtime_secs(path: &str) -> Result<u64, u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesExW, GetFileExInfoStandard, WIN32_FILE_ATTRIBUTE_DATA,
+    };
+
+    let native = path.replace('/', "\\");
+    let wide: Vec<u16> = std::ffi::OsStr::new(&native)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut data: WIN32_FILE_ATTRIBUTE_DATA = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetFileAttributesExW(
+            wide.as_ptr(),
+            GetFileExInfoStandard,
+            &mut data as *mut WIN32_FILE_ATTRIBUTE_DATA as *mut core::ffi::c_void,
+        )
+    };
+    if ok == 0 {
+        return Err(unsafe { windows_sys::Win32::Foundation::GetLastError() });
+    }
+    let ticks = ((data.ftLastWriteTime.dwHighDateTime as u64) << 32)
+        | data.ftLastWriteTime.dwLowDateTime as u64;
+    const EPOCH_DIFF_SECS: u64 = 11_644_473_600;
+    let secs = ticks / 10_000_000;
+    Ok(secs.saturating_sub(EPOCH_DIFF_SECS))
+}
+
+#[cfg(not(windows))]
+fn dir_mtime_secs(path: &str) -> Result<u64, u32> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
+        .map_err(|_| 0)
+}
+
+/// 并行 stat 所有已知目录，返回 `(脏目录 [(路径, 新 mtime)], 是否有目录 stat 失败)`。
+///
+/// 「脏」= mtime 变了，或 mtime 离这次刷新不足 `DIR_SLACK_SECS`（秒级 mtime 下
+/// 「同一秒内新建又删除」不留痕迹，宁可多枚举一个目录）。
+/// stat 失败的目录**不算脏**：读不到就当没变，保留旧数据，只把状态标成不完整——
+/// 反过来把「读不到」当「空了」，会直接把整棵子树的文件从索引里抹掉。
+fn scan_dirty_dirs(
+    dir_blob: &str,
+    old_dirs: &[DirRec],
+    started: u64,
+) -> (Vec<(String, u64)>, bool) {
+    if old_dirs.is_empty() {
+        return (Vec::new(), false);
+    }
+    let threads = num_cpus::get().clamp(1, 16);
+    let chunk = ((old_dirs.len() + threads - 1) / threads).max(1);
+    let failed = AtomicBool::new(false);
+    let out: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        for slice in old_dirs.chunks(chunk) {
+            let out = &out;
+            let failed = &failed;
+            scope.spawn(move || {
+                let mut local: Vec<(String, u64)> = Vec::new();
+                for rec in slice {
+                    let key = dir_path_of(dir_blob, rec);
+                    match dir_mtime_secs(key) {
+                        Ok(mtime) => {
+                            if mtime != rec.mtime
+                                || mtime.saturating_add(DIR_SLACK_SECS) >= started
+                            {
+                                local.push((key.to_string(), mtime));
+                            }
+                        }
+                        // 目录已经不在了：它的父目录 mtime 必然也变过、会被枚举到，
+                        // 那里会把这条记录清掉，这里不需要也不该标成「读不到」。
+                        Err(code) if code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND => {}
+                        Err(_) => failed.store(true, Ordering::Relaxed),
+                    }
+                }
+                if !local.is_empty() {
+                    out.lock().unwrap().extend(local);
+                }
+            });
+        }
+    });
+
+    (out.into_inner().unwrap_or_default(), failed.load(Ordering::Relaxed))
+}
+
+/// 把（可能重叠的）区间排序并合并。
+fn merge_ranges(mut r: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    r.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(r.len());
+    for (lo, hi) in r {
+        if lo >= hi {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+            _ => out.push((lo, hi)),
+        }
+    }
+    out
+}
+
+/// 区间集合差：`a` 里去掉被 `b` 覆盖的部分（两侧都已排序合并）。
+fn subtract(a: &[(usize, usize)], b: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut j = 0usize;
+    for &(lo, hi) in a {
+        let mut cur = lo;
+        while j < b.len() && b[j].1 <= cur {
+            j += 1;
+        }
+        let mut k = j;
+        while k < b.len() && b[k].0 < hi {
+            if b[k].0 > cur {
+                out.push((cur, b[k].0));
+            }
+            cur = cur.max(b[k].1);
+            if cur >= hi {
+                break;
+            }
+            k += 1;
+        }
+        if cur < hi {
+            out.push((cur, hi));
+        }
+    }
+    out
+}
+
+/// 丢弃区间（已排序、可能重叠）覆盖的元素个数。
+fn covered(ranges: &[(usize, usize)]) -> usize {
+    let mut n = 0usize;
+    let mut last = 0usize;
+    for (lo, hi) in ranges {
+        let lo = (*lo).max(last);
+        if hi > &lo {
+            n += hi - lo;
+            last = *hi;
+        }
+    }
+    n
+}
+
+/// 把 `items` 中没被丢弃区间覆盖的元素按原顺序拷进 `out`。
+fn copy_gaps<T: Copy>(items: &[T], ranges: &[(usize, usize)], out: &mut Vec<T>) {
+    let mut prev = 0usize;
+    for (lo, hi) in ranges {
+        let lo = (*lo).max(prev).min(items.len());
+        let hi = (*hi).max(lo).min(items.len());
+        if lo > prev {
+            out.extend_from_slice(&items[prev..lo]);
+        }
+        prev = hi;
+    }
+    if prev < items.len() {
+        out.extend_from_slice(&items[prev..]);
+    }
+}
+
+/// 把 blob 里已失效（条目被删）的路径文本清掉，重新紧凑排布。
+fn repack(index: &mut Index) {
+    let used: usize = index.items.iter().map(|it| it.path_len as usize).sum();
+    if used > 0 && index.blob.len() > used + used / 4 {
+        let mut blob = String::with_capacity(used);
+        for it in index.items.iter_mut() {
+            let path: &str =
+                &index.blob[it.path_off as usize..(it.path_off + it.path_len) as usize];
+            let path_off = blob.len() as u32;
+            let rel = path.rfind('/').map_or(0, |i| i + 1) as u32;
+            blob.push_str(path);
+            it.path_off = path_off;
+            it.name_off = path_off + rel;
+            it.name_len = it.path_len - rel;
+        }
+        index.blob = blob;
+    }
+    let dused: usize = index.dirs.iter().map(|r| r.path_len as usize).sum();
+    if dused > 0 && index.dir_blob.len() > dused + dused / 4 {
+        let mut blob = String::with_capacity(dused);
+        for rec in index.dirs.iter_mut() {
+            let path: &str =
+                &index.dir_blob[rec.path_off as usize..(rec.path_off + rec.path_len) as usize];
+            rec.path_off = blob.len() as u32;
+            blob.push_str(path);
+        }
+        index.dir_blob = blob;
+    }
+}
+
 fn build() -> Option<Index> {
-    build_with_match(None, None, 0).map(|(index, _)| index)
+    build_with_match(None, None, 0, false).map(|(index, _)| index)
 }
 
 /// 一趟遍历收集所有文件；`match_re` 为 Some 时同时按文件名答查询（冷启动合并用）。
@@ -629,6 +1608,7 @@ fn build_with_match(
     match_re: Option<&Regex>,
     match_exts: Option<&HashSet<String>>,
     max: usize,
+    match_path: bool,
 ) -> Option<(Index, Vec<Hit>)> {
     // 索引代表「开始遍历那一刻」的文件系统，而不是结束时刻：
     // 遍历过程中新建的文件可能落在已扫过的目录里而没进索引。
@@ -660,6 +1640,8 @@ fn build_with_match(
     });
 
     let hits = Mutex::new(Vec::new());
+    // 目录表：路径 + 目录自身 mtime，增量刷新靠它判断哪些子树根本没动
+    let raw_dirs: Mutex<Vec<(Box<str>, u64)>> = Mutex::new(Vec::new());
     {
         let tx = tx.clone();
         fastwalk::walk(
@@ -671,6 +1653,11 @@ fn build_with_match(
                     return if info.is_dir { Step::Skip } else { Step::Continue };
                 }
                 if info.is_dir {
+                    let key = path.to_string_lossy().replace('\\', "/");
+                    raw_dirs
+                        .lock()
+                        .unwrap()
+                        .push((key.into_boxed_str(), unix_secs(info.modified)));
                     return Step::Continue;
                 }
                 if count.fetch_add(1, Ordering::Relaxed) >= cap {
@@ -683,14 +1670,15 @@ fn build_with_match(
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
 
-                // 冷启动答查询：按文件名匹配，语义与 query 的 match_item 一致
+                // 冷启动答查询：匹配语义与 query 的 match_item 一致（含「按路径匹配」）
                 if let Some(re) = match_re {
                     let name = path_str.rsplit('/').next().unwrap_or(&path_str);
                     let ok = match match_exts {
                         Some(exts) => exts.is_empty() || ext_matches(name, exts),
                         None => true,
                     };
-                    if ok && re.is_match(name) {
+                    let target = if match_path { path_str.as_str() } else { name };
+                    if ok && re.is_match(target) {
                         let mut guard = hits.lock().unwrap();
                         if guard.len() < max {
                             guard.push(Hit { path: path_str.clone(), size: info.size, mtime });
@@ -739,7 +1727,29 @@ fn build_with_match(
         });
     }
 
-    let index = Index { blob, items, built_unix: build_started, complete };
+    let mut dirs_sorted = raw_dirs.into_inner().unwrap_or_default();
+    dirs_sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let mut dir_blob = String::with_capacity(dirs_sorted.iter().map(|(p, _)| p.len()).sum());
+    let mut dirs = Vec::with_capacity(dirs_sorted.len());
+    for (path, mtime) in dirs_sorted {
+        if dir_blob.len() + path.len() > u32::MAX as usize {
+            break;
+        }
+        let path_off = dir_blob.len() as u32;
+        let path_len = path.len() as u32;
+        dir_blob.push_str(&path);
+        dirs.push(DirRec { path_off, path_len, mtime });
+    }
+
+    let index = Index {
+        blob,
+        items,
+        dir_blob,
+        dirs,
+        built_unix: build_started,
+        complete,
+        incomplete_dirs: false,
+    };
     Some((index, hits.into_inner().unwrap_or_default()))
 }
 
@@ -791,15 +1801,24 @@ fn load_cache() -> Option<Index> {
     let blob_len = u64::from_le_bytes(buf[16..24].try_into().ok()?) as usize;
     let count = u64::from_le_bytes(buf[24..32].try_into().ok()?) as usize;
     let flags = u64::from_le_bytes(buf[32..40].try_into().ok()?);
+    let dir_blob_len = u64::from_le_bytes(buf[40..48].try_into().ok()?) as usize;
+    let dir_count = u64::from_le_bytes(buf[48..56].try_into().ok()?) as usize;
     if count > MAX_ENTRIES_CEIL
-        || HDR.checked_add(blob_len)?.checked_add(count * ITEM_BYTES)? != buf.len()
+        || dir_count > MAX_ENTRIES_CEIL
+        || HDR
+            .checked_add(blob_len)?
+            .checked_add(count * ITEM_BYTES)?
+            .checked_add(dir_blob_len)?
+            .checked_add(dir_count * DIR_BYTES)?
+            != buf.len()
     {
         return None;
     }
 
     let blob_end = HDR + blob_len;
     let blob = String::from_utf8(buf[HDR..blob_end].to_vec()).ok()?;
-    let raw = &buf[blob_end..];
+    let items_end = blob_end + count * ITEM_BYTES;
+    let raw = &buf[blob_end..items_end];
     let mut items = Vec::with_capacity(count);
     for chunk in raw.chunks_exact(ITEM_BYTES) {
         let item = Item {
@@ -823,11 +1842,35 @@ fn load_cache() -> Option<Index> {
         items.push(item);
     }
 
+    let dir_blob_end = items_end + dir_blob_len;
+    let dir_blob = String::from_utf8(buf[items_end..dir_blob_end].to_vec()).ok()?;
+    let mut dirs = Vec::with_capacity(dir_count);
+    for chunk in buf[dir_blob_end..].chunks_exact(DIR_BYTES) {
+        let rec = DirRec {
+            path_off: u32::from_le_bytes(chunk[0..4].try_into().ok()?),
+            path_len: u32::from_le_bytes(chunk[4..8].try_into().ok()?),
+            mtime: u64::from_le_bytes(chunk[8..16].try_into().ok()?),
+        };
+        let (o, l) = (rec.path_off as usize, rec.path_len as usize);
+        if !o
+            .checked_add(l)
+            .map_or(false, |end| end <= dir_blob.len())
+            || !dir_blob.is_char_boundary(o)
+            || !dir_blob.is_char_boundary(o + l)
+        {
+            return None;
+        }
+        dirs.push(rec);
+    }
+
     Some(Index {
         blob,
         items,
+        dir_blob,
+        dirs,
         built_unix,
         complete: flags & FLAG_COMPLETE != 0,
+        incomplete_dirs: flags & FLAG_INCOMPLETE_DIRS != 0,
     })
 }
 
@@ -836,13 +1879,20 @@ fn save_cache(index: &Index) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let mut buf = Vec::with_capacity(HDR + index.blob.len() + index.items.len() * ITEM_BYTES);
+    let mut buf = Vec::with_capacity(
+        HDR + index.blob.len() + index.items.len() * ITEM_BYTES + index.dir_blob.len() + index.dirs.len() * DIR_BYTES,
+    );
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&index.built_unix.to_le_bytes());
     buf.extend_from_slice(&(index.blob.len() as u64).to_le_bytes());
     buf.extend_from_slice(&(index.items.len() as u64).to_le_bytes());
-    let flags = if index.complete { FLAG_COMPLETE } else { 0 };
+    let mut flags = if index.complete { FLAG_COMPLETE } else { 0 };
+    if index.incomplete_dirs {
+        flags |= FLAG_INCOMPLETE_DIRS;
+    }
     buf.extend_from_slice(&flags.to_le_bytes());
+    buf.extend_from_slice(&(index.dir_blob.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&(index.dirs.len() as u64).to_le_bytes());
     buf.extend_from_slice(index.blob.as_bytes());
     for it in &index.items {
         buf.extend_from_slice(&it.path_off.to_le_bytes());
@@ -851,6 +1901,12 @@ fn save_cache(index: &Index) {
         buf.extend_from_slice(&it.name_len.to_le_bytes());
         buf.extend_from_slice(&it.size.to_le_bytes());
         buf.extend_from_slice(&it.mtime.to_le_bytes());
+    }
+    buf.extend_from_slice(index.dir_blob.as_bytes());
+    for rec in &index.dirs {
+        buf.extend_from_slice(&rec.path_off.to_le_bytes());
+        buf.extend_from_slice(&rec.path_len.to_le_bytes());
+        buf.extend_from_slice(&rec.mtime.to_le_bytes());
     }
 
     // 临时文件名带 pid：多个 MCP 进程同时重建时各写各的，最后 rename 覆盖

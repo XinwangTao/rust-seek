@@ -13,7 +13,9 @@
 use crate::fastwalk::{self, Step};
 use crate::index;
 use crate::integration;
-use crate::searcher::{path_is_system_root, search_file, search_filename_meta, SKIP_DIRS};
+use crate::searcher::{
+    path_is_system_root, search_file, search_filename_meta_path, SKIP_DIRS,
+};
 use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -101,12 +103,14 @@ fn tool_defs() -> Value {
         {
             "name": "search_files",
             "description": "Search the local machine for files by name/path. Returns absolute paths with size and mtime. \
+The pattern is cleaned first (BOM / zero-width chars / surrounding whitespace are stripped); if it contains '/' or '\\\\' it is matched against the full path, otherwise only against the file name. \
 Traversal stops as soon as max_results matches are collected or budget_ms expires. Whole-drive queries without an explicit budget_ms may run up to ~60s (fresh, or index fallback); pass budget_ms to cap it. \
 roots defaults to the server's working directory (normally your project); pass roots like [\"C:/\",\"D:/\"] to search elsewhere or the whole machine. \
 node_modules/.git/target/WinSxS and drive-root system directories are pruned by default. \
 Whole-drive searches are served from an in-memory name index: the first such query builds it in a single ~19s pass (answering the query in the same walk) instead of running a competing background walk; once built, repeat queries come back in ~0.1-0.5s with source:\"index\". \
+The index is kept current by a directory-mtime based incremental refresh (sub-second: only subtrees whose directory LastWriteTime changed are re-enumerated), so newly created files are normally found without a full rebuild. \
 The result carries index_complete; if the index hit its entry cap on a very large machine, the call automatically falls back to a real walk and merges both result sets (source:\"index+walk\", index_complete:false) instead of returning a false negative. \
-The index is a snapshot: a zero-hit index query on a non-fresh index also falls back to a real walk (source:\"index+walk\", index_stale:true) so files created after the index was built are still found. \
+A zero-hit index query, or one against an index that could not be refreshed for over a minute, also falls back to a real walk (source:\"index+walk\", index_stale:true) so files created after the snapshot are still found. \
 index_maybe_stale:true means the result is usable but files created/renamed after the index snapshot may be missing; pass fresh:true to force a fresh walk.",
             "inputSchema": {
                 "type": "object",
@@ -230,6 +234,8 @@ fn files_index_result(
         "index_complete": complete,
         "index_stale": false,
         "index_maybe_stale": index::maybe_stale(age_ms),
+        "index_built_at": fmt_time(UNIX_EPOCH + Duration::from_secs(index::built_unix())),
+        "index_incomplete_dirs": index::incomplete_dirs(),
         "elapsed_ms": elapsed.as_millis(),
         "truncated": truncated,
         "timed_out": timed_out,
@@ -241,6 +247,8 @@ fn files_index_result(
 
 fn run_search_files(args: &Value) -> Result<String, String> {
     let pattern = arg_str(args, "pattern").ok_or("missing required argument: pattern")?;
+    // 粘的是路径片段（含 / 或 \\）时按完整路径匹配，否则只看文件名
+    let match_path = crate::searcher::looks_like_path(&pattern);
     let re = build_regex(&pattern, arg_bool(args, "regex", true), arg_bool(args, "case_sensitive", false))?;
     let roots = resolve_roots(args)?;
     let max_results = arg_usize(args, "max_results", 100, 1, 2000);
@@ -297,7 +305,7 @@ fn run_search_files(args: &Value) -> Result<String, String> {
                 && !index::try_load()
             {
                 if let Some((hits, entries, complete)) =
-                    index::build_and_match(&re, &exts, max_results)
+                    index::build_and_match(&re, &exts, max_results, match_path)
                 {
                     if complete || hits.len() >= max_results {
                         let truncated = hits.len() >= max_results;
@@ -320,7 +328,7 @@ fn run_search_files(args: &Value) -> Result<String, String> {
             if !seeded_from_build {
                 index::ensure_ready();
                 if let Some((hits, entries, age, full, complete)) =
-                    index::query(&re, &roots, &exts, max_results, budget)
+                    index::query(&re, &roots, &exts, max_results, budget, match_path)
                 {
                     // 索引完整但零命中：缓存可能比新文件旧，继续遍历兜底
                     let stale = index::suspicious_miss(hits.len(), age, complete);
@@ -404,7 +412,9 @@ fn run_search_files(args: &Value) -> Result<String, String> {
             return Step::Continue;
         }
         // 大小/时间直接用目录枚举带回的，命中时零系统调用
-        let Some(hit) = search_filename_meta(path, &re_c, || Some((info.size, info.modified))) else {
+        let Some(hit) =
+            search_filename_meta_path(path, &re_c, match_path, || Some((info.size, info.modified)))
+        else {
             return Step::Continue;
         };
         // 索引种子已贡献过的路径不再重复推送
@@ -808,7 +818,9 @@ fn resolve_roots(args: &Value) -> Result<Vec<String>, String> {
 // ---------- 匹配辅助 ----------
 
 fn build_regex(pattern: &str, is_regex: bool, case_sensitive: bool) -> Result<Regex, String> {
-    let src = if is_regex { pattern.to_string() } else { regex::escape(pattern) };
+    // 粘贴来的模式常带 BOM / 零宽字符 / 首尾空白：不清洗就永远 0 命中
+    let (pattern, _) = crate::searcher::clean_pattern(pattern);
+    let src = if is_regex { pattern } else { regex::escape(&pattern) };
     RegexBuilder::new(&src)
         .case_insensitive(!case_sensitive)
         .build()
