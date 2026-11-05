@@ -84,7 +84,7 @@
       "col": 5,
       "type": "backend",
       "label": "替换并重启",
-      "sublabel": "旧 exe 改名 .old，写入新 exe，延迟拉起",
+      "sublabel": "改名 .old → 原子写入 → 释放锁拉起",
       "width": 200
     },
     {
@@ -195,6 +195,7 @@
       "items": [
         "--mcp 进程不参与检查与替换",
         "运行中的 exe 不能覆盖，改名后新文件原子就位",
+        "替换前主动释放单实例锁，直接拉起新进程（不经 cmd 延迟）",
         "替换失败时旧版仍可启动",
         "检查与失败都写入 %LOCALAPPDATA%\\rust-seek\\update.log",
         "预发布 tag 不会成为 releases/latest"
