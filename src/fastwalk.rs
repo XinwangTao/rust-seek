@@ -178,7 +178,10 @@ mod imp {
             if !is_dot {
                 let attrs = data.dwFileAttributes;
                 let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
-                let hidden = attrs & FILE_ATTRIBUTE_HIDDEN != 0 || name.first() == Some(&(b'.' as u16));
+                // 只认 Windows 的隐藏属性。点开头是 Unix 习惯，在 Windows 上
+                // .env / .github / .vscode 这类名字并没有隐藏属性，按点号当隐藏
+                // 会让它们永远搜不到（假阴性）。
+                let hidden = attrs & FILE_ATTRIBUTE_HIDDEN != 0;
                 if opts.include_hidden || !hidden {
                     let os_name = OsString::from_wide(name);
                     path.push(&os_name);

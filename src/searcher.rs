@@ -1,5 +1,5 @@
 use anyhow::Result;
-use encoding_rs::GBK;
+use encoding_rs::{GBK, UTF_16BE, UTF_16LE};
 use memmap2::Mmap;
 use regex::Regex;
 use std::fs::File;
@@ -107,8 +107,24 @@ pub fn clean_pattern(s: &str) -> (String, usize) {
 }
 
 /// 模式里带路径分隔符 ⇒ 用户粘的是路径片段，应按完整路径匹配。
-pub fn looks_like_path(s: &str) -> bool {
-    s.contains('/') || s.contains('\\')
+/// 粘的是路径片段时按完整路径匹配。
+///
+/// 关键：`\` 在正则里是转义符（`\.` `\d` `\w`），不能一见到反斜杠就当路径 ——
+/// 否则 `^Cargo\.toml$` 这类锚定文件名的正则会变成对绝对路径匹配，静默 0 命中。
+/// 正则模式下只认明确形态（`X:\`、UNC `\\server`）；非正则模式才把任意反斜杠当分隔符。
+pub fn looks_like_path(s: &str, is_regex: bool) -> bool {
+    if s.contains('/') {
+        return true;
+    }
+    let b = s.as_bytes();
+    let drive_abs = b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b[2] == b'\\' || b[2] == b'/');
+    if drive_abs || s.starts_with("\\\\") {
+        return true;
+    }
+    !is_regex && s.contains('\\')
 }
 
 const MAX_LINE_LEN: usize = 512;
@@ -150,11 +166,24 @@ fn make_paths(path: &Path) -> (String, String) {
 }
 
 fn is_binary(data: &[u8], check_len: usize) -> bool {
+    // 带 BOM 的 UTF-16 文本（PowerShell .ps1、.reg、部分 .ini）高字节恒为 0x00，
+    // 按「含 NUL 即二进制」判会整类漏掉，先认 BOM。
+    if data.starts_with(&[0xFF, 0xFE]) || data.starts_with(&[0xFE, 0xFF]) {
+        return false;
+    }
     data[..data.len().min(check_len)].contains(&0)
 }
 
 /// Detect encoding from a small sample, then decode the full buffer once
 fn decode(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let (cow, _, _) = UTF_16LE.decode(bytes);
+        return cow.into_owned();
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let (cow, _, _) = UTF_16BE.decode(bytes);
+        return cow.into_owned();
+    }
     if std::str::from_utf8(bytes).is_ok() {
         // SAFETY: just validated above
         return unsafe { std::str::from_utf8_unchecked(bytes) }.to_owned();
@@ -169,16 +198,16 @@ fn collect_matches(content: &str, pattern: &Regex) -> Vec<Match> {
     let mut lines_iter = content.lines().enumerate().peekable();
 
     while let Some((i, line)) = lines_iter.next() {
-        if line.len() > MAX_LINE_LEN * 4 {
-            prev = None;
-            continue;
-        }
         if pattern.find(line).is_none() {
             // Reuse allocation via Rc — context_before of next match shares this
             prev = Some(Arc::new(truncate(line)));
             continue;
         }
-        let ranges: Vec<(usize, usize)> = pattern.find_iter(line)
+        // 长行（压缩后的 js/css、单行 JSON、大日志）照样要匹配：以前整行丢弃，
+        // 等于对这些文件静默返回 0 命中。命中区间设上限，避免单行刷出百万条。
+        let ranges: Vec<(usize, usize)> = pattern
+            .find_iter(line)
+            .take(100)
             .map(|m| (m.start(), m.end()))
             .collect();
         let display = truncate(line);
@@ -192,7 +221,7 @@ fn collect_matches(content: &str, pattern: &Regex) -> Vec<Match> {
             context_before,
             context_after,
         });
-        prev = Some(Arc::new(line.to_string()));
+        prev = Some(Arc::new(truncate(line)));
     }
     matches
 }

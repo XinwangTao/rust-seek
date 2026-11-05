@@ -247,9 +247,11 @@ fn files_index_result(
 
 fn run_search_files(args: &Value) -> Result<String, String> {
     let pattern = arg_str(args, "pattern").ok_or("missing required argument: pattern")?;
-    // 粘的是路径片段（含 / 或 \\）时按完整路径匹配，否则只看文件名
-    let match_path = crate::searcher::looks_like_path(&pattern);
-    let re = build_regex(&pattern, arg_bool(args, "regex", true), arg_bool(args, "case_sensitive", false))?;
+    // 粘的是路径片段（含 / 或 \\）时按完整路径匹配，否则只看文件名。
+    // 正则模式下反斜杠是转义符，不能当路径分隔符（见 searcher::looks_like_path）。
+    let use_regex = arg_bool(args, "regex", true);
+    let match_path = crate::searcher::looks_like_path(&pattern, use_regex);
+    let re = build_regex(&pattern, use_regex, arg_bool(args, "case_sensitive", false))?;
     let roots = resolve_roots(args)?;
     let max_results = arg_usize(args, "max_results", 100, 1, 2000);
     let include_hidden = arg_bool(args, "include_hidden", false);
@@ -258,6 +260,9 @@ fn run_search_files(args: &Value) -> Result<String, String> {
     let budget_ms = arg_usize(args, "budget_ms", 10_000, 0, 600_000) as u128;
     let exts = lower_list(args, "exts");
     let skip = skip_set(args);
+    // 用户显式指定的根若落在剪枝规则里（.../target、C:/Program Files/...），
+    // 不能再按同名段整棵剪掉，否则「指定目录里明明有文件却 0 命中」。
+    let (skip, prune_system) = relax_for_explicit_roots(skip, prune_system, &roots);
     let extra_skip = args
         .get("skip_dirs")
         .and_then(Value::as_array)
@@ -484,6 +489,8 @@ fn run_search_text(args: &Value) -> Result<String, String> {
     let budget_ms = arg_usize(args, "budget_ms", 10_000, 0, 600_000) as u128;
     let exts = lower_list(args, "exts");
     let skip = skip_set(args);
+    // 同 search_files：显式指定的根不被同名剪枝段整棵剪掉
+    let (skip, prune_system) = relax_for_explicit_roots(skip, prune_system, &roots);
 
     let start = Instant::now();
 
@@ -825,6 +832,30 @@ fn build_regex(pattern: &str, is_regex: bool, case_sensitive: bool) -> Result<Re
         .case_insensitive(!case_sensitive)
         .build()
         .map_err(|e| format!("invalid regex: {e}"))
+}
+
+/// 显式指定的根本身若落在剪枝规则里（`.../target`、`C:/Program Files/...`、
+/// `node_modules/...`），把该段从剪枝集合里去掉、并关掉系统目录剪枝：
+/// 用户已经点名要这个目录，再按同名段剪掉就是「静默 0 命中」。
+fn relax_for_explicit_roots(
+    mut skip: HashSet<String>,
+    mut prune_system: bool,
+    roots: &[String],
+) -> (HashSet<String>, bool) {
+    for r in roots {
+        let p = Path::new(r);
+        for c in p.components() {
+            if let std::path::Component::Normal(s) = c {
+                if let Some(n) = s.to_str() {
+                    skip.remove(&n.to_ascii_lowercase());
+                }
+            }
+        }
+        if path_is_system_root(p) {
+            prune_system = false;
+        }
+    }
+    (skip, prune_system)
 }
 
 fn is_skipped(path: &Path, skip: &HashSet<String>) -> bool {
