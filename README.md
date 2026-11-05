@@ -277,7 +277,7 @@ Releases are built automatically by GitHub Actions on every `v*` tag, with the a
 
 ### 自动更新（v5.1.2）
 
-程序启动 30 秒后，并在之后每 6 小时，会在后台读取 GitHub Releases 上的 `latest.json`：
+程序启动 30 秒后会在后台读取一次 GitHub Releases 上的 `latest.json`（只在启动时查，不轮询）：
 
 - 只比较版本号，不上传任何本地信息；
 - 发现新版本弹系统对话框，只有点「是」才下载；点「否」记住该版本，同一版本不再打扰；点 X 只算这次不问；

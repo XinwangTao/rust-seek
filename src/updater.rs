@@ -1,7 +1,7 @@
 //! 自动更新：GitHub Releases → 系统弹窗确认 → 下载 + SHA-256 校验 → 替换 exe 并重启。
 //!
-//! 流程见 docs/archify/auto_update_workflow.html（L1，2026-11-04 已确认）：
-//!   启动 30s 后查一次，之后每 6h；仅比较版本号，只有用户点「是」才下载；
+//! 流程见 docs/archify/auto_update_workflow.html（L1，2026-11-05 已确认）：
+//!   软件启动 30s 后查一次（不再定时轮询）；仅比较版本号，只有用户点「是」才下载；
 //!   `--mcp` 进程不进入本模块（main.rs 在 MCP 分支已提前返回）。
 //!
 //! 每次检查/决策/失败都追加到 `%LOCALAPPDATA%\rust-seek\update.log`，
@@ -16,9 +16,6 @@ use std::time::Duration;
 const DEFAULT_MANIFEST_URL: &str =
     "https://github.com/XinwangTao/rust-seek/releases/latest/download/latest.json";
 const DEFAULT_FIRST_DELAY: Duration = Duration::from_secs(30);
-const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
-const RETRY_MIN: Duration = Duration::from_secs(10 * 60);
-const RETRY_MAX: Duration = CHECK_INTERVAL;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const LOG_MAX_BYTES: u64 = 256 * 1024;
 
@@ -87,7 +84,8 @@ fn session_blocked(version: &str) -> bool {
 
 // ---------- 后台线程 ----------
 
-/// 后台线程入口：清理上次遗留的 .old，延迟首查，之后定时循环。
+/// 后台线程入口：清理上次遗留的 .old，延迟首查。
+/// **只在启动后查一次**，不再定时轮询（2026-11-05 用户确认）。
 pub fn spawn() {
     if std::env::var_os("RUST_SEEK_NO_UPDATE").is_some() {
         return;
@@ -95,23 +93,10 @@ pub fn spawn() {
     let _ = std::thread::Builder::new().name("updater".into()).spawn(|| {
         cleanup_old();
         std::thread::sleep(first_delay());
-        let mut backoff = RETRY_MIN;
-        loop {
-            match check_once() {
-                Ok(()) => {
-                    backoff = RETRY_MIN;
-                    std::thread::sleep(CHECK_INTERVAL);
-                }
-                Err(e) => {
-                    // 网络抖动不该让下一次检查等到 6 小时后：按 10min → 20min → … 退避。
-                    // 注意只有“取清单”这类无弹窗的失败会走到这里，下载/替换失败在
-                    // check_once 内部已记入 SESSION_BLOCKED，不会引发弹窗风暴。
-                    log(&format!("检查更新失败: {e}"));
-                    let wait = backoff;
-                    backoff = (backoff * 2).min(RETRY_MAX);
-                    std::thread::sleep(wait);
-                }
-            }
+        match check_once() {
+            Ok(()) => {}
+            // 只查一次：本次失败就等下次启动，不再退避重试
+            Err(e) => log(&format!("检查更新失败: {e}")),
         }
     });
 }
