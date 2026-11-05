@@ -84,6 +84,7 @@ struct RECT {
 extern "system" {
     fn SystemParametersInfoW(action: u32, param: u32, pvparam: *mut core::ffi::c_void, winini: u32) -> i32;
     fn CreateMutexW(attr: *mut core::ffi::c_void, owner: i32, name: *const u16) -> *mut core::ffi::c_void;
+    fn CloseHandle(h: *mut core::ffi::c_void) -> i32;
     fn CreateEventW(attr: *mut core::ffi::c_void, manual: i32, initial: i32, name: *const u16) -> *mut core::ffi::c_void;
     fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> *mut core::ffi::c_void;
     fn SetEvent(h: *mut core::ffi::c_void) -> i32;
@@ -327,6 +328,10 @@ pub fn local_drives_detailed() -> Vec<(String, &'static str)> {
 const SHOW_EVENT: &str = "Local\\RustSeek.ShowEvent";
 const MUTEX: &str = "Local\\RustSeek.SingleInstance";
 
+/// 主实例持有的互斥体句柄；更新替换前要主动关掉，新进程才能立刻接手。
+static MUTEX_HANDLE: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
 /// 已有实例在运行时通知其呼出窗口并返回 true；否则创建互斥体并返回 false（成为主实例）。
 pub fn notify_existing_or_claim() -> bool {
     unsafe {
@@ -337,10 +342,26 @@ pub fn notify_existing_or_claim() -> bool {
             let eh = OpenEventW(EVENT_MODIFY_STATE, 0, ev.as_ptr());
             if !eh.is_null() {
                 SetEvent(eh);
+                CloseHandle(eh);
             }
+            CloseHandle(h);
             return true;
         }
+        if !h.is_null() {
+            MUTEX_HANDLE.store(h, std::sync::atomic::Ordering::SeqCst);
+        }
         false
+    }
+}
+
+/// 释放单实例锁。自动更新替换完 exe 后必须先调用它，
+/// 否则拉起的新进程会撞锁、通知一下旧窗口就退出，用户看到的是“更新完程序没了”。
+pub fn release_single_instance() {
+    let h = MUTEX_HANDLE.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst);
+    if !h.is_null() {
+        unsafe {
+            CloseHandle(h);
+        }
     }
 }
 

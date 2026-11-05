@@ -297,27 +297,42 @@ fn replace_and_restart(new_exe: &Path, version: &str) -> Result<(), String> {
     let _ = fs::remove_file(new_exe);
     mark_updated(version);
 
-    // 等本进程退出、单实例互斥体释放后再拉起（隐藏启动，回到托盘待命）
-    let cmdline = format!(
-        "ping -n 3 127.0.0.1 >nul & start \"\" \"{}\" --hidden",
-        cur.display()
-    );
+    // 先释放单实例锁：否则拉起来的新进程会撞锁，通知一下旧窗口就退出，
+    // 用户看到的现象是「更新完程序就没了」。
+    crate::integration::release_single_instance();
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        match std::process::Command::new("cmd")
-            .arg("/C")
-            .arg(cmdline)
+
+        // 直接拉起新进程。不再用「cmd /C ping … & start …」：
+        // cmd 不认 Rust 的转义引号，命令行会被拼坏并挂死（实测复现）。
+        match std::process::Command::new(&cur)
+            .arg("--hidden")
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
         {
             Ok(_) => {}
             Err(e) => {
-                // 排程失败就绝不能退出，否则程序会“更新完就消失”
-                return Err(format!(
-                    "新版本已就位，但自动重启失败（{e}）。请手动重新打开 Rust Seek。"
-                ));
+                let spawn_err = e.to_string();
+                log(&format!("直接拉起失败（{e}），改用延迟拉起"));
+                let cmdline = format!(
+                    "ping -n 3 127.0.0.1 >nul & start \"\" \"{}\" --hidden",
+                    cur.display()
+                );
+                let fallback = std::process::Command::new("cmd")
+                    .raw_arg("/C")
+                    .raw_arg(&cmdline)
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .spawn();
+                if let Err(e2) = fallback {
+                    // 拉不起来就绝不能退出，还要把单实例锁还回去
+                    crate::integration::notify_existing_or_claim();
+                    return Err(format!(
+                        "新版本已就位，但自动重启失败（{spawn_err} / {e2}）。请手动重新打开 Rust Seek。"
+                    ));
+                }
             }
         }
     }

@@ -3373,7 +3373,7 @@ dependencies = [
 
 [[package]]
 name = "rust-seek"
-version = "5.1.1"
+version = "5.1.2"
 dependencies = [
  "anyhow",
  "chrono",

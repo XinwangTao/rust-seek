@@ -5116,15 +5116,15 @@
           <text data-detail="context" x="815" y="258" class="t-muted" font-size="8" text-anchor="middle">新 exe 落临时目录，SHA-256 比对</text>
         </g>
 
-        <g id="node-swap" data-node-id="swap" data-node-label="替换并重启" tabindex="0" role="button" aria-label="聚焦替换并重启，旧 exe 改名 .old，写入新 exe，延迟拉起, Rust Seek 主程序" aria-pressed="false" data-node-kind="backend" data-node-sublabel="旧 exe 改名 .old，写入新 exe，延迟拉起" data-node-context="Rust Seek 主程序">
-          <title>替换并重启 · 旧 exe 改名 .old，写入新 exe，延迟拉起 · Rust Seek 主程序</title>
+        <g id="node-swap" data-node-id="swap" data-node-label="替换并重启" tabindex="0" role="button" aria-label="聚焦替换并重启，改名 .old → 原子写入 → 释放锁拉起, Rust Seek 主程序" aria-pressed="false" data-node-kind="backend" data-node-sublabel="改名 .old → 原子写入 → 释放锁拉起" data-node-context="Rust Seek 主程序">
+          <title>替换并重启 · 改名 .old → 原子写入 → 释放锁拉起 · Rust Seek 主程序</title>
           <rect x="966.4000000000001" y="220" width="200" height="52" rx="6" class="c-mask"/>
           <rect x="966.4000000000001" y="220" width="200" height="52" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(972.4000000000001 226) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
           <text data-node-label="" data-detail-anchor="" x="1066.4" y="241" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">替换并重启</text>
-          <text data-detail="context" x="1066.4" y="258" class="t-muted" font-size="8" text-anchor="middle">旧 exe 改名 .old，写入新 exe，延迟拉起</text>
+          <text data-detail="context" x="1066.4" y="258" class="t-muted" font-size="8" text-anchor="middle">改名 .old → 原子写入 → 释放锁拉起</text>
         </g>
 
         <g id="node-up_to_date" data-node-id="up_to_date" data-node-label="已是最新 / 刚更新过" tabindex="0" role="button" aria-label="聚焦已是最新 / 刚更新过，版本相同，或 24h 内刚更新过, 例外出口" aria-pressed="false" data-node-kind="external" data-node-sublabel="版本相同，或 24h 内刚更新过" data-node-context="例外出口">
@@ -5428,6 +5428,7 @@
         <ul>
           <li>&bull; --mcp 进程不参与检查与替换</li>
           <li>&bull; 运行中的 exe 不能覆盖，改名后新文件原子就位</li>
+          <li>&bull; 替换前主动释放单实例锁，直接拉起新进程（不经 cmd 延迟）</li>
           <li>&bull; 替换失败时旧版仍可启动</li>
           <li>&bull; 检查与失败都写入 %LOCALAPPDATA%\rust-seek\update.log</li>
           <li>&bull; 预发布 tag 不会成为 releases/latest</li>
