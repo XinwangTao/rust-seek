@@ -862,12 +862,10 @@ impl App {
         if invisible > 0 {
             self.pattern = clean;
         }
-        // 只保留真实存在的根：拔掉的 U 盘、失效的映射盘直接跳过，而不是整体报错
-        let roots: Vec<String> = self
-            .search_roots()
-            .into_iter()
-            .filter(|p| std::path::Path::new(p.as_str()).exists())
-            .collect();
+        // 注意：不要在这里做 Path::exists()。网络盘 / 刚拔掉的移动盘上它是同步
+        // 网络 IO，会把整个 UI 线程卡几十秒（窗口「未响应」）。存在性检查挪到
+        // 搜索线程里做（见 thread::spawn 开头）。
+        let roots: Vec<String> = self.search_roots();
         if roots.is_empty() {
             self.path_error = Some(format!("没有可搜索的路径：{}", self.scope.label()));
             return;
@@ -965,6 +963,23 @@ impl App {
 
         thread::spawn(move || {
             let start = Instant::now();
+            // 根的存在性在工作线程里判断：UI 线程上碰网络盘会整窗假死。
+            // 剔除已断开/已拔掉的根，一个都不剩时如实报错，而不是假装「没有结果」。
+            let roots: Vec<String> = roots
+                .into_iter()
+                .filter(|p| std::path::Path::new(p.as_str()).exists())
+                .collect();
+            if roots.is_empty() {
+                let _ = tx.send(SearchMsg::Status(
+                    "没有可搜索的路径（盘或网络位置可能已断开）".to_string(),
+                ));
+                let _ = tx.send(SearchMsg::Done {
+                    ms: start.elapsed().as_millis(),
+                    visited: 0,
+                    scope: scope_label.clone(),
+                });
+                return;
+            }
             // 索引命中已发出的路径：索引不完整时下面遍历补齐要去重
             let seen: Arc<std::sync::Mutex<HashSet<String>>> =
                 Arc::new(std::sync::Mutex::new(HashSet::new()));
@@ -1205,7 +1220,16 @@ impl eframe::App for App {
                         done = true;
                         break;
                     }
-                    Err(_) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // 工作线程已经结束（取消、panic，或某条路径漏发 Done）。
+                        // 必须在这里复位，否则界面会永久卡在「搜索中…」，
+                        // 连回车都不再触发搜索。
+                        self.searching = false;
+                        self.cancel = None;
+                        done = true;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 }
             }
             if done { self.rx = None; }
