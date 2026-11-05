@@ -233,6 +233,12 @@ pub fn query(
     let guard = lock();
     let index = guard.as_ref()?;
     touch_index();
+    // 索引里存的是正斜杠路径；粘贴反斜杠路径（D:\work\a.rs）时索引匹配不上，
+    // 直接交回调用方走真实遍历（searcher 会做原生形式二次匹配），
+    // 否则会以 source:"index"、truncated:false 回一个假的「没有」。
+    if match_path && re.as_str().contains('\\') {
+        return None;
+    }
     let start = Instant::now();
 
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -1154,7 +1160,14 @@ fn watch_volume(root: &str) {
             // 句柄失效 / 缓冲区溢出丢事件：标脏，退回全量扫描保最终一致
             NEED_FULL_SCAN.store(true, Ordering::Relaxed);
             if ok == 0 {
-                break;
+                // ERROR_NOTIFY_ENUM_DIR(1022) 只是缓冲区溢出丢了事件，监听本身还活着，
+                // 继续 arm 即可；真正的句柄失效才退出，而且必须清掉 WATCH_ACTIVE——
+                // 否则「监听已死」仍被当成可信，之后零命中会被当权威答案。
+                let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+                if err != 1022 {
+                    WATCH_ACTIVE.store(false, Ordering::Relaxed);
+                    break;
+                }
             }
             continue;
         }
@@ -1185,9 +1198,17 @@ fn collect_changes(root: &str, buf: &[u8]) {
             if ACTIONS.contains(&rec.Action) {
                 let full = format!("{}{}", root, rel.replace('\\', "/"));
                 if let Some(i) = full.rfind('/') {
-                    let dir = &full[..i];
-                    note_dirty(dir);
-                    batch.push(dir.to_string());
+                    let raw = &full[..i];
+                    // 盘根：`D:/foo.txt` 取出来是裸 `D:`。既不是绝对路径（枚举会拼成
+                    // <cwd>/D: 得到 0 条），却又能按 `D:/` 前缀把整盘旧条目划进删除集，
+                    // 结果就是「往盘根拖一个文件 → 整个 D 盘从索引里消失」。统一成 `D:/`。
+                    let dir = if raw.len() == 2 && raw.as_bytes()[1] == b':' {
+                        format!("{raw}/")
+                    } else {
+                        raw.to_string()
+                    };
+                    note_dirty(&dir);
+                    batch.push(dir);
                 }
             }
         }

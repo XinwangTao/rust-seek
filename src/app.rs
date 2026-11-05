@@ -945,8 +945,9 @@ impl App {
         let threads = num_cpus::get();
         let mode = self.mode;
         let exts = self.ext_filter_active();
-        // 粘的是路径片段（含 / 或 \）时按完整路径匹配，否则只看文件名
-        let match_path = looks_like_path(&self.pattern);
+        // 粘的是路径片段（含 / 或 \）时按完整路径匹配，否则只看文件名。
+        // 正则模式下反斜杠是转义符，不能当路径分隔符（见 searcher::looks_like_path）。
+        let match_path = looks_like_path(&self.pattern, !self.fixed_string);
         // 剪掉系统大头目录（Windows/Program Files/回收站/WinSxS）
         let prune_noise = self.prefs.prune_system;
         // 索引建库时就剪掉了这些目录，所以只有「同样剪枝」的口径能走索引，否则会少结果。
