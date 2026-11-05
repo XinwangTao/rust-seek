@@ -92,9 +92,9 @@
       "lane": "exception",
       "col": 2,
       "type": "external",
-      "label": "已是最新",
-      "sublabel": "版本相同，等下一轮",
-      "width": 120
+      "label": "已是最新 / 刚更新过",
+      "sublabel": "版本相同，或 24h 内刚更新过",
+      "width": 140
     },
     {
       "id": "declined",
@@ -110,9 +110,9 @@
       "lane": "exception",
       "col": 4,
       "type": "external",
-      "label": "下载 / 校验失败",
-      "sublabel": "超时或哈希不符，保留旧版",
-      "width": 150
+      "label": "下载 / 校验 / 替换失败",
+      "sublabel": "超时、哈希不符或写盘失败，保留旧版",
+      "width": 170
     }
   ],
   "edges": [
@@ -161,6 +161,12 @@
       "to": "dl_fail",
       "role": "error",
       "variant": "dashed"
+    },
+    {
+      "from": "swap",
+      "to": "dl_fail",
+      "role": "error",
+      "variant": "dashed"
     }
   ],
   "cards": [
@@ -178,8 +184,9 @@
       "title": "不更新的出口",
       "items": [
         "已是最新：静默退出，等下一轮",
+        "刚更新过但版本号没变：同一版本不再重复下载",
         "用户拒绝：记住该版本，同一版本不再弹",
-        "下载或校验失败：保留旧版并提示"
+        "下载、校验或替换失败：保留旧版并提示，本轮不再问"
       ]
     },
     {
@@ -187,8 +194,10 @@
       "title": "边界与约束",
       "items": [
         "--mcp 进程不参与检查与替换",
-        "运行中的 exe 不能覆盖，改名后再写入",
-        "替换失败时旧版仍可启动"
+        "运行中的 exe 不能覆盖，改名后新文件原子就位",
+        "替换失败时旧版仍可启动",
+        "检查与失败都写入 %LOCALAPPDATA%\\rust-seek\\update.log",
+        "预发布 tag 不会成为 releases/latest"
       ]
     }
   ]
