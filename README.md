@@ -275,14 +275,17 @@ claude mcp add rust-seek -- "F:\path\to\rust-seek.exe" --mcp
 
 Releases are built automatically by GitHub Actions on every `v*` tag, with the app icon and version info embedded in the executable.
 
-### 自动更新（v5.1.0）
+### 自动更新（v5.1.1）
 
 程序启动 30 秒后，并在之后每 6 小时，会在后台读取 GitHub Releases 上的 `latest.json`：
 
 - 只比较版本号，不上传任何本地信息；
-- 发现新版本弹系统对话框，只有点「是」才下载；
-- 下载后按清单里的 SHA-256 校验，通过才替换，替换失败自动回滚旧版；
-- 用户点「否」会记住该版本，同一版本不再打扰。
+- 发现新版本弹系统对话框，只有点「是」才下载；点「否」记住该版本，同一版本不再打扰；点 X 只算这次不问；
+- 下载后按清单里的 SHA-256 校验，新 exe 先落到同目录临时名再原子替换，写到一半失败会自动回滚旧版；
+- 清单里缺本机架构时不会弹窗打扰；
+- 替换后若程序自报版本仍是旧的（发布包版本号漏改），同一版本不再重复下载。
+
+每次检查、决策和失败都会追加到 `%LOCALAPPDATA%\rust-seek\update.log`，「到底有没有在检查」可以直接看日志。
 
 更新流程见 [docs/archify/auto_update_workflow.html](docs/archify/auto_update_workflow.html)。可用环境变量 `RUST_SEEK_NO_UPDATE=1` 关闭检查。
 

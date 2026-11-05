@@ -29,6 +29,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify Cargo.toml version matches tag
+        shell: bash
+        run: |
+          pkg=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          tag="${GITHUB_REF_NAME#v}"
+          echo "Cargo.toml=$pkg tag=$tag"
+          if [ -n "$tag" ] && [ "$pkg" != "$tag" ]; then
+            echo "::error::Cargo.toml 版本 $pkg 与 tag $tag 不一致；发布出去的包会自报旧版本，客户端将反复提示更新"
+            exit 1
+          fi
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -72,6 +83,19 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      # build 腿带 continue-on-error，这里的校验才是真正拦住发布的闸门
+      - uses: actions/checkout@v4
+
+      - name: Verify Cargo.toml version matches tag
+        run: |
+          pkg=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          tag="${GITHUB_REF_NAME#v}"
+          echo "Cargo.toml=$pkg tag=$tag"
+          if [ "$pkg" != "$tag" ]; then
+            echo "::error::Cargo.toml 版本 $pkg 与 tag $tag 不一致，拒绝发布"
+            exit 1
+          fi
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -103,7 +127,7 @@ jobs:
               }
           if not assets:
               raise SystemExit("no update assets found")
-          json.dump({"version": ver, "assets": assets}, open("dist/latest.json", "w"), indent=2)
+          json.dump({"version": ver, "notes": f"详见 https://github.com/{repo}/releases/tag/v{ver}", "assets": assets}, open("dist/latest.json", "w"), indent=2)
           print(open("dist/latest.json").read())
           PY
 
@@ -116,3 +140,6 @@ jobs:
             dist/latest.json
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # 预发布 tag（v5.2.0-rc1 之类）不能成为 releases/latest，
+          # 否则所有正式用户都会被提示升级到测试版
+          prerelease: ${{ contains(github.ref_name, '-') }}
