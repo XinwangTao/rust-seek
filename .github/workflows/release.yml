@@ -40,6 +40,16 @@ jobs:
             exit 1
           fi
 
+      - name: Verify Cargo.lock is in sync
+        shell: bash
+        run: |
+          # 改版本号后必须重新跑一次 cargo，让 Cargo.lock 里的本包版本跟着变；
+          # 否则 --locked 构建会直接失败（且 continue-on-error 会把错误藏起来）。
+          if ! cargo metadata --locked --format-version 1 > /dev/null 2>&1; then
+            echo "::error::Cargo.lock 与 Cargo.toml 不同步，请本地跑一次 cargo build 后提交 Cargo.lock"
+            exit 1
+          fi
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
