@@ -26,6 +26,16 @@ fn main() -> eframe::Result {
     let start_hidden = std::env::args().any(|a| a == "--hidden");
     // 自动更新检查（仅 GUI 模式；--mcp 已在上面提前返回）
     updater::spawn();
+    // 启动即在后台预热索引：否则「打开软件后第一次搜索」要等 17–22 秒的全盘
+    // 目录 stat 巡（31.7 万目录，过滤驱动下每个 ~1ms）。程序是隐藏启动的，
+    // 从点图标到真正开始搜索通常已经过去十几秒，正好用这段时间把巡跑完。
+    // 放独立线程、先等 2 秒，避免和窗口首帧抢 I/O；最坏情况与改动前一致。
+    let _ = std::thread::Builder::new()
+        .name("index-warmup".into())
+        .spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            index::ensure_ready();
+        });
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Rust Seek")
         .with_inner_size([900.0, 600.0])
