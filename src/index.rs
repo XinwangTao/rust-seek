@@ -936,7 +936,17 @@ fn refresh_with(index: &mut Index) -> bool {
             index.built_unix = now_unix();
             return true;
         }
-        return refresh_in_place(index, Some(dirty));
+        let ok = refresh_in_place(index, Some(dirty.clone()));
+        if !ok {
+            // 刷新失败不能当成成功：把脏目录放回队列，并强制下一轮全量扫描。
+            // 否则这批变更永久缺失，而 built_unix 还会被推进到当前时间，
+            // 「看起来更新鲜」的假象会让零命中直接返回「没有」。
+            for d in dirty {
+                note_dirty(&d);
+            }
+            NEED_FULL_SCAN.store(true, Ordering::Relaxed);
+        }
+        return ok;
     }
     let ok = refresh_in_place(index, None);
     if ok {

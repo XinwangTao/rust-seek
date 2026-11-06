@@ -654,6 +654,11 @@ pub fn load_png_rgba(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
     let info = reader.next_frame(&mut buf).ok()?;
     buf.truncate(info.buffer_size());
     let (w, h) = (info.width, info.height);
+    // 只处理 8 位 PNG：16 位（Rgba16 等）解出来的缓冲长度是 w*h*8，
+    // 交给 ColorImage::from_rgba_unmultiplied 会直接触发断言 panic。
+    if info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
     match info.color_type {
         png::ColorType::Rgba => Some((buf, w, h)),
         png::ColorType::Rgb => {
