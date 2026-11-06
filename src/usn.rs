@@ -110,7 +110,7 @@ const MAX_RECORDS: usize = 200_000;
 /// - 记录数超过 `MAX_RECORDS`
 pub fn scan(drive: char, expected_id: u64, start_usn: i64) -> Option<(Vec<RawRecord>, i64)> {
     use windows_sys::Win32::System::Ioctl::{
-        FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V0,
+        FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V1,
         USN_JOURNAL_DATA_V0,
     };
     use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -149,13 +149,16 @@ pub fn scan(drive: char, expected_id: u64, start_usn: i64) -> Option<(Vec<RawRec
         let mut cursor = start_usn;
         let mut buf = vec![0u8; 1024 * 1024];
         loop {
-            let input = READ_USN_JOURNAL_DATA_V0 {
+            // V1 显式声明「只要 v2 结构」：解析器按 v2 布局读，版本协商必须钉死。
+            let input = READ_USN_JOURNAL_DATA_V1 {
                 StartUsn: cursor,
                 ReasonMask: u32::MAX,
                 ReturnOnlyOnClose: 0,
                 Timeout: 0,
                 BytesToWaitFor: 0,
                 UsnJournalID: expected_id,
+                MinMajorVersion: 2,
+                MaxMajorVersion: 2,
             };
             let mut ret: u32 = 0;
             let ok = unsafe {
@@ -163,7 +166,7 @@ pub fn scan(drive: char, expected_id: u64, start_usn: i64) -> Option<(Vec<RawRec
                     h,
                     FSCTL_READ_USN_JOURNAL,
                     &input as *const _ as *mut core::ffi::c_void,
-                    std::mem::size_of::<READ_USN_JOURNAL_DATA_V0>() as u32,
+                    std::mem::size_of::<READ_USN_JOURNAL_DATA_V1>() as u32,
                     buf.as_mut_ptr() as *mut core::ffi::c_void,
                     buf.len() as u32,
                     &mut ret,
