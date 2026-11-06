@@ -86,6 +86,142 @@ pub fn can_resume(info: &JournalInfo, expected_id: u64, start_usn: i64) -> bool 
     info.journal_id == expected_id && start_usn >= info.lowest_valid && start_usn <= info.next_usn
 }
 
+/// 一条原始变更记录。只保留定位「哪个目录脏了」需要的最小信息。
+#[derive(Debug, Clone)]
+pub struct RawRecord {
+    /// 父目录的 file reference number
+    pub parent_frn: u64,
+    /// 文件名（不含目录）
+    pub name: String,
+    pub reason: u32,
+}
+
+/// 单次扫描最多读这么多条：超过就当作「变动太多」，调用方回退全盘巡。
+const MAX_RECORDS: usize = 200_000;
+
+/// 从 `start_usn` 之后读到日志末尾。
+///
+/// 返回 `(records, next_usn)`；`next_usn` 是下次续读的起点。
+/// 以下任一情况返回 None（调用方必须回退全盘巡）：
+/// - 没有权限 / 不是 NTFS / 没有日志
+/// - `expected_id` 与当前日志 ID 不一致（日志被重建）
+/// - `start_usn` 早于 `lowest_valid`（中间被截断）
+/// - 遇到非 v2 记录（格式看不懂就不猜）
+/// - 记录数超过 `MAX_RECORDS`
+pub fn scan(drive: char, expected_id: u64, start_usn: i64) -> Option<(Vec<RawRecord>, i64)> {
+    use windows_sys::Win32::System::Ioctl::{
+        FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V0,
+        USN_JOURNAL_DATA_V0,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let h = open_volume(drive)?;
+    let result = (|| {
+        // 1) 取当前日志状态并校验能不能续
+        let mut jd: USN_JOURNAL_DATA_V0 = unsafe { std::mem::zeroed() };
+        let mut ret: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                h,
+                FSCTL_QUERY_USN_JOURNAL,
+                std::ptr::null(),
+                0,
+                &mut jd as *mut _ as *mut core::ffi::c_void,
+                std::mem::size_of::<USN_JOURNAL_DATA_V0>() as u32,
+                &mut ret,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let info = JournalInfo {
+            journal_id: jd.UsnJournalID,
+            next_usn: jd.NextUsn,
+            lowest_valid: jd.LowestValidUsn,
+        };
+        if !can_resume(&info, expected_id, start_usn) {
+            return None;
+        }
+
+        // 2) 循环读记录
+        let mut out: Vec<RawRecord> = Vec::new();
+        let mut cursor = start_usn;
+        let mut buf = vec![0u8; 1024 * 1024];
+        loop {
+            let input = READ_USN_JOURNAL_DATA_V0 {
+                StartUsn: cursor,
+                ReasonMask: u32::MAX,
+                ReturnOnlyOnClose: 0,
+                Timeout: 0,
+                BytesToWaitFor: 0,
+                UsnJournalID: expected_id,
+            };
+            let mut ret: u32 = 0;
+            let ok = unsafe {
+                DeviceIoControl(
+                    h,
+                    FSCTL_READ_USN_JOURNAL,
+                    &input as *const _ as *mut core::ffi::c_void,
+                    std::mem::size_of::<READ_USN_JOURNAL_DATA_V0>() as u32,
+                    buf.as_mut_ptr() as *mut core::ffi::c_void,
+                    buf.len() as u32,
+                    &mut ret,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 || ret < 8 {
+                let e = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+                eprintln!("[usn] READ_USN_JOURNAL ok={ok} ret={ret} err={e} cursor={cursor}");
+                return None;
+            }
+            let next = i64::from_le_bytes(buf[0..8].try_into().ok()?);
+            let body = &buf[8..ret as usize];
+
+            let mut off = 0usize;
+            while off + 8 <= body.len() {
+                let len = u32::from_le_bytes(body[off..off + 4].try_into().ok()?) as usize;
+                if len < 60 || off + len > body.len() {
+                    break;
+                }
+                let major = u16::from_le_bytes(body[off + 4..off + 6].try_into().ok()?);
+                if major != 2 {
+                    // v3/v4（128 位 FRN 等）不认识，整次作废，别猜
+                    return None;
+                }
+                let parent = u64::from_le_bytes(body[off + 16..off + 24].try_into().ok()?);
+                let reason = u32::from_le_bytes(body[off + 40..off + 44].try_into().ok()?);
+                let name_len = u16::from_le_bytes(body[off + 56..off + 58].try_into().ok()?) as usize;
+                let name_off = u16::from_le_bytes(body[off + 58..off + 60].try_into().ok()?) as usize;
+                if name_off + name_len > len || name_len % 2 != 0 {
+                    return None;
+                }
+                let units: Vec<u16> = body[off + name_off..off + name_off + name_len]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                out.push(RawRecord {
+                    parent_frn: parent,
+                    name: String::from_utf16_lossy(&units),
+                    reason,
+                });
+                if out.len() > MAX_RECORDS {
+                    return None;
+                }
+                off += len;
+            }
+
+            if next == cursor {
+                break; // 没有新记录
+            }
+            cursor = next;
+        }
+        Some((out, cursor))
+    })();
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +236,30 @@ mod tests {
 
     /// 实机探针（默认忽略）：需要管理员权限才能读卷。
     /// 运行：cargo test --release -- --ignored --nocapture
+    /// 实机探针（默认忽略）：需要管理员权限才能读卷。
+    /// 运行：cargo test --release -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_scan_probe() {
+        let info = match journal_info('D') {
+            Some(i) => i,
+            None => {
+                println!("D: 读不到日志（无管理员权限？）");
+                return;
+            }
+        };
+        let start = (info.next_usn - 2000).max(info.lowest_valid);
+        match scan('D', info.journal_id, start) {
+            Some((recs, next)) => {
+                println!("records={} next={}", recs.len(), next);
+                for r in recs.iter().rev().take(3) {
+                    println!("  {:?} reason={:#x} parent={:#x}", r.name, r.reason, r.parent_frn);
+                }
+            }
+            None => println!("scan 返回 None（按设计应回退全盘巡）"),
+        }
+    }
+
     #[test]
     #[ignore]
     fn live_journal_probe() {
