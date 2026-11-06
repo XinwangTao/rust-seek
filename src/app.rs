@@ -37,6 +37,8 @@ struct ClipUi {
     rx: Receiver<()>,
     summaries: Vec<ClipSummary>,
     textures: std::collections::HashMap<u64, egui::TextureHandle>,
+    /// 解码失败的缩略图：不缓存的话每帧都会重新开文件解析一遍
+    failed_thumbs: std::collections::HashSet<u64>,
     filter: String,
     selected: usize,
     status: String,
@@ -241,7 +243,7 @@ impl Prefs {
         if let Some(p) = prefs_path() {
             if let Ok(s) = serde_json::to_string(self) {
                 let _ = std::fs::create_dir_all(p.parent().unwrap());
-                let _ = std::fs::write(p, s);
+                write_prefs_file(&p, &s);
             }
         }
     }
@@ -249,6 +251,16 @@ impl Prefs {
 
 fn prefs_path() -> Option<std::path::PathBuf> {
     Some(dirs::data_local_dir()?.join("rust-seek").join("prefs.json"))
+}
+
+/// 原子写配置：先写同目录临时文件再 rename。
+/// 搜索线程与输入框会并发触发保存，直接 `fs::write` 截断重写可能留下半截 JSON，
+/// 而 `Prefs::load` 解析失败会静默回退默认值 —— 等于用户配置被清空。
+fn write_prefs_file(p: &std::path::Path, s: &str) {
+    let tmp = p.with_extension(format!("json.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, s).is_ok() && std::fs::rename(&tmp, p).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 pub struct App {
@@ -370,6 +382,7 @@ impl App {
             rx: clip_rx,
             summaries: Vec::new(),
             textures: std::collections::HashMap::new(),
+            failed_thumbs: std::collections::HashSet::new(),
             filter: String::new(),
             selected: 0,
             status: String::new(),
@@ -451,7 +464,7 @@ impl App {
         if let Some(p) = prefs_path() {
             if let Ok(s) = serde_json::to_string(&self.prefs) {
                 let _ = std::fs::create_dir_all(p.parent().unwrap());
-                let _ = std::fs::write(p, s);
+                write_prefs_file(&p, &s);
             }
         }
     }
@@ -799,9 +812,22 @@ impl App {
         if let Some(tex) = self.clip.textures.get(&summary.id) {
             return Some(tex.id());
         }
+        // 解不出来的图（缺失/损坏/非 8 位 PNG）记下来，别每帧重试
+        if self.clip.failed_thumbs.contains(&summary.id) {
+            return None;
+        }
         let path = summary.image_path.clone()?;
-        let (rgba, w, h) = clipboard::load_png_rgba(&path)?;
+        let decoded = clipboard::load_png_rgba(&path);
+        let Some((rgba, w, h)) = decoded else {
+            self.clip.failed_thumbs.insert(summary.id);
+            return None;
+        };
         let (rgba, w, h) = clipboard::downscale_rgba(&rgba, w, h, 128);
+        // 再自检一次：ColorImage::from_rgba_unmultiplied 对长度不符会直接 panic
+        if rgba.len() != (w as usize) * (h as usize) * 4 || w == 0 || h == 0 {
+            self.clip.failed_thumbs.insert(summary.id);
+            return None;
+        }
         let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
         let tex = ctx.load_texture(format!("clip-thumb-{}", summary.id), image, egui::TextureOptions::LINEAR);
         let id = tex.id();
@@ -902,7 +928,7 @@ impl App {
         thread::spawn(move || {
             if let (Some(p), Some(s)) = (prefs_path(), prefs_clone) {
                 let _ = std::fs::create_dir_all(p.parent().unwrap());
-                let _ = std::fs::write(p, s);
+                write_prefs_file(&p, &s);
             }
         });
 
