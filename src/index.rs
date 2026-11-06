@@ -60,15 +60,16 @@ const DIR_BYTES: usize = 16;
 /// 秒级 mtime 下「同一秒内新建又删除」不会留下痕迹，留 2s 余量、重新枚举一遍即可。
 const DIR_SLACK_SECS: u64 = 2;
 
-/// 索引超过这么久就同步做一次目录级增量刷新。
-/// 刷新只枚举 mtime 变了的目录（空闲时几十毫秒），所以阈值放得很小：
-/// 宁可每次整盘查询多花几十毫秒，也不要给用户一个「看不见刚建文件」的快照。
-/// `RUST_SEEK_REFRESH_SECS` 可覆盖（调试时可调大）。
+/// 索引超过这么久就做一次目录级增量刷新。
+/// 监听在跑时刷新只枚举 mtime 变了的目录（几十毫秒）；但「需要全盘巡」时一次约 20s
+/// （31.7 万目录 × ~1ms，过滤驱动下 stat 很慢），所以阈值不能太小：
+/// 2026-11-06 由 2s 提到 30s —— 全盘巡的结果现在会落盘，别的进程 30s 内加载到它
+/// 就直接跳过巡；超过 30s 仍会刷新。`RUST_SEEK_REFRESH_SECS` 可覆盖。
 pub fn auto_refresh_secs() -> u64 {
     std::env::var("RUST_SEEK_REFRESH_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(2)
+        .unwrap_or(30)
 }
 
 #[derive(Clone, Copy)]
@@ -951,6 +952,13 @@ fn refresh_with(index: &mut Index) -> bool {
     let ok = refresh_in_place(index, None);
     if ok {
         NEED_FULL_SCAN.store(false, Ordering::Relaxed);
+        // 新鲜度记「巡完的时刻」而不是「开始巡的时刻」：本机巡一次约 17s，
+        // 记开始时间会让刚落盘的文件在别人眼里已经旧了 17 秒，起不到作用。
+        index.built_unix = now_unix();
+        // 全盘巡的结果必须落盘，否则每个新进程（GUI + 每个 MCP 子进程）启动后
+        // 都要各自再巡一遍 31.7 万目录（本机约 20s）。写盘后后来者加载到的
+        // 缓存年龄接近 0，ensure_ready 会直接跳过巡。
+        save_cache(index);
     }
     ok
 }
