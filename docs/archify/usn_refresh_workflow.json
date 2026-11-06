@@ -1,0 +1,204 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Rust Seek 索引刷新：USN 增量与回退",
+    "locale": "zh-CN",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    {
+      "id": "entry",
+      "label": "刷新决策"
+    },
+    {
+      "id": "usn",
+      "label": "USN 增量与落盘"
+    },
+    {
+      "id": "fallback",
+      "label": "回退：全盘巡",
+      "variant": "exception"
+    }
+  ],
+  "mainPath": [
+    "refresh",
+    "trusted",
+    "load",
+    "verify",
+    "scan",
+    "dirty"
+  ],
+  "nodes": [
+    {
+      "id": "refresh",
+      "lane": "entry",
+      "col": 0,
+      "type": "backend",
+      "label": "refresh_with",
+      "sublabel": "查询前刷新"
+    },
+    {
+      "id": "trusted",
+      "lane": "entry",
+      "col": 1,
+      "type": "security",
+      "label": "监听可信？",
+      "sublabel": "NEED_FULL_SCAN"
+    },
+    {
+      "id": "fast",
+      "lane": "entry",
+      "col": 2,
+      "type": "backend",
+      "width": 106,
+      "label": "应用 DIRTY_DIRS",
+      "sublabel": "监听推来的脏目录",
+      "tag": "不变"
+    },
+    {
+      "id": "load",
+      "lane": "usn",
+      "col": 1,
+      "type": "database",
+      "width": 120,
+      "label": "读 usn-state.json",
+      "sublabel": "journal_id · next_usn"
+    },
+    {
+      "id": "verify",
+      "lane": "usn",
+      "col": 2,
+      "type": "security",
+      "width": 114,
+      "label": "校验日志边界",
+      "sublabel": "ID 一致 · 起点界内"
+    },
+    {
+      "id": "scan",
+      "lane": "usn",
+      "col": 3,
+      "type": "backend",
+      "width": 126,
+      "label": "读记录 + 转路径",
+      "sublabel": "scan() · path_of_frn()"
+    },
+    {
+      "id": "dirty",
+      "lane": "usn",
+      "col": 4,
+      "type": "backend",
+      "width": 114,
+      "label": "refresh_in_place",
+      "sublabel": "只重枚举脏目录",
+      "tag": "Some(dirty)"
+    },
+    {
+      "id": "commit",
+      "lane": "usn",
+      "col": 5,
+      "type": "database",
+      "width": 108,
+      "label": "commit_snapshot",
+      "sublabel": "写回每盘 next_usn"
+    },
+    {
+      "id": "full",
+      "lane": "fallback",
+      "col": 4,
+      "type": "backend",
+      "width": 114,
+      "label": "refresh_in_place",
+      "sublabel": "全盘 stat 巡 17–22s",
+      "tag": "None"
+    },
+    {
+      "id": "commitfull",
+      "lane": "fallback",
+      "col": 5,
+      "type": "database",
+      "width": 124,
+      "label": "commit_full_sweep",
+      "sublabel": "记 journal_id + 位置"
+    }
+  ],
+  "edges": [
+    {
+      "from": "refresh",
+      "to": "trusted"
+    },
+    {
+      "from": "trusted",
+      "to": "fast",
+      "label": "是：监听完整"
+    },
+    {
+      "from": "trusted",
+      "to": "load",
+      "label": "否：需全量",
+      "role": "branch"
+    },
+    {
+      "from": "load",
+      "to": "verify",
+      "label": "可续读"
+    },
+    {
+      "from": "verify",
+      "to": "scan"
+    },
+    {
+      "from": "scan",
+      "to": "dirty",
+      "label": "父目录 FRN → 路径"
+    },
+    {
+      "from": "dirty",
+      "to": "commit",
+      "label": "刷新成功"
+    },
+    {
+      "from": "verify",
+      "to": "full",
+      "label": "ID 变了 / 起点越界",
+      "role": "error"
+    },
+    {
+      "from": "scan",
+      "to": "full",
+      "label": "读失败 / 超 20 万条 / FRN 解析失败",
+      "role": "error"
+    },
+    {
+      "from": "full",
+      "to": "commitfull",
+      "label": "巡完落盘"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "失败一律回退，不许猜",
+      "items": [
+        "ID 变了、起点越界、读失败、单条 FRN 解析失败 → 放弃增量",
+        "任一失败整次走全盘巡；partial 也算失败"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "状态文件口径",
+      "items": [
+        "%LOCALAPPDATA%\\rust-seek\\usn-state.json，按盘记 journal_id + next_usn",
+        "索引缓存格式不变（v4），条目里不存 FRN"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "本批范围：第 1、2 步",
+      "items": [
+        "第 1 步：usn.rs 状态读写（load / commit_snapshot / commit_full_sweep）",
+        "第 2 步：index.rs::refresh_with 接入；验证门槛与提权不在本批"
+      ]
+    }
+  ]
+}
