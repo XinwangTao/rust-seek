@@ -586,6 +586,9 @@ fn adopt_cache(cache_unix: u64) {
     }
     JOURNAL_CACHE_UNIX.store(cache_unix, Ordering::Relaxed);
     JOURNAL_READY.store(false, Ordering::Relaxed);
+    // USN 游标只在这份状态确实属于这份缓存时才会被采纳（对不上就等全盘巡重建）
+    #[cfg(windows)]
+    crate::usn::adopt_state(cache_unix);
     if let Some(dirs) = journal_replay(cache_unix) {
         {
             let mut g = DIRTY_DIRS.lock().unwrap_or_else(|e| e.into_inner());
@@ -925,7 +928,8 @@ fn watcher_trusted() -> bool {
 /// - 监听在跑且没溢出 ⇒ 只重枚举「有变更的目录」（通常几个，耗时可忽略）
 /// - 首次 / 监听溢出 / 盘数量变了 ⇒ 全量 stat 巡（约 10s，交给后台）
 fn refresh_with(index: &mut Index) -> bool {
-    if integration::local_drives().len() as u64 != WATCHED_DRIVES.load(Ordering::Relaxed) {
+    let drives = integration::local_drives();
+    if drives.len() as u64 != WATCHED_DRIVES.load(Ordering::Relaxed) {
         NEED_FULL_SCAN.store(true, Ordering::Relaxed);
     }
     // NEED_FULL_SCAN=false 表示「我们相信自己对变更的了解是完整的」——
@@ -949,6 +953,24 @@ fn refresh_with(index: &mut Index) -> bool {
         }
         return ok;
     }
+
+    // 先试 USN：读到「关软件这段时间哪些目录改了」，代价与变更量成正比，
+    // 与盘上目录数无关。任何一块盘不满足条件都会返回 None。
+    #[cfg(windows)]
+    {
+        if let Some(inc) = crate::usn::incremental_since(&drives) {
+            if refresh_in_place(index, Some(inc.dirty_dirs)) {
+                NEED_FULL_SCAN.store(false, Ordering::Relaxed);
+                index.built_unix = now_unix();
+                // 游标只能指向「真的落盘了」的那份缓存，否则下个进程会拿它去配旧缓存
+                let saved = save_cache(index);
+                crate::usn::commit_snapshot(index.built_unix, &drives, &inc.checkpoints, saved);
+                return true;
+            }
+            // 刷新失败：按原设计往下走全盘巡，游标不推进（下次重读同一段）
+        }
+    }
+
     let ok = refresh_in_place(index, None);
     if ok {
         NEED_FULL_SCAN.store(false, Ordering::Relaxed);
@@ -958,7 +980,14 @@ fn refresh_with(index: &mut Index) -> bool {
         // 全盘巡的结果必须落盘，否则每个新进程（GUI + 每个 MCP 子进程）启动后
         // 都要各自再巡一遍 31.7 万目录（本机约 20s）。写盘后后来者加载到的
         // 缓存年龄接近 0，ensure_ready 会直接跳过巡。
-        save_cache(index);
+        let saved = save_cache(index);
+        // 巡完的文件系统 = 日志当前位置，记下来供下次增量续读
+        #[cfg(windows)]
+        {
+            crate::usn::commit_full_sweep(&drives, index.built_unix, saved);
+        }
+        #[cfg(not(windows))]
+        let _ = saved;
     }
     ok
 }
@@ -2130,8 +2159,9 @@ fn load_cache() -> Option<Index> {
     })
 }
 
-fn save_cache(index: &Index) {
-    let Some(path) = cache_path() else { return };
+/// 返回是否真的写进了磁盘：状态文件只在缓存落盘后才敢记游标。
+fn save_cache(index: &Index) -> bool {
+    let Some(path) = cache_path() else { return false };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -2169,21 +2199,22 @@ fn save_cache(index: &Index) {
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     let mut file = match std::fs::File::create(&tmp) {
         Ok(f) => f,
-        Err(_) => return,
+        Err(_) => return false,
     };
     if file.write_all(&buf).is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return;
+        return false;
     }
     drop(file);
     if std::fs::rename(&tmp, &path).is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return;
+        return false;
     }
     // 新缓存代表「此刻的文件系统」，之前那份日志描述的空窗已经归零
     if let Some(j) = journal_path() {
         let _ = std::fs::remove_file(j);
     }
+    true
 }
 
 #[cfg(test)]

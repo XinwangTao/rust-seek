@@ -233,6 +233,18 @@ pub fn scan(drive: char, expected_id: u64, start_usn: i64) -> Option<(Vec<RawRec
 /// 由 file reference number 反查完整路径（正斜杠形式，与索引口径一致）。
 /// 任何一步失败都返回 None —— 调用方必须回退全盘巡，不许猜。
 pub fn path_of_frn(drive: char, frn: u64) -> Option<String> {
+    let vol = open_volume(drive)?;
+    let out = path_of_frn_with(vol, frn);
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(vol) };
+    out
+}
+
+/// 同 [`path_of_frn`]，但复用调用方已打开的卷句柄。
+/// 批量反查时一条记录开一次卷代价太大（本机 5 万条），所以拆出这一层。
+fn path_of_frn_with(
+    vol: windows_sys::Win32::Foundation::HANDLE,
+    frn: u64,
+) -> Option<String> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         FileIdType, GetFinalPathNameByHandleW, OpenFileById, FILE_ID_DESCRIPTOR,
@@ -240,7 +252,6 @@ pub fn path_of_frn(drive: char, frn: u64) -> Option<String> {
         FILE_SHARE_WRITE, VOLUME_NAME_DOS,
     };
 
-    let vol = open_volume(drive)?;
     let mut desc: FILE_ID_DESCRIPTOR = unsafe { std::mem::zeroed() };
     desc.dwSize = std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32;
     desc.Type = FileIdType;
@@ -257,7 +268,6 @@ pub fn path_of_frn(drive: char, frn: u64) -> Option<String> {
         )
     };
     if fh.is_null() || fh == INVALID_HANDLE_VALUE {
-        unsafe { CloseHandle(vol) };
         return None;
     }
 
@@ -272,7 +282,6 @@ pub fn path_of_frn(drive: char, frn: u64) -> Option<String> {
     };
     unsafe {
         CloseHandle(fh);
-        CloseHandle(vol);
     }
     if n == 0 || n as usize >= buf.len() {
         return None;
@@ -282,16 +291,374 @@ pub fn path_of_frn(drive: char, frn: u64) -> Option<String> {
     Some(trimmed.replace('\\', "/"))
 }
 
+// ---------- 状态落盘（usn-state.json）----------
+//
+// 只回答一个问题：这份索引对应每块盘日志里的哪个位置。
+//
+// 文件是**跨进程的暖启动提示**，不是真源：进程内以内存游标为准，落盘失败
+// 最多让下次多点重复工作，不会产生错误结果。`cache_unix` 记着它属于哪一份
+// 磁盘缓存——对不上就整份作废（拿旧游标去增量刷一个别的索引 = 静默丢文件）。
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriveCheckpoint {
+    /// 日志 ID。存十六进制字符串而不是 u64：JSON 里超过 2^53 的整数会被解析器截断。
+    pub journal_id: String,
+    /// 下次续读的起点。
+    pub next_usn: i64,
+}
+
+impl DriveCheckpoint {
+    fn new(journal_id: u64, next_usn: i64) -> Self {
+        Self {
+            journal_id: format!("{journal_id:#018x}"),
+            next_usn,
+        }
+    }
+
+    fn parsed_id(&self) -> Option<u64> {
+        let hex = self.journal_id.trim_start_matches("0x");
+        u64::from_str_radix(hex, 16).ok()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsnState {
+    /// 这份状态对应的磁盘缓存（= `Index::built_unix`）。0 表示没有可用缓存。
+    #[serde(default)]
+    pub cache_unix: u64,
+    #[serde(default)]
+    pub drives: BTreeMap<String, DriveCheckpoint>,
+}
+
+/// 本进程当前持有的游标，与内存里的索引严格同步推进。
+/// `None` = 还不知道（首次全盘巡之前 / 缓存对不上），此时只能走全盘巡。
+static CURSORS: Mutex<Option<BTreeMap<String, DriveCheckpoint>>> = Mutex::new(None);
+
+fn state_file() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    Some(base.join("rust-seek").join("usn-state.json"))
+}
+
+fn load_from_disk() -> UsnState {
+    state_file()
+        .map(|p| load_at(&p))
+        .unwrap_or_default()
+}
+
+fn load_at(path: &Path) -> UsnState {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// 原子写（临时文件 + rename）：多进程同时写不会读到半截 JSON。
+fn save_to_disk(state: &UsnState) -> bool {
+    let Some(path) = state_file() else {
+        return false;
+    };
+    save_at(&path, state)
+}
+
+fn save_at(path: &Path, state: &UsnState) -> bool {
+    let path = path.to_path_buf();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let Ok(buf) = serde_json::to_vec(state) else {
+        return false;
+    };
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, &buf).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    true
+}
+
+fn lock_cursors() -> std::sync::MutexGuard<'static, Option<BTreeMap<String, DriveCheckpoint>>> {
+    CURSORS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 载入磁盘缓存后调用：只有状态文件记的正是这份缓存，才敢拿它的游标做增量。
+pub fn adopt_state(cache_unix: u64) {
+    let st = load_from_disk();
+    let usable = state_usable(cache_unix, &st);
+    *lock_cursors() = if usable { Some(st.drives) } else { None };
+}
+
+/// 状态文件能不能拿来续读：必须属于同一份缓存，且至少有一块盘有游标。
+fn state_usable(cache_unix: u64, st: &UsnState) -> bool {
+    cache_unix != 0 && st.cache_unix == cache_unix && !st.drives.is_empty()
+}
+
+fn drive_letter(drive: &str) -> Option<char> {
+    let mut it = drive.chars();
+    let c = it.next()?;
+    if !c.is_ascii_alphabetic() {
+        return None;
+    }
+    match it.next() {
+        Some(':') | None => Some(c),
+        _ => None,
+    }
+}
+
+/// 反查出来的路径统一成索引里的目录键口径：正斜杠、不带结尾斜杠（盘根是 `D:`）。
+fn normalize_dir(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// 一次成功的增量查询：脏目录 + 处理到哪了。
+pub struct Incremental {
+    pub dirty_dirs: Vec<String>,
+    /// 与调用方传入的 `drives` 一一对应。
+    pub checkpoints: Vec<DriveCheckpoint>,
+}
+
+/// 从本进程的游标读到日志末尾，返回「哪些目录脏了」。
+///
+/// 任何一块盘不满足条件（没有游标 / 日志重建 / 起点越界 / 读失败 / 单条 FRN
+/// 解析失败）都整体返回 None —— 调用方必须回退全盘巡，不许拿半份结果充数。
+pub fn incremental_since(drives: &[String]) -> Option<Incremental> {
+    if drives.is_empty() {
+        return None;
+    }
+    let cursors = lock_cursors().clone()?;
+
+    let mut dirty: Vec<String> = Vec::new();
+    let mut checkpoints: Vec<DriveCheckpoint> = Vec::with_capacity(drives.len());
+
+    for drive in drives {
+        let letter = drive_letter(drive)?;
+        let cp = cursors.get(drive)?;
+        let expected = cp.parsed_id()?;
+        let info = journal_info(letter)?;
+        if !can_resume(&info, expected, cp.next_usn) {
+            return None;
+        }
+        let (records, next) = scan(letter, expected, cp.next_usn)?;
+
+        // 同一条记录里的父目录大量重复（一次批量操作几十个文件同目录），
+        // 先去重再开卷反查。
+        let mut seen = std::collections::HashSet::new();
+        let mut frns: Vec<u64> = Vec::new();
+        for r in &records {
+            if seen.insert(r.parent_frn) {
+                frns.push(r.parent_frn);
+            }
+        }
+        drop(records);
+
+        let vol = open_volume(letter)?;
+        let mut paths: Vec<String> = Vec::with_capacity(frns.len());
+        let mut failed = false;
+        for frn in frns {
+            match path_of_frn_with(vol, frn).and_then(|p| normalize_dir(&p)) {
+                Some(p) => paths.push(p),
+                None => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(vol) };
+        if failed {
+            return None;
+        }
+        dirty.append(&mut paths);
+        checkpoints.push(DriveCheckpoint::new(expected, next));
+    }
+
+    dirty.sort_unstable();
+    dirty.dedup();
+    Some(Incremental {
+        dirty_dirs: dirty,
+        checkpoints,
+    })
+}
+
+/// 增量刷新成功之后：推进本进程游标；`persist` 为真时才写状态文件。
+///
+/// 只有「缓存确实落盘了」才能 persist —— 否则状态文件会指向一份不存在的缓存，
+/// 下一个进程对不上就直接全盘巡（安全，但白跑一趟）。
+pub fn commit_snapshot(
+    cache_unix: u64,
+    drives: &[String],
+    checkpoints: &[DriveCheckpoint],
+    persist: bool,
+) {
+    if drives.len() != checkpoints.len() {
+        return;
+    }
+    let map: BTreeMap<String, DriveCheckpoint> = drives
+        .iter()
+        .cloned()
+        .zip(checkpoints.iter().cloned())
+        .collect();
+    *lock_cursors() = Some(map.clone());
+    if persist {
+        let _ = save_to_disk(&UsnState {
+            cache_unix,
+            drives: map,
+        });
+    }
+}
+
+/// 全盘巡成功之后：重新问一遍日志边界，把当前位置作为新游标。
+///
+/// 读不到日志的盘（没权限 / 非 NTFS）直接不记：下次那块盘只会再全巡一遍，
+/// 不会拿一个猜出来的位置去续读。
+pub fn commit_full_sweep(drives: &[String], cache_unix: u64, persist: bool) {
+    let mut map = BTreeMap::new();
+    for d in drives {
+        let Some(letter) = drive_letter(d) else {
+            continue;
+        };
+        let Some(info) = journal_info(letter) else {
+            continue;
+        };
+        map.insert(
+            d.clone(),
+            DriveCheckpoint::new(info.journal_id, info.next_usn),
+        );
+    }
+    let usable = !map.is_empty();
+    *lock_cursors() = if usable { Some(map.clone()) } else { None };
+    if persist && usable {
+        let _ = save_to_disk(&UsnState {
+            cache_unix,
+            drives: map,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
-    fn resume_rules() {        let info = JournalInfo { journal_id: 7, next_usn: 100, first_usn: 10, lowest_valid: 10 };
+    fn resume_rules() {
+        let info = JournalInfo { journal_id: 7, next_usn: 100, first_usn: 10, lowest_valid: 10 };
         assert!(can_resume(&info, 7, 50));
         assert!(!can_resume(&info, 8, 50), "日志被重建时必须回退");
         assert!(!can_resume(&info, 7, 5), "起点早于 lowest_valid 必须回退");
         assert!(!can_resume(&info, 7, 101), "起点超过 next_usn 不可信，必须回退");
+    }
+
+    #[test]
+    fn journal_id_survives_json() {
+        // 真实日志 ID 是 64 位，直接当 JSON 数字会被解析器按 f64 截断；
+        // 存十六进制字符串才能原样回来。
+        let raw = 0x01dd_6db4_68d4_884du64;
+        let cp = DriveCheckpoint::new(raw, 24240);
+        let text = serde_json::to_string(&cp).unwrap();
+        let back: DriveCheckpoint = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.parsed_id(), Some(raw));
+        assert_eq!(back.next_usn, 24240);
+    }
+
+    #[test]
+    fn state_round_trips_on_disk() {
+        let dir = std::env::temp_dir().join(format!("rust-seek-usn-test-{}", std::process::id()));
+        let path = dir.join("usn-state.json");
+        let raw = 0x01dd_6db4_68d4_884du64;
+        let mut st = UsnState { cache_unix: 1_762_000_000, drives: BTreeMap::new() };
+        st.drives.insert("D:".into(), DriveCheckpoint::new(raw, 24240));
+        assert!(save_at(&path, &st));
+
+        let back = load_at(&path);
+        assert_eq!(back.cache_unix, st.cache_unix);
+        assert_eq!(back.drives["D:"].parsed_id(), Some(raw));
+        assert_eq!(back.drives["D:"].next_usn, 24240);
+
+        // 半截/损坏的文件必须当成「没有状态」，而不是猜
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert!(load_at(&path).drives.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn state_must_match_cache() {
+        let mut st = UsnState { cache_unix: 100, drives: BTreeMap::new() };
+        assert!(!state_usable(100, &st), "没有游标也不算可用");
+        st.drives.insert("D:".into(), DriveCheckpoint::new(7, 50));
+        assert!(state_usable(100, &st));
+        assert!(!state_usable(99, &st), "缓存换了就不能拿旧游标续读");
+        assert!(!state_usable(0, &st), "没有缓存时不能用状态");
+    }
+
+    #[test]
+    fn dir_key_normalisation() {
+        assert_eq!(normalize_dir("D:/auto/"), Some("D:/auto".to_string()));
+        assert_eq!(normalize_dir("D:/auto"), Some("D:/auto".to_string()));
+        assert_eq!(normalize_dir("D:/"), Some("D:".to_string()));
+        assert_eq!(normalize_dir(""), None);
+        assert_eq!(drive_letter("D:"), Some('D'));
+        assert_eq!(drive_letter("D"), Some('D'));
+        assert_eq!(drive_letter("DD:"), None);
+    }
+
+    /// 实机端到端：记下游标 → 新建一个文件 → 增量必须精确报出那个目录。
+    /// 需要管理员权限。运行：
+    ///   cargo test live_incremental_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_incremental_probe() {
+        let drive = "D:".to_string();
+        let Some(info) = journal_info('D') else {
+            println!("D: 读不到日志（无管理员权限？）");
+            return;
+        };
+        let before = DriveCheckpoint::new(info.journal_id, info.next_usn);
+        commit_snapshot(1, std::slice::from_ref(&drive), std::slice::from_ref(&before), false);
+
+        let dir = format!("D:/_rs_usn_probe_{}", std::process::id());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(format!("{dir}/a.txt"), b"probe").unwrap();
+
+        let out = incremental_since(std::slice::from_ref(&drive));
+
+        match out {
+            Some(inc) => {
+                let hit = inc.dirty_dirs.iter().any(|d| d == &dir);
+                println!(
+                    "dirty={} 命中新建目录={} next={}",
+                    inc.dirty_dirs.len(),
+                    hit,
+                    inc.checkpoints.first().map_or(-1, |c| c.next_usn)
+                );
+                for d in inc.dirty_dirs.iter().take(3) {
+                    println!("  {d} exists={}", std::path::Path::new(d).is_dir());
+                }
+                assert!(hit, "增量没报出刚新建的目录 —— 会静默丢文件");
+                assert!(
+                    inc.checkpoints[0].next_usn >= before.next_usn,
+                    "游标不能倒退"
+                );
+            }
+            None => panic!("增量返回 None（按设计应回退全盘巡，但这里是探针）"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 实机探针（默认忽略）：需要管理员权限才能读卷。

@@ -62,16 +62,38 @@ else { refresh_in_place(None) /* 全盘巡 */ ; save_cache }
 
 ```
 if !NEED_FULL_SCAN { ... 不变 ... }
-else if let Some(dirty) = usn::dirty_dirs_since_snapshot() {
+else if let Some(dirty) = usn::incremental_since(&drives) {
     refresh_in_place(Some(dirty));            // 复用现有增量路径
-    usn::commit_snapshot();                   // 记下 next_usn
-    save_cache(index);
+    let saved = save_cache(index);
+    usn::commit_snapshot(built_unix, &drives, &checkpoints, saved);
 } else {
     refresh_in_place(None);                   // 原全盘巡
-    usn::commit_full_sweep();                 // 记下 journal_id + next_usn
-    save_cache(index);
+    let saved = save_cache(index);
+    usn::commit_full_sweep(&drives, built_unix, saved);
 }
 ```
+
+### 6.1 落地时的两处修正（2026-11-06）
+
+蓝图原写法有个没考虑到的问题：**GUI 与每个 MCP 进程各持一份内存索引**。
+如果游标只存在文件里、每次刷新都跟文件比，两个进程会互相把对方的状态判成
+「对不上」，陷入「你全巡一次、我全巡一次」的乒乓，等于没优化。
+
+实际实现改成：
+
+1. **游标以进程内存为准**（`CURSORS`）。USN 是卷级全局日志，每个进程从自己
+   上次确认的位置往后读，就能拿到这段时间的全部变更（包括别的进程造成的）。
+   进程内游标与进程内索引严格同步推进，天然没有乒乓。
+2. **状态文件只是暖启动提示**。`usn-state.json` 里记 `cache_unix`，只有它等于
+   刚载入的那份缓存的 `built_unix` 时才采纳游标（`adopt_state`）。对不上就
+   `None` → 全盘巡，不会拿旧游标去配另一份索引。
+3. **只有缓存真的落盘了才写状态文件**（`save_cache` 改成返回 bool）。写失败时
+   内存游标照常推进，下次进程启动对不上 → 全盘巡，安全。
+4. `usn.rs` 的接口按图定名：`incremental_since` / `commit_snapshot` /
+   `commit_full_sweep` / `adopt_state`。
+
+监听快路径（`NEED_FULL_SCAN=false`）**不推进** USN 游标：那条路径没有查日志，
+游标落后只会导致下次多读一段已处理过的记录（幂等），不会漏。
 
 ## 7. 验证门槛（不过就不合并）
 
