@@ -80,7 +80,23 @@ else if let Some(dirty) = usn::dirty_dirs_since_snapshot() {
 - 对照：同一组查询在「USN 路径」与「全盘巡路径」下结果集逐字节一致。
 - 性能：首查从 17–22s 降到 < 2s。
 
-## 8. 提权（最后一步，单独做）
+## 9. 实机调试记录（2026-11-06）
+
+**已打通**：开卷、`FSCTL_QUERY_USN_JOURNAL`、`FSCTL_READ_USN_JOURNAL`（`READ_USN_JOURNAL_DATA_V1`，Min/MaxMajorVersion=2），
+在 C 盘与 D 盘都成功读出过记录（D 盘一次读出 51,815 条）。
+
+**踩到的坑（务必写进实现）**：
+
+1. `ERROR_INVALID_PARAMETER(87)` 不一定是参数写错，**多半是 `StartUsn` 落在该盘当前有效区间之外**。
+   - 用 `next_usn - 2000` 当起点：C 盘成功，D 盘 87。
+   - 用 `lowest_valid`(0) 当起点：D 盘成功，C 盘 87。
+   - 结论：**起点必须用日志自己报告的 `FirstUsn` 校验**（`start >= FirstUsn`），
+     `LowestValidUsn` 不足以判断——D 盘 32MB 日志写入量大，回卷很快。
+2. 因此 `JournalInfo` 必须带上 `FirstUsn`，`can_resume()` 的三条判定改成：
+   `journal_id 一致 && start_usn >= FirstUsn && start_usn <= NextUsn`。
+3. 读失败一律返回 None → 回退全盘巡，这条设计已在代码里生效。
+
+## 10. 提权（最后一步，单独做）
 
 读卷需要管理员。改法：`HKCU\...\Run` → 计划任务（登录时触发、`RunLevel Highest`）。
 代价：托盘程序以管理员常驻；资源管理器拖拽到提权窗口会被 UIPI 拦住。
