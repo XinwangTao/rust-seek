@@ -17,6 +17,9 @@ use std::os::windows::ffi::OsStrExt;
 pub struct JournalInfo {
     pub journal_id: u64,
     pub next_usn: i64,
+    /// 日志里最早还保留的位置。`start_usn < first_usn` 会被内核直接拒绝
+    /// （ERROR_INVALID_PARAMETER）—— D 盘 32MB 日志回卷快，必须用它校验。
+    pub first_usn: i64,
     pub lowest_valid: i64,
 }
 
@@ -76,6 +79,7 @@ pub fn journal_info(drive: char) -> Option<JournalInfo> {
     Some(JournalInfo {
         journal_id: data.UsnJournalID,
         next_usn: data.NextUsn,
+        first_usn: data.FirstUsn,
         lowest_valid: data.LowestValidUsn,
     })
 }
@@ -83,7 +87,7 @@ pub fn journal_info(drive: char) -> Option<JournalInfo> {
 /// `start_usn` 这个起点还能不能用来做增量。
 /// journal_id 变了（日志被重建）或起点早于 lowest_valid（中间被截断）都不行。
 pub fn can_resume(info: &JournalInfo, expected_id: u64, start_usn: i64) -> bool {
-    info.journal_id == expected_id && start_usn >= info.lowest_valid && start_usn <= info.next_usn
+    info.journal_id == expected_id && start_usn >= info.first_usn && start_usn <= info.next_usn
 }
 
 /// 一条原始变更记录。只保留定位「哪个目录脏了」需要的最小信息。
@@ -138,6 +142,7 @@ pub fn scan(drive: char, expected_id: u64, start_usn: i64) -> Option<(Vec<RawRec
         let info = JournalInfo {
             journal_id: jd.UsnJournalID,
             next_usn: jd.NextUsn,
+            first_usn: jd.FirstUsn,
             lowest_valid: jd.LowestValidUsn,
         };
         if !can_resume(&info, expected_id, start_usn) {
@@ -230,7 +235,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resume_rules() {        let info = JournalInfo { journal_id: 7, next_usn: 100, lowest_valid: 10 };
+    fn resume_rules() {        let info = JournalInfo { journal_id: 7, next_usn: 100, first_usn: 10, lowest_valid: 10 };
         assert!(can_resume(&info, 7, 50));
         assert!(!can_resume(&info, 8, 50), "日志被重建时必须回退");
         assert!(!can_resume(&info, 7, 5), "起点早于 lowest_valid 必须回退");
@@ -251,7 +256,7 @@ mod tests {
                 return;
             }
         };
-        let start = (info.next_usn - 2000).max(info.lowest_valid);
+        let start = (info.next_usn - 2000).max(info.first_usn);
         match scan('D', info.journal_id, start) {
             Some((recs, next)) => {
                 println!("records={} next={}", recs.len(), next);
