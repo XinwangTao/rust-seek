@@ -2177,3 +2177,166 @@ fn save_cache(index: &Index) {
         let _ = std::fs::remove_file(j);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! 索引层目前没有对外的 golden 对照，这里先钉住查询地基的两条不变量：
+    //!   1) 条目按完整路径字节序升序（prefix_bounds 的二分依赖它）
+    //!   2) `prefix_bounds` 给出的区间 == 线性筛出的子树（不漏不多）
+    //! 以后改存储格式（目录/名字分离、mmap）时，这些用例必须原样通过。
+    use super::*;
+
+    /// 用一组完整路径拼出一个与 build 同构的索引（条目升序、目录表升序）。
+    fn synth(paths: &[&str]) -> Index {
+        let mut sorted: Vec<&str> = paths.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+
+        let mut blob = String::new();
+        let mut items = Vec::new();
+        let mut dir_set: Vec<String> = Vec::new();
+        for p in &sorted {
+            let off = blob.len() as u32;
+            blob.push_str(p);
+            let name_start = p.rfind('/').map(|i| i + 1).unwrap_or(0);
+            items.push(Item {
+                path_off: off,
+                path_len: p.len() as u32,
+                name_off: off + name_start as u32,
+                name_len: (p.len() - name_start) as u32,
+                size: 0,
+                mtime: 0,
+            });
+            if let Some(i) = p.rfind('/') {
+                dir_set.push(p[..i].to_string());
+            }
+        }
+        dir_set.sort_unstable();
+        dir_set.dedup();
+
+        let mut dir_blob = String::new();
+        let mut dirs = Vec::new();
+        for d in &dir_set {
+            let off = dir_blob.len() as u32;
+            dir_blob.push_str(d);
+            dirs.push(DirRec { path_off: off, path_len: d.len() as u32, mtime: 0 });
+        }
+
+        Index {
+            blob,
+            items,
+            dir_blob,
+            dirs,
+            built_unix: 0,
+            complete: true,
+            incomplete_dirs: false,
+        }
+    }
+
+    fn subtree(index: &Index, root: &str) -> Vec<String> {
+        let prefix = norm_prefix(root);
+        let (lo, hi) = prefix_bounds(index, &prefix);
+        index.items[lo..hi]
+            .iter()
+            .map(|it| index.path(it).to_string())
+            .collect()
+    }
+
+    fn naive(index: &Index, root: &str) -> Vec<String> {
+        let prefix = norm_prefix(root);
+        index
+            .items
+            .iter()
+            .map(|it| index.path(it).to_string())
+            .filter(|p| p.starts_with(&prefix))
+            .collect()
+    }
+
+    const SAMPLE: &[&str] = &[
+        "C:/Users/a/.env",
+        "C:/Users/a/readme.md",
+        "C:/Users/a/proj/src/main.rs",
+        "C:/Users/a/proj/src/lib.rs",
+        "C:/Users/ab/other.txt",
+        "C:/Windows/notepad.exe",
+        "D:/",
+        "D:/work/a.txt",
+        "D:/work/sub/b.txt",
+        "D:/work/sub/deep/c.txt",
+        "D:/work2/d.txt",
+        "D:/work3.txt",
+        "D:/归档/述职材料.md",
+        "D:/归档/2026 报告/说明.txt",
+    ];
+
+    #[test]
+    fn items_are_sorted_by_full_path() {
+        let idx = synth(SAMPLE);
+        for w in idx.items.windows(2) {
+            assert!(
+                idx.path(&w[0]) < idx.path(&w[1]),
+                "条目未按路径升序：{:?} >= {:?}",
+                idx.path(&w[0]),
+                idx.path(&w[1])
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_bounds_match_linear_scan() {
+        let idx = synth(SAMPLE);
+        for root in [
+            "D:/",
+            "D:/work",
+            "D:/work/",
+            "D:/work/sub",
+            "D:/work2",
+            "C:/Users",
+            "C:/Users/a",
+            "C:/Users/ab",
+            "C:/Windows",
+            "D:/归档",
+        ] {
+            assert_eq!(subtree(&idx, root), naive(&idx, root), "根 {root} 的子树区间不对");
+        }
+    }
+
+    #[test]
+    fn prefix_bounds_does_not_leak_neighbours() {
+        let idx = synth(SAMPLE);
+        // D:/work 不能把 D:/work2、D:/work3.txt 带进来
+        let got = subtree(&idx, "D:/work");
+        assert!(!got.iter().any(|p| p.starts_with("D:/work2")));
+        assert!(!got.iter().any(|p| p.starts_with("D:/work3")));
+        // 盘根只取本盘
+        assert!(subtree(&idx, "D:/").iter().all(|p| p.starts_with("D:/")));
+    }
+
+    #[test]
+    fn drive_letter_case_is_normalised() {
+        let idx = synth(SAMPLE);
+        assert_eq!(subtree(&idx, "d:/work"), subtree(&idx, "D:/work"));
+    }
+
+    #[test]
+    fn match_item_name_vs_path() {
+        let idx = synth(SAMPLE);
+        let re = regex::Regex::new(r"^lib\.rs$").unwrap();
+        let exts = std::collections::HashSet::new();
+
+        // 文件名模式：只有 lib.rs 命中
+        let mut hits = Vec::new();
+        for it in &idx.items {
+            match_item(&idx, it, &re, &exts, &mut hits, false);
+        }
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.ends_with("/lib.rs"));
+
+        // 整路径模式：锚定在文件名开头的正则对完整路径不命中（现有语义，供改造对照）
+        let mut path_hits = Vec::new();
+        for it in &idx.items {
+            match_item(&idx, it, &re, &exts, &mut path_hits, true);
+        }
+        assert!(path_hits.is_empty());
+    }
+}
