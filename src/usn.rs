@@ -256,7 +256,7 @@ mod tests {
                 return;
             }
         };
-        let start = (info.next_usn - 2000).max(info.first_usn);
+        let start = info.next_usn;
         match scan('D', info.journal_id, start) {
             Some((recs, next)) => {
                 println!("records={} next={}", recs.len(), next);
