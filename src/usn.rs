@@ -230,6 +230,58 @@ pub fn scan(drive: char, expected_id: u64, start_usn: i64) -> Option<(Vec<RawRec
     result
 }
 
+/// 由 file reference number 反查完整路径（正斜杠形式，与索引口径一致）。
+/// 任何一步失败都返回 None —— 调用方必须回退全盘巡，不许猜。
+pub fn path_of_frn(drive: char, frn: u64) -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdType, GetFinalPathNameByHandleW, OpenFileById, FILE_ID_DESCRIPTOR,
+        FILE_ID_DESCRIPTOR_0, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, VOLUME_NAME_DOS,
+    };
+
+    let vol = open_volume(drive)?;
+    let mut desc: FILE_ID_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    desc.dwSize = std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32;
+    desc.Type = FileIdType;
+    desc.Anonymous = FILE_ID_DESCRIPTOR_0 { FileId: frn as i64 };
+
+    let fh = unsafe {
+        OpenFileById(
+            vol,
+            &desc,
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if fh.is_null() || fh == INVALID_HANDLE_VALUE {
+        unsafe { CloseHandle(vol) };
+        return None;
+    }
+
+    let mut buf = vec![0u16; 1024];
+    let n = unsafe {
+        GetFinalPathNameByHandleW(
+            fh,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    unsafe {
+        CloseHandle(fh);
+        CloseHandle(vol);
+    }
+    if n == 0 || n as usize >= buf.len() {
+        return None;
+    }
+    let raw = String::from_utf16_lossy(&buf[..n as usize]);
+    let trimmed = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    Some(trimmed.replace('\\', "/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,7 +308,7 @@ mod tests {
                 return;
             }
         };
-        let start = info.next_usn;
+        let start = info.first_usn;
         match scan('D', info.journal_id, start) {
             Some((recs, next)) => {
                 println!("records={} next={}", recs.len(), next);
