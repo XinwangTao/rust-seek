@@ -7,6 +7,8 @@ mod integration;
 mod mcp;
 mod searcher;
 mod updater;
+#[allow(dead_code)]
+mod usn;
 
 fn main() -> eframe::Result {
     // `--mcp`：作为 MCP server 跑在 stdio 上，供 AI Agent 调用。
