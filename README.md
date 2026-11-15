@@ -5,7 +5,15 @@
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue?logo=windows)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Version](https://img.shields.io/badge/version-5.1.0-brightgreen)
+![Version](https://img.shields.io/badge/version-5.3.1-brightgreen)
+
+---
+
+## 🎬 演示视频
+
+[![Rust Seek 90 秒演示](docs/media/promo-poster.jpg)](docs/media/rust-seek-promo.mp4)
+
+90 秒讲清楚：为什么要写它、它怎么把「文件名 + 内容」一起搜掉。点封面直接播放，或下载 [MP4](docs/media/rust-seek-promo.mp4)（约 2.8 MB，竖屏 1080p）。
 
 ---
 
@@ -247,21 +255,9 @@ claude mcp add rust-seek -- "F:\path\to\rust-seek.exe" --mcp
 
 ## 📸 Screenshot
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Path: [C:/my-project          ] 📁  Search: [fn main  ] 🔍 Search  [Aa] [F] │
-├─────────────────────────────────────────────────────────────┤
-│  src/main.rs  (1 match)                                      │
-│     1:  fn main() -> eframe::Result {                        │
-│                                                              │
-│  src/app.rs  (3 matches)                                     │
-│    41:  fn start_search(&mut self) {                         │
-│    66:  fn update(&mut self, ctx: &egui::Context, ...) {     │
-│   142:  fn render_result(ui: &mut Ui, result: &SearchResult) │
-├─────────────────────────────────────────────────────────────┤
-│  4 matches in 2 files (12ms)                                 │
-└─────────────────────────────────────────────────────────────┘
-```
+![Rust Seek 主界面：文件名/内容一起搜，结果按文件分组、命中行高亮](docs/media/screenshot.png)
+
+同一次搜索里比对文件名与文本内容，命中的行就地高亮；结果按文件分组，可按路径、修改时间、大小排序。
 
 ---
 
@@ -360,4 +356,4 @@ Rust Seek uses the same parallel directory walking strategy as `ripgrep` — one
 
 ## 📄 License
 
-MIT © 2024
+MIT © 2024 XinwangTao · 完整条款见 [LICENSE](LICENSE)
