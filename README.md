@@ -11,7 +11,7 @@
 
 ## 🎬 演示视频
 
-[![Rust Seek 90 秒演示](docs/media/promo-poster.jpg)](docs/media/rust-seek-promo.mp4)
+<a href="docs/media/rust-seek-promo.mp4"><img src="docs/media/promo-poster.jpg" width="340" alt="Rust Seek 90 秒演示"></a>
 
 90 秒讲清楚：为什么要写它、它怎么把「文件名 + 内容」一起搜掉。点封面直接播放，或下载 [MP4](docs/media/rust-seek-promo.mp4)（约 2.8 MB，竖屏 1080p）。
 
