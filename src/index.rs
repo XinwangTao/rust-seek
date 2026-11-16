@@ -40,8 +40,14 @@ const MAX_CACHE_AGE_SECS: u64 = 7 * 24 * 3600;
 /// 缓存格式 v4：在 v3 基础上加一张「目录表」（目录路径 + 该目录自身的 LastWriteTime）。
 /// 目录 mtime 不变 ⇒ 里面没有增删改名 ⇒ 整棵子树可以整段复用，增量刷新不用重扫全盘。
 /// 旧版本缓存因 MAGIC 不匹配自动作废，重新建一次即可。
-const MAGIC: &[u8; 8] = b"RSKIDX\x04\x00";
+const MAGIC: &[u8; 8] = b"RSKIDX\x05\x00";
+/// 旧格式（v4）仍可读：读进来没有 USN 水位，随后做一次全盘巡把水位种上，
+/// 避免升级后立刻重扫 760 万条重建索引。
+const MAGIC_V4: &[u8; 8] = b"RSKIDX\x04\x00";
 const HDR: usize = 56;
+/// v5 在 56 字节头后多一个 usn_count，末尾跟若干 24 字节水位记录
+const HDR_V5: usize = HDR + 8;
+const USN_BYTES: usize = 24;
 const FLAG_COMPLETE: u64 = 1 << 0;
 /// 刷新时有目录读不到：该子树按旧快照给出，结果里要如实标注
 const FLAG_INCOMPLETE_DIRS: u64 = 1 << 1;
@@ -97,6 +103,9 @@ struct Index {
     /// 已进索引的目录（路径升序，不含盘符根）+ 它们的路径文本
     dir_blob: String,
     dirs: Vec<DirRec>,
+    /// 这份索引覆盖到的 USN 水位（每块盘一条）。**必须和缓存同生共死**：
+    /// 分两个文件写会在并发下出现「旧内容 + 新水位」，那批变更被永久跳过。
+    usn: Vec<crate::usn::Commit>,
     built_unix: u64,
     /// false = 构建时撞到条目上限提前收尾，这台机器有文件没进索引。
     /// 查询方必须据此回退真实遍历，否则会拿到假阴性。
@@ -613,7 +622,7 @@ pub fn ensure_ready() {
     }
     if NEED_FULL_SCAN.load(Ordering::Relaxed) {
         let drives = integration::local_drives();
-        if crate::usn::can_attempt(&drives) {
+        if crate::usn::can_attempt(&drives, &current_usn_state()) {
             let _ = refresh_now_mode(false);
         }
     }
@@ -622,7 +631,9 @@ pub fn ensure_ready() {
     // 以后每次启动都只补变化，不再全盘巡。
     if !SEED_REQUESTED.load(Ordering::Relaxed) {
         let drives = integration::local_drives();
-        if crate::usn::needs_seed(&drives) && crate::usn::available(&drives) {
+        if crate::usn::needs_seed(&drives, &current_usn_state())
+            && crate::usn::available(&drives)
+        {
             SEED_REQUESTED.store(true, Ordering::Relaxed);
             rebuild_throttled();
         }
@@ -660,7 +671,7 @@ fn refresh_smart() -> bool {
     // USN 增量是毫秒级的：确认能走增量就同步做掉，别把便宜活甩到后台。
     // 只有 can_attempt 成立才同步——否则 refresh_now 会退化成 17-22s 的全盘巡。
     let drives = integration::local_drives();
-    if crate::usn::can_attempt(&drives) && refresh_now_mode(false) {
+    if crate::usn::can_attempt(&drives, &current_usn_state()) && refresh_now_mode(false) {
         return true;
     }
     let badly_stale = current_age_secs().map_or(true, |a| a > 60);
@@ -685,6 +696,25 @@ pub fn ensure_fresh(max_age_secs: u64) -> bool {
 
 /// 上一次「先答后补」的后台刷新安排时间（秒）。
 static LAST_QUICK_REQ: AtomicU64 = AtomicU64::new(0);
+
+/// 当前索引自带的水位（盘符 → 上次覆盖到的 USN）。
+fn usn_state(index: &Index) -> std::collections::HashMap<String, crate::usn::VolState> {
+    index
+        .usn
+        .iter()
+        .map(|c| {
+            (
+                crate::usn::key_of(c.drive),
+                crate::usn::VolState { journal_id: c.journal_id, next_usn: c.next_usn },
+            )
+        })
+        .collect()
+}
+
+/// 当前内存索引的水位（没有索引时为空）。
+fn current_usn_state() -> std::collections::HashMap<String, crate::usn::VolState> {
+    lock().as_ref().map(|ix| usn_state(ix)).unwrap_or_default()
+}
 
 /// 实时输入用：**绝不在搜索路径上刷新**。
 ///
@@ -814,11 +844,12 @@ fn spawn_build(slot: BuildSlot) {
         let _slot = slot;
         // 建索引期间照样在遍历全盘：先记下日志位置，建完提交，下次启动就能走增量
         let sweep = crate::usn::snapshot_before_sweep(&integration::local_drives());
-        let built = build();
+        let mut built = build();
+        if let Some(index) = built.as_mut() {
+            index.usn = sweep;
+        }
         if let Some(index) = &built {
-            if save_cache(index) {
-                crate::usn::commit(&sweep);
-            }
+            save_cache(index);
             adopt_cache(index.built_unix);
         }
         let mut guard = lock();
@@ -837,14 +868,12 @@ pub fn build_sync() -> bool {
     let sweep = crate::usn::snapshot_before_sweep(&integration::local_drives());
     let outcome = build();
     let ok = outcome.is_some();
-    if let Some(index) = outcome {
-        let saved = save_cache(&index);
+    if let Some(mut index) = outcome {
+        index.usn = sweep;
+        save_cache(&index);
         let built = index.built_unix;
         *lock() = Some(Box::new(index));
         adopt_cache(built);
-        if saved {
-            crate::usn::commit(&sweep);
-        }
     }
     ok
 }
@@ -863,16 +892,14 @@ pub fn build_and_match(
     let sweep = crate::usn::snapshot_before_sweep(&integration::local_drives());
     let outcome = build_with_match(Some(re), Some(exts), max, match_path);
     match outcome {
-        Some((index, hits)) => {
+        Some((mut index, hits)) => {
             let entries = index.items.len() as u64;
             let complete = index.complete;
-            let saved = save_cache(&index);
+            index.usn = sweep;
+            save_cache(&index);
             let built = index.built_unix;
             *lock() = Some(Box::new(index));
             adopt_cache(built);
-            if saved {
-                crate::usn::commit(&sweep);
-            }
             Some((hits, entries, complete))
         }
         None => None,
@@ -986,13 +1013,15 @@ pub fn spawn_refresh_async() -> bool {
             index.built_unix = now_unix();
             index.incomplete_dirs = stat_failed;
             NEED_FULL_SCAN.store(false, Ordering::Relaxed);
-            crate::usn::commit(&sweep);
+            // 这条路径不写缓存：水位不能单独推进（它会和旧缓存对不上），
+            // 保持旧水位，下次从旧位置重放这批变更即可（幂等）。
+            let _ = &sweep;
             return;
         }
         let hint: Vec<String> = dirty.into_iter().map(|(k, _)| k).collect();
         if refresh_in_place(index, Some(hint)) {
             NEED_FULL_SCAN.store(false, Ordering::Relaxed);
-            crate::usn::commit(&sweep);
+            let _ = &sweep;
         }
         // 扫盘期间（约 10s）又攒下的变更，接着补上，最多 3 轮
         for _ in 0..3 {
@@ -1055,13 +1084,17 @@ fn refresh_with_mode(index: &mut Index, allow_full_sweep: bool) -> bool {
     // 毫秒级；不需要 17-22 秒的全盘 stat 巡。任何一步不可信（没管理员权限 / 非 NTFS /
     // 日志重建 / 起点被截断 / 有条目解析不出路径）都返回 None，直接落回下面的全盘巡。
     let drives = integration::local_drives();
+    let state = usn_state(index);
     let __t = Instant::now();
-    let __usn = crate::usn::dirty_dirs_since_snapshot(&drives);
+    let __usn = crate::usn::dirty_dirs_since_snapshot(&drives, &state);
     if std::env::var_os("RUST_SEEK_DEBUG").is_some() {
-        eprintln!("[debug] usn dirty={:?} in {:?}", __usn.as_ref().map(|(d, _)| d.len()), __t.elapsed());
+        eprintln!(
+            "[debug] usn dirty={:?} in {:?}",
+            __usn.as_ref().map(|(d, _)| d.len()),
+            __t.elapsed()
+        );
     }
     if let Some((dirty, commits)) = __usn {
-        // 空脏目录同样走一遍：它会推进 built_unix 并保持索引不变
         let __t2 = Instant::now();
         let __ok = refresh_in_place(index, Some(dirty.clone()));
         if std::env::var_os("RUST_SEEK_DEBUG").is_some() {
@@ -1070,14 +1103,14 @@ fn refresh_with_mode(index: &mut Index, allow_full_sweep: bool) -> bool {
         if __ok {
             NEED_FULL_SCAN.store(false, Ordering::Relaxed);
             index.built_unix = now_unix();
+            // 水位只在缓存真的写成功之后才推进，而且和缓存放在同一个文件里：
+            // 内容与水位一起落盘，并发下也不会出现「旧内容 + 新水位」。
             if !dirty.is_empty() {
-                // 索引内容变了就必须落盘：别的进程若载入「旧缓存 + 已推进的 next_usn」，
-                // 这批变更会被永久跳过。写盘失败就不推进共享快照。
+                index.usn = commits;
                 if !save_cache(index) {
                     return true;
                 }
             }
-            crate::usn::commit(&commits);
             USN_TRUSTED.store(true, Ordering::Relaxed);
             return true;
         }
@@ -1097,8 +1130,9 @@ fn refresh_with_mode(index: &mut Index, allow_full_sweep: bool) -> bool {
         // 全盘巡的结果必须落盘，否则每个新进程（GUI + 每个 MCP 子进程）启动后
         // 都要各自再巡一遍 31.7 万目录（本机约 20s）。写盘后后来者加载到的
         // 缓存年龄接近 0，ensure_ready 会直接跳过巡。
+        // 水位跟着缓存一起写：这就是「全盘巡完成」的坐标。
+        index.usn = sweep;
         save_cache(index);
-        crate::usn::commit(&sweep);
     }
     ok
 }
@@ -2156,6 +2190,7 @@ fn build_with_match(
         items,
         dir_blob,
         dirs,
+        usn: Vec::new(),
         built_unix: build_started,
         complete,
         incomplete_dirs: false,
@@ -2327,9 +2362,16 @@ fn load_cache() -> Option<Index> {
     let map = unsafe { memmap2::Mmap::map(&file).ok()? };
     let buf: &[u8] = &map;
 
-    if buf.len() < HDR || &buf[..8] != MAGIC {
+    if buf.len() < HDR {
         return None;
     }
+    let is_v5 = &buf[..8] == MAGIC;
+    let is_v4 = &buf[..8] == MAGIC_V4;
+    if !is_v5 && !is_v4 {
+        return None;
+    }
+    // v5 头部多 8 字节 usn_count；blob/条目/目录的相对偏移随之整体后移
+    let hdr = if is_v5 { HDR_V5 } else { HDR };
     let built_unix = u64::from_le_bytes(buf[8..16].try_into().ok()?);
     if now_unix().saturating_sub(built_unix) > MAX_CACHE_AGE_SECS {
         return None;
@@ -2339,32 +2381,58 @@ fn load_cache() -> Option<Index> {
     let flags = u64::from_le_bytes(buf[32..40].try_into().ok()?);
     let dir_blob_len = u64::from_le_bytes(buf[40..48].try_into().ok()?) as usize;
     let dir_count = u64::from_le_bytes(buf[48..56].try_into().ok()?) as usize;
+    let usn_count = if is_v5 {
+        u64::from_le_bytes(buf[HDR..HDR_V5].try_into().ok()?) as usize
+    } else {
+        0
+    };
     if count > MAX_ENTRIES_CEIL
         || dir_count > MAX_ENTRIES_CEIL
-        || HDR
+        || usn_count > 64
+        || hdr
             .checked_add(blob_len)?
             .checked_add(count * ITEM_BYTES)?
             .checked_add(dir_blob_len)?
             .checked_add(dir_count * DIR_BYTES)?
+            .checked_add(usn_count * USN_BYTES)?
             != buf.len()
     {
         return None;
     }
 
     let t_load = Instant::now();
-    let blob_end = HDR + blob_len;
-    let blob_bytes = buf[HDR..blob_end].to_vec();
+    let blob_end = hdr + blob_len;
+    let blob_bytes = buf[hdr..blob_end].to_vec();
     if !utf8_valid_parallel(&blob_bytes) {
+        if std::env::var_os("RUST_SEEK_DEBUG").is_some() { eprintln!("[debug] cache: blob 非法 UTF-8"); }
         return None;
     }
     // SAFETY: 上一行已校验整段是合法 UTF-8
     let blob = unsafe { String::from_utf8_unchecked(blob_bytes) };
     let items_end = blob_end + count * ITEM_BYTES;
-    let items = parallel_parse(count, ITEM_BYTES, &buf[blob_end..items_end], |raw| {
+    let items = match parallel_parse(count, ITEM_BYTES, &buf[blob_end..items_end], |raw| {
         parse_items(raw, &blob)
-    })?;
+    }) {
+        Some(v) => v,
+        None => {
+            if std::env::var_os("RUST_SEEK_DEBUG").is_some() { eprintln!("[debug] cache: items 校验失败"); }
+            return None;
+        }
+    };
 
     let dir_blob_end = items_end + dir_blob_len;
+    // 尾部水位：u8 盘符 + 7 字节填充 + journal_id(8) + next_usn(8)
+    let mut usn: Vec<crate::usn::Commit> = Vec::with_capacity(usn_count);
+    for i in 0..usn_count {
+        let off = dir_blob_end + dir_count * DIR_BYTES + i * USN_BYTES;
+        if off + USN_BYTES > buf.len() {
+            return None;
+        }
+        let drive = buf[off] as char;
+        let journal_id = u64::from_le_bytes(buf[off + 8..off + 16].try_into().ok()?);
+        let next_usn = i64::from_le_bytes(buf[off + 16..off + 24].try_into().ok()?);
+        usn.push(crate::usn::Commit { drive, journal_id, next_usn });
+    }
     let dir_bytes = buf[items_end..dir_blob_end].to_vec();
     if !utf8_valid_parallel(&dir_bytes) {
         return None;
@@ -2388,6 +2456,7 @@ fn load_cache() -> Option<Index> {
         items,
         dir_blob,
         dirs,
+        usn,
         built_unix,
         complete: flags & FLAG_COMPLETE != 0,
         incomplete_dirs: flags & FLAG_INCOMPLETE_DIRS != 0,
@@ -2400,7 +2469,12 @@ fn save_cache(index: &Index) -> bool {
         let _ = std::fs::create_dir_all(dir);
     }
     let mut buf = Vec::with_capacity(
-        HDR + index.blob.len() + index.items.len() * ITEM_BYTES + index.dir_blob.len() + index.dirs.len() * DIR_BYTES,
+        HDR_V5
+            + index.blob.len()
+            + index.items.len() * ITEM_BYTES
+            + index.dir_blob.len()
+            + index.dirs.len() * DIR_BYTES
+            + index.usn.len() * USN_BYTES,
     );
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&index.built_unix.to_le_bytes());
@@ -2413,6 +2487,7 @@ fn save_cache(index: &Index) -> bool {
     buf.extend_from_slice(&flags.to_le_bytes());
     buf.extend_from_slice(&(index.dir_blob.len() as u64).to_le_bytes());
     buf.extend_from_slice(&(index.dirs.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&(index.usn.len() as u64).to_le_bytes());
     buf.extend_from_slice(index.blob.as_bytes());
     for it in &index.items {
         buf.extend_from_slice(&it.path_off.to_le_bytes());
@@ -2427,6 +2502,14 @@ fn save_cache(index: &Index) -> bool {
         buf.extend_from_slice(&rec.path_off.to_le_bytes());
         buf.extend_from_slice(&rec.path_len.to_le_bytes());
         buf.extend_from_slice(&rec.mtime.to_le_bytes());
+    }
+    // 尾部：本份索引覆盖到的 USN 水位（24 字节/盘）
+    for c in &index.usn {
+        let mut rec = [0u8; USN_BYTES];
+        rec[0] = c.drive as u8;
+        rec[8..16].copy_from_slice(&c.journal_id.to_le_bytes());
+        rec[16..24].copy_from_slice(&c.next_usn.to_le_bytes());
+        buf.extend_from_slice(&rec);
     }
 
     // 临时文件名带 pid：多个 MCP 进程同时重建时各写各的，最后 rename 覆盖
@@ -2458,6 +2541,29 @@ mod tests {
     //!   2) `prefix_bounds` 给出的区间 == 线性筛出的子树（不漏不多）
     //! 以后改存储格式（目录/名字分离、mmap）时，这些用例必须原样通过。
     use super::*;
+
+    /// 实机探针（默认忽略）：水位必须能从缓存文件里读出来，且能直接续增量。
+    /// 这是「索引内容与水位的原子性」的验证点——不再有独立的 usn-state.json。
+    /// 运行：cargo test --release live_usn_from_cache -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_usn_from_cache() {
+        assert!(try_load(), "载入缓存失败");
+        let st = current_usn_state();
+        println!("cache watermark: {st:?}");
+        assert!(!st.is_empty(), "缓存里没有 USN 水位");
+        let drives = integration::local_drives();
+        let r = crate::usn::dirty_dirs_since_snapshot(&drives, &st);
+        println!("dirty dirs: {:?}", r.as_ref().map(|(d, _)| d.len()));
+        assert!(r.is_some(), "从缓存水位出发的增量不可用");
+        // 独立的 usn-state.json 不应再出现
+        let legacy = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap()
+            .join("rust-seek")
+            .join("usn-state.json");
+        assert!(!legacy.exists(), "仍然写出了旧的 usn-state.json");
+    }
 
     /// 实机探针（默认忽略）：实时输入路径必须立刻返回，刷新只能甩后台。
     /// 运行：cargo test --release live_realtime_path -- --ignored --nocapture
@@ -2523,7 +2629,7 @@ mod tests {
         let ok = build_sync();
         assert!(ok, "build_sync 失败");
         assert!(
-            !crate::usn::needs_seed(&drives),
+            !crate::usn::needs_seed(&drives, &current_usn_state()),
             "建完索引后仍缺增量起点"
         );
     }
@@ -2534,14 +2640,15 @@ mod tests {
     #[ignore]
     fn live_usn_sees_new_file() {
         let drives = integration::local_drives();
-        if crate::usn::needs_seed(&drives) {
+        if crate::usn::needs_seed(&drives, &current_usn_state()) {
             eprintln!("跳过：还没有增量起点，先跑 live_seed_usn_after_build");
             return;
         }
         let dir = std::path::Path::new(r"D:\");
         let probe = dir.join(format!("usn_probe_{}.txt", std::process::id()));
         std::fs::write(&probe, b"hello").expect("写探针文件失败");
-        let (dirty, _) = crate::usn::dirty_dirs_since_snapshot(&drives).expect("增量不可用");
+        let state = current_usn_state();
+        let (dirty, _) = crate::usn::dirty_dirs_since_snapshot(&drives, &state).expect("增量不可用");
         let target = format!("D:/{}", probe.file_name().unwrap().to_string_lossy());
         let parent = "D:/".to_string();
         let _ = target;
@@ -2593,6 +2700,7 @@ mod tests {
             items,
             dir_blob,
             dirs,
+            usn: Vec::new(),
             built_unix: 0,
             complete: true,
             incomplete_dirs: false,

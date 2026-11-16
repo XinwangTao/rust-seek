@@ -11,7 +11,6 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::windows::ffi::{OsStrExt};
-use std::path::PathBuf;
 
 use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE};
 
@@ -298,51 +297,24 @@ fn resolve_dir(
 
 // ---------- 快照状态 ----------
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+/// 一块盘的增量水位。**跟着缓存文件一起落盘**，不再单独存一个 JSON：
+/// 索引内容和「它覆盖到哪一条 USN」是同一次事实，分两个文件写，
+/// 并发下就会出现「旧内容 + 新水位」——那批变更被永久跳过且无声无息。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VolState {
     pub journal_id: u64,
     pub next_usn: i64,
 }
 
-/// 本次处理到哪：由调用方在全盘巡 / 增量成功后提交。
-#[derive(Debug, Clone, Copy)]
+/// 全盘巡/建索引结束后要提交的水位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Commit {
     pub drive: char,
     pub journal_id: u64,
     pub next_usn: i64,
 }
 
-fn state_path() -> Option<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    Some(base.join("rust-seek").join("usn-state.json"))
-}
-
-fn load_state() -> HashMap<String, VolState> {
-    let Some(path) = state_path() else {
-        return HashMap::new();
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return HashMap::new();
-    };
-    serde_json::from_str(&text).unwrap_or_default()
-}
-
-fn save_state(map: &HashMap<String, VolState>) {
-    let Some(path) = state_path() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let Ok(text) = serde_json::to_vec(map) else { return };
-    // 原子写：先写临时文件再 rename，避免别的进程读到半截 JSON
-    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    if std::fs::write(&tmp, &text).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
-}
-
-fn key_of(drive: char) -> String {
+pub fn key_of(drive: char) -> String {
     format!("{}:", drive.to_ascii_uppercase())
 }
 
@@ -355,41 +327,52 @@ pub fn available(drives: &[String]) -> bool {
         .any(|ch| journal_info(ch).is_some())
 }
 
-/// 有没有卷缺「增量起点」。缺就得建一次索引把它种下来，否则永远只能全盘巡。
-pub fn needs_seed(drives: &[String]) -> bool {
-    let state = load_state();
-    drives
-        .iter()
-        .filter_map(|d| d.chars().next())
-        .any(|ch| !state.contains_key(&key_of(ch)))
+/// 有日志、可以走增量的盘；没有日志的（U 盘 / 非 NTFS / FAT）不算。
+fn journal_capable(drive: &str) -> Option<char> {
+    let ch = drive.chars().next()?;
+    journal_info(ch).map(|_| ch)
 }
 
-/// 快查：这次**大概**能不能走增量（有状态、日志能打开、起点还能续）。
-/// 只用于决定「值不值得同步试一次」，不保证一定成功——真正的判定在
-/// [`dirty_dirs_since_snapshot`] 里逐条做，失败仍会回退全盘巡。
-pub fn can_attempt(drives: &[String]) -> bool {
-    let state = load_state();
-    if state.is_empty() || drives.is_empty() {
-        return false;
-    }
-    drives.iter().all(|d| {
-        let Some(ch) = d.chars().next() else { return false };
-        let Some(st) = state.get(&key_of(ch)) else { return false };
-        journal_info(ch).map_or(false, |i| can_resume(&i, st.journal_id, st.next_usn))
+/// 有盘缺水位（首次安装 / 新插硬盘）→ 需要建一次索引把水位种下来。
+///
+/// **只认有日志的盘**：U 盘没有 USN 日志，如果把它也算进来，就会永远「缺水位」
+/// 而每隔几分钟重建一次 760 万条索引——永远种不上，也永远停不下来。
+pub fn needs_seed(drives: &[String], state: &HashMap<String, VolState>) -> bool {
+    drives.iter().filter_map(|d| journal_capable(d)).any(|ch| {
+        !state.contains_key(&key_of(ch))
     })
 }
 
-/// 用 USN 算「上次快照之后哪些目录变过」。
+/// 快查：这次**大概**能不能走增量（每块盘都有日志、都有可用水位）。
+/// 有任何一块盘没有日志（例如插了 U 盘）就返回 false —— 那块盘的内容无法用
+/// USN 跟踪，整机索引不能声称「最新」，老老实实回退全盘 stat 巡。
+pub fn can_attempt(drives: &[String], state: &HashMap<String, VolState>) -> bool {
+    if drives.is_empty() {
+        return false;
+    }
+    let mut any = false;
+    for d in drives {
+        let Some(ch) = journal_capable(d) else { return false };
+        any = true;
+        let Some(st) = state.get(&key_of(ch)) else { return false };
+        let Some(info) = journal_info(ch) else { return false };
+        if !can_resume(&info, st.journal_id, st.next_usn) {
+            return false;
+        }
+    }
+    any
+}
+
+/// 用 USN 算「上次水位之后哪些目录变过」。
 ///
-/// 返回 `Some((脏目录, 待提交快照))` 表示增量**完整可信**；
+/// 返回 `Some((脏目录, 待提交水位))` 表示增量**完整可信**；
 /// `None` 表示不可用（没权限 / 非 NTFS / 日志重建 / 起点被截断 / 有目录解析不出路径），
 /// 调用方必须回退全盘巡。
-pub fn dirty_dirs_since_snapshot(drives: &[String]) -> Option<(Vec<String>, Vec<Commit>)> {
-    let state = load_state();
-    if state.is_empty() {
-        return None;
-    }
-    if drives.is_empty() {
+pub fn dirty_dirs_since_snapshot(
+    drives: &[String],
+    state: &HashMap<String, VolState>,
+) -> Option<(Vec<String>, Vec<Commit>)> {
+    if state.is_empty() || drives.is_empty() {
         return None;
     }
 
@@ -401,7 +384,7 @@ pub fn dirty_dirs_since_snapshot(drives: &[String]) -> Option<(Vec<String>, Vec<
         let Some(ch) = drive_str.chars().next() else { return None };
         let Some(st) = state.get(&key_of(ch)) else {
             if debug {
-                eprintln!("[debug] usn {ch}: 没有快照");
+                eprintln!("[debug] usn {ch}: 没有水位");
             }
             return None;
         };
@@ -470,8 +453,8 @@ pub fn dirty_dirs_since_snapshot(drives: &[String]) -> Option<(Vec<String>, Vec<
     Some((dirty, commits))
 }
 
-/// 全盘巡**开始前**调用：记下当前日志位置。巡完成功后把这份快照提交，
-/// 下次启动就能走增量。拿不到日志（无权限/非 NTFS）时返回空，调用方照常提交空列表。
+/// 全盘巡**开始前**调用：记下当前日志位置。巡完成功后把这份水位随缓存一起提交，
+/// 下次启动就能走增量。拿不到日志（无权限/非 NTFS）时返回空。
 pub fn snapshot_before_sweep(drives: &[String]) -> Vec<Commit> {
     let mut out = Vec::new();
     for drive_str in drives {
@@ -480,33 +463,6 @@ pub fn snapshot_before_sweep(drives: &[String]) -> Vec<Commit> {
         out.push(Commit { drive: ch, journal_id: info.journal_id, next_usn: info.next_usn });
     }
     out
-}
-
-/// 提交快照：只覆盖本次真的处理过的卷，其它卷保持原值。
-pub fn commit(commits: &[Commit]) {
-    if commits.is_empty() {
-        return;
-    }
-    let mut map = load_state();
-    for c in commits {
-        map.insert(key_of(c.drive), VolState { journal_id: c.journal_id, next_usn: c.next_usn });
-    }
-    save_state(&map);
-}
-
-/// 增量不可信时把某块盘的快照作废，保证下一次必然全盘巡。
-pub fn invalidate(drives: &[String]) {
-    let mut map = load_state();
-    let mut changed = false;
-    for d in drives {
-        if let Some(ch) = d.chars().next() {
-            map.remove(&key_of(ch));
-            changed = true;
-        }
-    }
-    if changed {
-        save_state(&map);
-    }
 }
 
 #[cfg(test)]
@@ -553,9 +509,11 @@ mod tests {
 
     #[test]
     fn empty_state_means_no_incremental() {
-        // 状态文件不存在时必须是 None（回退全盘巡），不能返回「零脏目录」
+        // 没有任何水位时必须是 None（回退全盘巡），不能返回「零脏目录」
         let drives = vec!["Z:".to_string()];
-        assert!(dirty_dirs_since_snapshot(&drives).is_none());
+        let state = HashMap::new();
+        assert!(dirty_dirs_since_snapshot(&drives, &state).is_none());
+        assert!(!can_attempt(&drives, &state));
     }
 
     /// 实机探针（默认忽略）：目录建了又删时，父 FRN 已经打不开——
@@ -569,12 +527,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::write(root.join("sub").join("a.txt"), b"x").unwrap();
-        commit(&snapshot_before_sweep(&drives));
         std::fs::remove_dir_all(root).unwrap();
         // 关键性质：删掉一整棵树之后，增量仍然可用（不能退回 17 秒全盘巡）。
         // NTFS 会把被删子项重挂到 $Extend/$Deleted，父 FRN 往往已经打不开，
         // 这时靠父链 + 名字把路径拼回来，或者至少落到仍存在的祖先目录上。
-        let (dirty, _) = dirty_dirs_since_snapshot(&drives).expect("删除后增量不可用");
+        let state: HashMap<String, VolState> = snapshot_before_sweep(&drives)
+            .iter()
+            .map(|c| (key_of(c.drive), VolState { journal_id: c.journal_id, next_usn: c.next_usn }))
+            .collect();
+        let (dirty, _) = dirty_dirs_since_snapshot(&drives, &state).expect("删除后增量不可用");
         println!("dirty={dirty:?}");
         assert!(
             !dirty.is_empty(),
@@ -590,12 +551,11 @@ mod tests {
         let drives = vec!["C:".to_string(), "D:".to_string()];
         let snap = snapshot_before_sweep(&drives);
         println!("snapshot commits: {}", snap.len());
-        commit(&snap);
-        println!(
-            "state file: {:?}",
-            state_path().map(|p| (p.clone(), p.exists()))
-        );
-        let dirty = dirty_dirs_since_snapshot(&drives);
+        let state: HashMap<String, VolState> = snap
+            .iter()
+            .map(|c| (key_of(c.drive), VolState { journal_id: c.journal_id, next_usn: c.next_usn }))
+            .collect();
+        let dirty = dirty_dirs_since_snapshot(&drives, &state);
         match &dirty {
             Some((dirs, c)) => println!("dirty dirs: {} commits: {}", dirs.len(), c.len()),
             None => println!("dirty: None（不可增量）"),
