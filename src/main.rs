@@ -81,7 +81,7 @@ fn main() -> eframe::Result {
                     .push("system-cjk".to_owned());
             }
             cc.egui_ctx.set_fonts(fonts);
-            Ok(Box::new(app::App::new(start_hidden)))
+            Ok(Box::new(app::App::new(start_hidden, &cc.egui_ctx)))
         }),
     )
 }

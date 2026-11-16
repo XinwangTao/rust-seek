@@ -340,7 +340,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(start_hidden: bool) -> Self {
+    pub fn new(start_hidden: bool, egui_ctx: &egui::Context) -> Self {
+        #[cfg(windows)]
+        let _ = egui_ctx;
         let prefs = Prefs::load();
         let prefs_sort_key = prefs.sort_key;
         let prefs_ext = prefs.ext_filter.clone();
@@ -368,12 +370,18 @@ impl App {
         let clip_paused = Arc::new(AtomicBool::new(false));
         let bridge = Arc::new(integration::Bridge::new(clip_paused.clone()));
         bridge.panel.store(prefs.dock_bottom, Ordering::Relaxed);
+        #[cfg(target_os = "macos")]
+        bridge.visible.store(!start_hidden, Ordering::Relaxed);
         // 全局热键（呼出/隐藏）
-        let (hotkey, hotkey_error) =
-            match integration::setup_hotkey(prefs.hotkey_preset, bridge.clone()) {
-                Ok(h) => (Some(h), None),
-                Err(e) => (None, Some(e)),
-            };
+        #[cfg(windows)]
+        let hotkey_result = integration::setup_hotkey(prefs.hotkey_preset, bridge.clone());
+        #[cfg(not(windows))]
+        let hotkey_result =
+            integration::setup_hotkey(prefs.hotkey_preset, bridge.clone(), egui_ctx.clone());
+        let (hotkey, hotkey_error) = match hotkey_result {
+            Ok(h) => (Some(h), None),
+            Err(e) => (None, Some(e)),
+        };
         // 托盘常驻
         let hotkey_label = hotkey.as_ref().map(|h| h.label).unwrap_or("Rust Seek");
         let clip_label = hotkey.as_ref().and_then(|h| h.clip_label);
@@ -572,16 +580,31 @@ impl App {
                 integration::win_hide(hwnd);
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         {
-            // 降级版没有托盘或全局热键，隐藏后将无法重新唤出，因此 Esc/收起直接退出。
+            // 有全局热键后可以安全隐藏；红色关闭按钮仍走正常退出流程。
+            self.bridge.visible.store(false, Ordering::Release);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            // 其他降级平台没有托盘或全局热键，隐藏后将无法重新唤出。
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
     /// 消费外部事件（热键/托盘/其他实例）设置的桥接标志。
-    /// 显示/隐藏本身由处理器用 Win32 直接完成，这里只做 egui 侧的善后。
-    fn poll_bridge_events(&mut self) {
+    /// Windows 的显示/隐藏由 Win32 完成；macOS 在 UI 帧中应用 ViewportCommand。
+    fn poll_bridge_events(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "macos")]
+        if self.bridge.pending_toggle.swap(false, Ordering::AcqRel) {
+            let visible = self.bridge.visible.load(Ordering::Acquire);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
+            if visible {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
         // 剪切板热键/托盘优先：切到剪切板面板并刷新历史。
         // 先于 pending_show 判断——同一批事件里两者都置位时，不能先按 pending_show
         // 清空关键词/结果再切视图，否则用户正在进行的搜索会被冲掉。
@@ -1268,7 +1291,7 @@ impl eframe::App for App {
         }
 
         // 消费外部呼出事件（Win32 显示已完成，这里做 egui 侧善后）
-        self.poll_bridge_events();
+        self.poll_bridge_events(ctx);
 
         // Windows：关闭窗口 = 隐藏到托盘；无托盘的降级平台正常关闭进程。
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -2131,14 +2154,27 @@ impl App {
             .show(ctx, |ui| {
                 ui.label("当前版本保留文件名搜索、文本搜索和本地索引。");
                 ui.add_space(6.0);
+                if self.hotkey.is_some() {
+                    ui.label("全局热键：Option+Space 呼出或隐藏窗口。");
+                }
+                if let Some(ref err) = self.hotkey_error {
+                    ui.label(
+                        RichText::new(err)
+                            .color(Color32::from_rgb(255, 140, 0))
+                            .small(),
+                    );
+                }
                 ui.label(
                     RichText::new(
-                        "全局热键、系统托盘、开机自启、剪贴板监听、Windows 搜索与资源管理器集成暂未启用。",
+                        "系统托盘、开机自启、剪贴板监听、Windows 搜索与资源管理器集成暂未启用。",
                     )
                     .weak(),
                 );
                 ui.add_space(6.0);
-                ui.label(RichText::new("没有托盘常驻：Esc、收起按钮或关闭窗口都会退出程序。").weak());
+                ui.label(
+                    RichText::new("Option+Space、Esc 或收起按钮隐藏窗口；红色关闭按钮退出程序。")
+                        .weak(),
+                );
             });
         self.show_settings = settings_open;
     }
