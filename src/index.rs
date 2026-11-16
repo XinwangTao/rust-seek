@@ -521,6 +521,12 @@ pub fn maybe_stale(age_ms: u128) -> bool {
     age_ms >= 300_000
 }
 
+/// 本次运行是否已经用 USN 增量把索引刷新到「当前」。
+/// GUI 状态栏用它显示「增量刷新已生效 / 未生效（需要管理员）」。
+pub fn usn_trusted() -> bool {
+    USN_TRUSTED.load(Ordering::Relaxed) && !NEED_FULL_SCAN.load(Ordering::Relaxed)
+}
+
 /// `idle` / `building` / `ready`
 pub fn status() -> &'static str {
     if is_building() {
@@ -599,6 +605,28 @@ fn adopt_cache(cache_unix: u64) {
 /// 没有就尝试磁盘缓存；再没有就后台建。缓存载入是同步的（约 0.2s），因为调用方可能马上要查。
 pub fn ensure_ready() {
     start_watchers();
+    // USN 增量是毫秒级的：先把磁盘缓存载入内存，再把「缓存写成之后」的变更补上。
+    // 不做这一步的话，新进程即便缓存只旧了几秒，NEED_FULL_SCAN 仍为 true，
+    // 零命中就要走 35 秒的全盘兜底——那正是这条链路要消灭的慢路径。
+    if NEED_FULL_SCAN.load(Ordering::Relaxed) && !is_ready() {
+        let _ = try_load();
+    }
+    if NEED_FULL_SCAN.load(Ordering::Relaxed) {
+        let drives = integration::local_drives();
+        if crate::usn::can_attempt(&drives) {
+            let _ = refresh_now_mode(false);
+        }
+    }
+    // 有管理员权限、但还没有可用的增量起点：后台建一次索引把它种下来
+    // （带跨进程节流，多个 MCP 进程不会同时扫盘）。种好之后，
+    // 以后每次启动都只补变化，不再全盘巡。
+    if !SEED_REQUESTED.load(Ordering::Relaxed) {
+        let drives = integration::local_drives();
+        if crate::usn::needs_seed(&drives) && crate::usn::available(&drives) {
+            SEED_REQUESTED.store(true, Ordering::Relaxed);
+            rebuild_throttled();
+        }
+    }
     let age = current_age_secs();
     match age {
         Some(a) if a <= auto_refresh_secs() && !has_pending_changes() => {}
@@ -628,6 +656,12 @@ pub fn ensure_ready() {
 fn refresh_smart() -> bool {
     if !NEED_FULL_SCAN.load(Ordering::Relaxed) {
         return refresh_now();
+    }
+    // USN 增量是毫秒级的：确认能走增量就同步做掉，别把便宜活甩到后台。
+    // 只有 can_attempt 成立才同步——否则 refresh_now 会退化成 17-22s 的全盘巡。
+    let drives = integration::local_drives();
+    if crate::usn::can_attempt(&drives) && refresh_now_mode(false) {
+        return true;
     }
     let badly_stale = current_age_secs().map_or(true, |a| a > 60);
     if badly_stale {
@@ -739,9 +773,13 @@ fn spawn_build(slot: BuildSlot) {
     // slot 移进线程：构建结束或被 panic 展开时由 Drop 释放 BUILDING
     std::thread::spawn(move || {
         let _slot = slot;
+        // 建索引期间照样在遍历全盘：先记下日志位置，建完提交，下次启动就能走增量
+        let sweep = crate::usn::snapshot_before_sweep(&integration::local_drives());
         let built = build();
         if let Some(index) = &built {
-            save_cache(index);
+            if save_cache(index) {
+                crate::usn::commit(&sweep);
+            }
             adopt_cache(index.built_unix);
         }
         let mut guard = lock();
@@ -757,13 +795,17 @@ pub fn build_sync() -> bool {
     let Some(_slot) = BuildSlot::acquire() else {
         return false;
     };
+    let sweep = crate::usn::snapshot_before_sweep(&integration::local_drives());
     let outcome = build();
     let ok = outcome.is_some();
     if let Some(index) = outcome {
-        save_cache(&index);
+        let saved = save_cache(&index);
         let built = index.built_unix;
         *lock() = Some(Box::new(index));
         adopt_cache(built);
+        if saved {
+            crate::usn::commit(&sweep);
+        }
     }
     ok
 }
@@ -779,15 +821,19 @@ pub fn build_and_match(
     match_path: bool,
 ) -> Option<(Vec<Hit>, u64, bool)> {
     let _slot = BuildSlot::acquire()?;
+    let sweep = crate::usn::snapshot_before_sweep(&integration::local_drives());
     let outcome = build_with_match(Some(re), Some(exts), max, match_path);
     match outcome {
         Some((index, hits)) => {
             let entries = index.items.len() as u64;
             let complete = index.complete;
-            save_cache(&index);
+            let saved = save_cache(&index);
             let built = index.built_unix;
             *lock() = Some(Box::new(index));
             adopt_cache(built);
+            if saved {
+                crate::usn::commit(&sweep);
+            }
             Some((hits, entries, complete))
         }
         None => None,
@@ -858,10 +904,14 @@ impl Drop for RefreshSlot {
 /// 同步做一次「目录级增量刷新」：只重新枚举 mtime 变了的子树。
 /// 返回是否真的刷成了（索引不存在或有别的线程在刷时返回 false，调用方继续用旧快照）。
 pub fn refresh_now() -> bool {
+    refresh_now_mode(true)
+}
+
+fn refresh_now_mode(allow_full_sweep: bool) -> bool {
     let Some(_slot) = RefreshSlot::acquire() else { return false };
     let mut guard = lock();
     let Some(index) = guard.as_mut() else { return false };
-    refresh_with(index)
+    refresh_with_mode(index, allow_full_sweep)
 }
 
 /// 后台刷新：不阻塞查询。
@@ -879,6 +929,8 @@ pub fn spawn_refresh_async() -> bool {
                 .map(|ix| (ix.dir_blob.clone(), ix.dirs.clone()))
         };
         let Some((dir_blob, dirs)) = snapshot else { return };
+        // 扫盘开始前记下 USN 位置：扫描成功后提交，下次启动就能走增量而不是再扫一遍
+        let sweep = crate::usn::snapshot_before_sweep(&integration::local_drives());
         // 扫盘阶段：不持锁
         let (mut dirty, stat_failed) = scan_dirty_dirs(&dir_blob, &dirs, now_unix());
         drop(dir_blob);
@@ -895,11 +947,13 @@ pub fn spawn_refresh_async() -> bool {
             index.built_unix = now_unix();
             index.incomplete_dirs = stat_failed;
             NEED_FULL_SCAN.store(false, Ordering::Relaxed);
+            crate::usn::commit(&sweep);
             return;
         }
         let hint: Vec<String> = dirty.into_iter().map(|(k, _)| k).collect();
         if refresh_in_place(index, Some(hint)) {
             NEED_FULL_SCAN.store(false, Ordering::Relaxed);
+            crate::usn::commit(&sweep);
         }
         // 扫盘期间（约 10s）又攒下的变更，接着补上，最多 3 轮
         for _ in 0..3 {
@@ -917,14 +971,21 @@ pub fn spawn_refresh_async() -> bool {
 
 /// 监听在跑、也没丢过事件：这时索引可以当作「当前文件系统」的权威视图，
 /// 零命中可以直接回「没有」，不必再花 20-48s 走一遍全盘遍历。
+///
+/// USN 增量成功提交后同样成立：那次刷新是把「上次快照到当前」的变更逐条应用掉的，
+/// 结论与监听路径等价（之后的新变化由监听继续接住）。
 fn watcher_trusted() -> bool {
-    WATCH_ACTIVE.load(Ordering::Relaxed) && !NEED_FULL_SCAN.load(Ordering::Relaxed)
+    (WATCH_ACTIVE.load(Ordering::Relaxed) || USN_TRUSTED.load(Ordering::Relaxed))
+        && !NEED_FULL_SCAN.load(Ordering::Relaxed)
 }
 
 /// 刷新策略：
 /// - 监听在跑且没溢出 ⇒ 只重枚举「有变更的目录」（通常几个，耗时可忽略）
-/// - 首次 / 监听溢出 / 盘数量变了 ⇒ 全量 stat 巡（约 10s，交给后台）
-fn refresh_with(index: &mut Index) -> bool {
+/// - 需要全盘巡时先试 USN 增量（读变更日志，只补关机期间变过的目录，毫秒级）
+/// - USN 不可信 ⇒ 全量 stat 巡（约 17s，交给后台）
+/// `allow_full_sweep=false`：只走「便宜的」路径（脏目录 / USN 增量），
+/// 需要全盘巡时直接返回 false，交给调用方决定要不要甩到后台。
+fn refresh_with_mode(index: &mut Index, allow_full_sweep: bool) -> bool {
     if integration::local_drives().len() as u64 != WATCHED_DRIVES.load(Ordering::Relaxed) {
         NEED_FULL_SCAN.store(true, Ordering::Relaxed);
     }
@@ -949,6 +1010,35 @@ fn refresh_with(index: &mut Index) -> bool {
         }
         return ok;
     }
+
+    // ---- 全盘巡之前先试 USN 增量 ----
+    // 读 NTFS 变更日志就知道「上次快照之后哪些目录变过」，只重枚举那几个目录即可，
+    // 毫秒级；不需要 17-22 秒的全盘 stat 巡。任何一步不可信（没管理员权限 / 非 NTFS /
+    // 日志重建 / 起点被截断 / 有条目解析不出路径）都返回 None，直接落回下面的全盘巡。
+    let drives = integration::local_drives();
+    if let Some((dirty, commits)) = crate::usn::dirty_dirs_since_snapshot(&drives) {
+        // 空脏目录同样走一遍：它会推进 built_unix 并保持索引不变
+        if refresh_in_place(index, Some(dirty.clone())) {
+            NEED_FULL_SCAN.store(false, Ordering::Relaxed);
+            index.built_unix = now_unix();
+            if !dirty.is_empty() {
+                // 索引内容变了就必须落盘：别的进程若载入「旧缓存 + 已推进的 next_usn」，
+                // 这批变更会被永久跳过。写盘失败就不推进共享快照。
+                if !save_cache(index) {
+                    return true;
+                }
+            }
+            crate::usn::commit(&commits);
+            USN_TRUSTED.store(true, Ordering::Relaxed);
+            return true;
+        }
+    }
+    if !allow_full_sweep {
+        return false;
+    }
+
+    // 全盘巡开始前记下日志位置：巡成功提交后，下次启动就能走增量
+    let sweep = crate::usn::snapshot_before_sweep(&drives);
     let ok = refresh_in_place(index, None);
     if ok {
         NEED_FULL_SCAN.store(false, Ordering::Relaxed);
@@ -959,6 +1049,7 @@ fn refresh_with(index: &mut Index) -> bool {
         // 都要各自再巡一遍 31.7 万目录（本机约 20s）。写盘后后来者加载到的
         // 缓存年龄接近 0，ensure_ready 会直接跳过巡。
         save_cache(index);
+        crate::usn::commit(&sweep);
     }
     ok
 }
@@ -985,6 +1076,11 @@ static WATCH_ACTIVE: AtomicBool = AtomicBool::new(false);
 static WATCH_STARTED: AtomicBool = AtomicBool::new(false);
 /// 启动后 / 监听溢出 / 盘数量变化：必须做一次全量扫描才敢说索引是全的
 static NEED_FULL_SCAN: AtomicBool = AtomicBool::new(true);
+/// 本进程已经成功用 USN 增量把「上次快照 → 现在」的变更全部应用过。
+/// 与「监听在跑」等价：可以拿它当零命中的判断依据。
+static USN_TRUSTED: AtomicBool = AtomicBool::new(false);
+/// 本进程已经尝试过「种增量起点」，别每次查询都去读状态文件
+static SEED_REQUESTED: AtomicBool = AtomicBool::new(false);
 static WATCHED_DRIVES: AtomicU64 = AtomicU64::new(0);
 
 /// 启动目录监听（幂等）。GUI 与 MCP 都会调，重复调用无代价。
@@ -2130,8 +2226,8 @@ fn load_cache() -> Option<Index> {
     })
 }
 
-fn save_cache(index: &Index) {
-    let Some(path) = cache_path() else { return };
+fn save_cache(index: &Index) -> bool {
+    let Some(path) = cache_path() else { return false };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -2169,21 +2265,22 @@ fn save_cache(index: &Index) {
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     let mut file = match std::fs::File::create(&tmp) {
         Ok(f) => f,
-        Err(_) => return,
+        Err(_) => return false,
     };
     if file.write_all(&buf).is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return;
+        return false;
     }
     drop(file);
     if std::fs::rename(&tmp, &path).is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return;
+        return false;
     }
     // 新缓存代表「此刻的文件系统」，之前那份日志描述的空窗已经归零
     if let Some(j) = journal_path() {
         let _ = std::fs::remove_file(j);
     }
+    true
 }
 
 #[cfg(test)]
@@ -2193,6 +2290,44 @@ mod tests {
     //!   2) `prefix_bounds` 给出的区间 == 线性筛出的子树（不漏不多）
     //! 以后改存储格式（目录/名字分离、mmap）时，这些用例必须原样通过。
     use super::*;
+
+    /// 实机探针（默认忽略）：全盘建一次索引，验证「种下 USN 增量起点」。
+    /// 运行：cargo test --release live_seed_usn -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_seed_usn_after_build() {
+        let drives = integration::local_drives();
+        let ok = build_sync();
+        assert!(ok, "build_sync 失败");
+        assert!(
+            !crate::usn::needs_seed(&drives),
+            "建完索引后仍缺增量起点"
+        );
+    }
+
+    /// 实机探针（默认忽略）：建一个文件，确认 USN 能把它所在目录报成脏目录。
+    /// 运行：cargo test --release live_usn_sees_new_file -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_usn_sees_new_file() {
+        let drives = integration::local_drives();
+        if crate::usn::needs_seed(&drives) {
+            eprintln!("跳过：还没有增量起点，先跑 live_seed_usn_after_build");
+            return;
+        }
+        let dir = std::path::Path::new(r"D:\");
+        let probe = dir.join(format!("usn_probe_{}.txt", std::process::id()));
+        std::fs::write(&probe, b"hello").expect("写探针文件失败");
+        let (dirty, _) = crate::usn::dirty_dirs_since_snapshot(&drives).expect("增量不可用");
+        let target = format!("D:/{}", probe.file_name().unwrap().to_string_lossy());
+        let parent = "D:/".to_string();
+        let _ = target;
+        assert!(
+            dirty.iter().any(|d| d == &parent || d == "D:"),
+            "USN 没把盘根报成脏目录，实际: {dirty:?}"
+        );
+        let _ = std::fs::remove_file(&probe);
+    }
 
     /// 用一组完整路径拼出一个与 build 同构的索引（条目升序、目录表升序）。
     fn synth(paths: &[&str]) -> Index {

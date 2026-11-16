@@ -1,0 +1,288 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Rust Seek 用 USN 变更日志做增量索引刷新",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "output": "docs/archify/usn_incremental_workflow.html",
+    "views": [
+      {
+        "id": "fast-path",
+        "label": "快路径：只补变化",
+        "focus": [
+          "request",
+          "snapshot",
+          "queryj",
+          "readj",
+          "dirty",
+          "apply",
+          "answer"
+        ],
+        "note": "重启后不再重扫全盘：读日志、算脏目录、只重枚举那几个目录。"
+      },
+      {
+        "id": "fallback",
+        "label": "回退：宁可慢也不漏",
+        "focus": [
+          "queryj",
+          "walk",
+          "answer"
+        ],
+        "note": "权限、日志重建、起点被截断，任何一条不成立都退回全盘巡。"
+      },
+      {
+        "id": "zero-hit",
+        "label": "零命中与落盘",
+        "focus": [
+          "apply",
+          "miss",
+          "answer"
+        ],
+        "note": "索引可信后零命中立刻回答；快照与索引同批落盘，下次接着续。"
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "refresh",
+      "label": "增量刷新"
+    },
+    {
+      "id": "fallback",
+      "label": "回退全盘巡",
+      "variant": "exception"
+    },
+    {
+      "id": "query",
+      "label": "查询出口"
+    }
+  ],
+  "phases": [
+    {
+      "id": "decide",
+      "label": "判定能否续",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "incremental",
+      "label": "只补变化",
+      "fromCol": 2,
+      "toCol": 4,
+      "variant": "emphasis"
+    },
+    {
+      "id": "answer",
+      "label": "落盘 + 回答",
+      "fromCol": 5,
+      "toCol": 5,
+      "variant": "dashed"
+    }
+  ],
+  "groups": [
+    {
+      "id": "usn_work",
+      "label": "只重枚举受影响的目录",
+      "lane": "refresh",
+      "fromCol": 3,
+      "toCol": 5,
+      "variant": "emphasis"
+    },
+    {
+      "id": "safe_fallback",
+      "label": "任一前提不成立",
+      "lane": "fallback",
+      "fromCol": 2,
+      "toCol": 4,
+      "variant": "security"
+    }
+  ],
+  "mainPath": [
+    "request",
+    "snapshot",
+    "queryj",
+    "readj",
+    "dirty",
+    "apply",
+    "answer"
+  ],
+  "nodes": [
+    {
+      "id": "request",
+      "lane": "refresh",
+      "col": 0,
+      "type": "external",
+      "label": "搜索请求",
+      "sublabel": "索引需要刷新？",
+      "width": 124
+    },
+    {
+      "id": "snapshot",
+      "lane": "refresh",
+      "col": 1,
+      "type": "database",
+      "label": "读上次快照",
+      "sublabel": "usn-state.json",
+      "width": 140
+    },
+    {
+      "id": "queryj",
+      "lane": "refresh",
+      "col": 2,
+      "type": "backend",
+      "label": "查询卷日志",
+      "sublabel": "FSCTL_QUERY_USN_JOURNAL",
+      "width": 150
+    },
+    {
+      "id": "readj",
+      "lane": "refresh",
+      "col": 3,
+      "type": "backend",
+      "label": "读增量记录",
+      "sublabel": "FSCTL_READ_USN_JOURNAL",
+      "width": 150
+    },
+    {
+      "id": "dirty",
+      "lane": "refresh",
+      "col": 4,
+      "type": "backend",
+      "label": "算出脏目录",
+      "sublabel": "FRN → 路径",
+      "width": 132
+    },
+    {
+      "id": "apply",
+      "lane": "refresh",
+      "col": 5,
+      "type": "backend",
+      "label": "只重枚举脏目录",
+      "sublabel": "毫秒级，不碰全盘",
+      "tag": "增量",
+      "width": 140
+    },
+    {
+      "id": "walk",
+      "lane": "fallback",
+      "col": 3,
+      "type": "backend",
+      "label": "全盘目录巡",
+      "sublabel": "31.7 万目录，17–22 秒",
+      "width": 140
+    },
+    {
+      "id": "miss",
+      "lane": "query",
+      "col": 4,
+      "type": "frontend",
+      "label": "零命中立刻回答",
+      "sublabel": "0.1 秒回「没有」，可点深搜",
+      "width": 140
+    },
+    {
+      "id": "answer",
+      "lane": "query",
+      "col": 5,
+      "type": "frontend",
+      "label": "返回结果",
+      "sublabel": "热查询 60 毫秒",
+      "width": 132
+    }
+  ],
+  "edges": [
+    {
+      "id": "req-snap",
+      "from": "request",
+      "to": "snapshot",
+      "variant": "default"
+    },
+    {
+      "id": "snap-query",
+      "from": "snapshot",
+      "to": "queryj",
+      "label": "上次停在哪",
+      "variant": "emphasis"
+    },
+    {
+      "id": "query-read",
+      "from": "queryj",
+      "to": "readj",
+      "label": "ID 一致且未截断",
+      "variant": "emphasis"
+    },
+    {
+      "id": "query-walk",
+      "from": "queryj",
+      "to": "walk",
+      "label": "任一前提不成立",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "read-dirty",
+      "from": "readj",
+      "to": "dirty",
+      "variant": "default"
+    },
+    {
+      "id": "dirty-apply",
+      "from": "dirty",
+      "to": "apply",
+      "variant": "emphasis"
+    },
+    {
+      "id": "apply-answer",
+      "from": "apply",
+      "to": "answer",
+      "label": "索引可信",
+      "variant": "emphasis"
+    },
+    {
+      "id": "apply-miss",
+      "from": "apply",
+      "to": "miss",
+      "label": "零命中",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "walk-answer",
+      "from": "walk",
+      "to": "answer",
+      "label": "兜底结果照常返回",
+      "variant": "dashed",
+      "role": "return"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "为什么能快",
+      "items": [
+        "索引已经是持久化快照，缺的只是「关机期间变了什么」",
+        "USN 直接给出这些变化，只重枚举受影响的目录",
+        "全盘目录巡 17–22 秒只在真正无法增量时发生"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "宁可慢也不漏",
+      "items": [
+        "无管理员、非 NTFS、日志被重建、起点早于 lowest_valid 都回退全盘巡",
+        "单条 FRN 解析失败即判 partial，整盘不赌增量",
+        "任何 USN 调用出错都把 next_usn 清零，下次必然全巡"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "零命中口径变更",
+      "items": [
+        "索引可信时零命中 0.1 秒返回「没有」，不再等 35 秒",
+        "结论可能漏掉「刚建还没进索引」的文件，标 index_maybe_stale",
+        "想确保不漏可点「深搜」强制遍历"
+      ]
+    }
+  ]
+}

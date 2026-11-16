@@ -1047,6 +1047,9 @@ impl App {
                         // 索引快照可能不含刚建的文件：状态栏如实标注，别让用户误以为搜全了
                         let suffix = if index::incomplete_dirs() {
                             "索引（部分目录未同步）"
+                        } else if index::usn_trusted() {
+                            // USN 增量已把「关机期间的变化」补齐：结论可信，不必再兜底
+                            "索引 · 变更已同步"
                         } else if index::maybe_stale(age) {
                             "索引快照（可能不含新建文件）"
                         } else {

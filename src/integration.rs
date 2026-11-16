@@ -695,23 +695,96 @@ pub fn set_highlights_enabled(on: bool) -> std::io::Result<()> {
     write_dword(SEARCH_SETTINGS_SUBKEY, HIGHLIGHTS_VALUE, if on { 1 } else { 0 })
 }
 
-pub fn autostart_enabled() -> bool {
+/// 计划任务名：登录时以最高权限启动。用计划任务而不是 HKCU\Run，
+/// 是因为读 NTFS USN 变更日志需要管理员权限（增量索引的前提）。
+const TASK_NAME: &str = "RustSeek";
+
+fn run_quiet(cmd: &str, args: &[String]) -> std::io::Result<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    /// CREATE_NO_WINDOW：别让 schtasks 的黑色控制台闪一下
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new(cmd)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+}
+
+fn task_exists() -> bool {
+    run_quiet(
+        "schtasks",
+        &["/Query".to_string(), "/TN".to_string(), TASK_NAME.to_string()],
+    )
+    .map(|o| o.status.success())
+    .unwrap_or(false)
+}
+
+fn legacy_run_present() -> bool {
     RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey(RUN_SUBKEY)
         .and_then(|k| k.get_value::<String, _>(RUN_VALUE))
         .is_ok()
 }
 
-pub fn set_autostart(on: bool) -> std::io::Result<()> {
-    let key = RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags(RUN_SUBKEY, KEY_SET_VALUE | KEY_QUERY_VALUE)?;
-    if on {
-        let exe = std::env::current_exe()?;
-        key.set_value(RUN_VALUE, &format!("\"{}\" --hidden", exe.display()))?;
-    } else {
+fn remove_legacy_run() {
+    if let Ok(key) =
+        RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_SUBKEY, KEY_SET_VALUE | KEY_QUERY_VALUE)
+    {
         let _ = key.delete_value(RUN_VALUE);
     }
-    Ok(())
+}
+
+pub fn autostart_enabled() -> bool {
+    // 计划任务优先；老版本写在 HKCU\Run 里的也认（升级后第一次显示仍勾选）
+    task_exists() || legacy_run_present()
+}
+
+pub fn set_autostart(on: bool) -> std::io::Result<()> {
+    if on {
+        let exe = std::env::current_exe()?;
+        let out = run_quiet(
+            "schtasks",
+            &[
+                "/Create".to_string(),
+                "/TN".to_string(),
+                TASK_NAME.to_string(),
+                "/TR".to_string(),
+                format!("\"{}\" --hidden", exe.display()),
+                "/SC".to_string(),
+                "ONLOGON".to_string(),
+                "/RL".to_string(),
+                "HIGHEST".to_string(),
+                "/F".to_string(),
+            ],
+        )?;
+        if !out.status.success() {
+            let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let msg = if msg.is_empty() {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            } else {
+                msg
+            };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                if msg.is_empty() { "schtasks 创建任务失败".to_string() } else { msg },
+            ));
+        }
+        // 旧的 HKCU\Run 条目必须清掉：否则登录时会先起一个普通权限实例，
+        // 单实例互斥让它占位，计划任务的管理员实例反而起不来。
+        remove_legacy_run();
+        Ok(())
+    } else {
+        let _ = run_quiet(
+            "schtasks",
+            &[
+                "/Delete".to_string(),
+                "/TN".to_string(),
+                TASK_NAME.to_string(),
+                "/F".to_string(),
+            ],
+        );
+        remove_legacy_run();
+        Ok(())
+    }
 }
 
 /// 当前任务栏搜索框是否被隐藏（SearchboxTaskbarMode == 0）。
