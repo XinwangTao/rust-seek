@@ -78,102 +78,110 @@ struct HistoryFile {
 
 // ---------- Win32 声明（沿用 integration.rs 的手写 extern 风格，不新增依赖） ----------
 
-type Hwnd = isize;
-type Hglobal = isize;
+#[cfg(windows)]
+mod win32 {
+    use super::*;
 
-#[repr(C)]
-struct WndClassExW {
-    cb_size: u32,
-    style: u32,
-    lpfn_wnd_proc: Option<extern "system" fn(Hwnd, u32, usize, isize) -> isize>,
-    cb_cls_extra: i32,
-    cb_wnd_extra: i32,
-    h_instance: isize,
-    h_icon: isize,
-    h_cursor: isize,
-    hbr_background: isize,
-    lpsz_menu_name: *const u16,
-    lpsz_class_name: *const u16,
-    h_icon_sm: isize,
-}
+    type Hwnd = isize;
+    type Hglobal = isize;
 
-#[repr(C)]
-struct Msg {
-    hwnd: Hwnd,
-    message: u32,
-    w_param: usize,
-    l_param: isize,
-    time: u32,
-    pt_x: i32,
-    pt_y: i32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct BitmapInfoHeader {
-    bi_size: u32,
-    bi_width: i32,
-    bi_height: i32,
-    bi_planes: u16,
-    bi_bit_count: u16,
-    bi_compression: u32,
-    bi_size_image: u32,
-    bi_x_pels_per_meter: i32,
-    bi_y_pels_per_meter: i32,
-    bi_clr_used: u32,
-    bi_clr_important: u32,
-}
-
-extern "system" {
-    fn RegisterClassExW(class: *const WndClassExW) -> u16;
-    fn CreateWindowExW(
-        ex_style: u32,
-        class_name: *const u16,
-        window_name: *const u16,
+    #[repr(C)]
+    struct WndClassExW {
+        cb_size: u32,
         style: u32,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
-        parent: Hwnd,
-        menu: isize,
-        instance: isize,
-        param: *mut core::ffi::c_void,
-    ) -> Hwnd;
-    fn DefWindowProcW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize;
-    fn GetModuleHandleW(name: *const u16) -> isize;
-    fn AddClipboardFormatListener(hwnd: Hwnd) -> i32;
-    fn GetMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32) -> i32;
-    fn TranslateMessage(msg: *const Msg) -> i32;
-    fn DispatchMessageW(msg: *const Msg) -> isize;
+        lpfn_wnd_proc: Option<extern "system" fn(Hwnd, u32, usize, isize) -> isize>,
+        cb_cls_extra: i32,
+        cb_wnd_extra: i32,
+        h_instance: isize,
+        h_icon: isize,
+        h_cursor: isize,
+        hbr_background: isize,
+        lpsz_menu_name: *const u16,
+        lpsz_class_name: *const u16,
+        h_icon_sm: isize,
+    }
 
-    fn OpenClipboard(hwnd: Hwnd) -> i32;
-    fn CloseClipboard() -> i32;
-    fn EmptyClipboard() -> i32;
-    fn GetClipboardData(format: u32) -> isize;
-    fn SetClipboardData(format: u32, data: Hglobal) -> isize;
-    fn IsClipboardFormatAvailable(format: u32) -> i32;
+    #[repr(C)]
+    struct Msg {
+        hwnd: Hwnd,
+        message: u32,
+        w_param: usize,
+        l_param: isize,
+        time: u32,
+        pt_x: i32,
+        pt_y: i32,
+    }
 
-    fn GlobalAlloc(flags: u32, bytes: usize) -> Hglobal;
-    fn GlobalFree(handle: Hglobal) -> Hglobal;
-    fn GlobalLock(handle: Hglobal) -> *mut core::ffi::c_void;
-    fn GlobalUnlock(handle: Hglobal) -> i32;
-    fn GlobalSize(handle: Hglobal) -> usize;
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct BitmapInfoHeader {
+        bi_size: u32,
+        bi_width: i32,
+        bi_height: i32,
+        bi_planes: u16,
+        bi_bit_count: u16,
+        bi_compression: u32,
+        bi_size_image: u32,
+        bi_x_pels_per_meter: i32,
+        bi_y_pels_per_meter: i32,
+        bi_clr_used: u32,
+        bi_clr_important: u32,
+    }
+
+    extern "system" {
+        fn RegisterClassExW(class: *const WndClassExW) -> u16;
+        fn CreateWindowExW(
+            ex_style: u32,
+            class_name: *const u16,
+            window_name: *const u16,
+            style: u32,
+            x: i32,
+            y: i32,
+            w: i32,
+            h: i32,
+            parent: Hwnd,
+            menu: isize,
+            instance: isize,
+            param: *mut core::ffi::c_void,
+        ) -> Hwnd;
+        fn DefWindowProcW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize;
+        fn GetModuleHandleW(name: *const u16) -> isize;
+        fn AddClipboardFormatListener(hwnd: Hwnd) -> i32;
+        fn GetMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32) -> i32;
+        fn TranslateMessage(msg: *const Msg) -> i32;
+        fn DispatchMessageW(msg: *const Msg) -> isize;
+
+        fn OpenClipboard(hwnd: Hwnd) -> i32;
+        fn CloseClipboard() -> i32;
+        fn EmptyClipboard() -> i32;
+        fn GetClipboardData(format: u32) -> isize;
+        fn SetClipboardData(format: u32, data: Hglobal) -> isize;
+        fn IsClipboardFormatAvailable(format: u32) -> i32;
+
+        fn GlobalAlloc(flags: u32, bytes: usize) -> Hglobal;
+        fn GlobalFree(handle: Hglobal) -> Hglobal;
+        fn GlobalLock(handle: Hglobal) -> *mut core::ffi::c_void;
+        fn GlobalUnlock(handle: Hglobal) -> i32;
+        fn GlobalSize(handle: Hglobal) -> usize;
+    }
+
+    const CF_DIB: u32 = 8;
+    const CF_UNICODETEXT: u32 = 13;
+    const CF_DIBV5: u32 = 17;
+    const GMEM_MOVEABLE: u32 = 0x0002;
+    const WM_CLIPBOARDUPDATE: u32 = 0x031D;
+    /// `HWND_MESSAGE`（-3）：仅消息窗口，不出现在桌面/任务栏
+    const HWND_MESSAGE: isize = -3;
+    const BI_RGB: u32 = 0;
+    const BI_BITFIELDS: u32 = 3;
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
 }
 
-const CF_DIB: u32 = 8;
-const CF_UNICODETEXT: u32 = 13;
-const CF_DIBV5: u32 = 17;
-const GMEM_MOVEABLE: u32 = 0x0002;
-const WM_CLIPBOARDUPDATE: u32 = 0x031D;
-/// `HWND_MESSAGE`（-3）：仅消息窗口，不出现在桌面/任务栏
-const HWND_MESSAGE: isize = -3;
-const BI_RGB: u32 = 0;
-const BI_BITFIELDS: u32 = 3;
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+#[cfg(windows)]
+use win32::*;
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut h = DefaultHasher::new();
@@ -183,251 +191,282 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 
 // ---------- 剪贴板读写 ----------
 
-enum RawClip {
-    Text(String),
-    Image { rgba: Vec<u8>, width: u32, height: u32 },
-}
+#[cfg(windows)]
+mod platform {
+    use super::win32::*;
+    use super::*;
 
-/// 打开剪贴板：别的程序可能瞬间占用，最多重试 10 次。
-fn open_clipboard() -> bool {
-    for _ in 0..10 {
-        if unsafe { OpenClipboard(0) } != 0 {
-            return true;
+    enum RawClip {
+        Text(String),
+        Image {
+            rgba: Vec<u8>,
+            width: u32,
+            height: u32,
+        },
+    }
+
+    /// 打开剪贴板：别的程序可能瞬间占用，最多重试 10 次。
+    fn open_clipboard() -> bool {
+        for _ in 0..10 {
+            if unsafe { OpenClipboard(0) } != 0 {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(15));
         }
-        thread::sleep(Duration::from_millis(15));
+        false
     }
-    false
-}
 
-fn read_clipboard() -> Option<RawClip> {
-    if !open_clipboard() {
-        return None;
+    fn read_clipboard() -> Option<RawClip> {
+        if !open_clipboard() {
+            return None;
+        }
+        let out = unsafe { read_clipboard_locked() };
+        unsafe {
+            CloseClipboard();
+        }
+        out
     }
-    let out = unsafe { read_clipboard_locked() };
-    unsafe {
-        CloseClipboard();
-    }
-    out
-}
 
-unsafe fn read_clipboard_locked() -> Option<RawClip> {
-    if IsClipboardFormatAvailable(CF_UNICODETEXT) != 0 {
-        let h = GetClipboardData(CF_UNICODETEXT);
-        if h != 0 {
-            if let Some(text) = read_unicode_text(h) {
-                return Some(RawClip::Text(text));
+    unsafe fn read_clipboard_locked() -> Option<RawClip> {
+        if IsClipboardFormatAvailable(CF_UNICODETEXT) != 0 {
+            let h = GetClipboardData(CF_UNICODETEXT);
+            if h != 0 {
+                if let Some(text) = read_unicode_text(h) {
+                    return Some(RawClip::Text(text));
+                }
             }
         }
+        for format in [CF_DIB, CF_DIBV5] {
+            if IsClipboardFormatAvailable(format) == 0 {
+                continue;
+            }
+            let h = GetClipboardData(format);
+            if h == 0 {
+                continue;
+            }
+            let ptr = GlobalLock(h);
+            if ptr.is_null() {
+                continue;
+            }
+            let got = dib_to_rgba(ptr as *const u8, GlobalSize(h));
+            GlobalUnlock(h);
+            if let Some((rgba, width, height)) = got {
+                return Some(RawClip::Image {
+                    rgba,
+                    width,
+                    height,
+                });
+            }
+        }
+        None
     }
-    for format in [CF_DIB, CF_DIBV5] {
-        if IsClipboardFormatAvailable(format) == 0 {
-            continue;
-        }
-        let h = GetClipboardData(format);
-        if h == 0 {
-            continue;
-        }
-        let ptr = GlobalLock(h);
+
+    unsafe fn read_unicode_text(handle: Hglobal) -> Option<String> {
+        let ptr = GlobalLock(handle);
         if ptr.is_null() {
-            continue;
-        }
-        let got = dib_to_rgba(ptr as *const u8, GlobalSize(h));
-        GlobalUnlock(h);
-        if let Some((rgba, width, height)) = got {
-            return Some(RawClip::Image { rgba, width, height });
-        }
-    }
-    None
-}
-
-unsafe fn read_unicode_text(handle: Hglobal) -> Option<String> {
-    let ptr = GlobalLock(handle);
-    if ptr.is_null() {
-        return None;
-    }
-    let len_u16 = GlobalSize(handle) / 2;
-    let slice = std::slice::from_raw_parts(ptr as *const u16, len_u16);
-    let end = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
-    let text = String::from_utf16_lossy(&slice[..end]);
-    GlobalUnlock(handle);
-    if text.is_empty() || text.len() > MAX_TEXT_BYTES {
-        return None;
-    }
-    Some(text)
-}
-
-/// CF_DIB / CF_DIBV5 → RGBA（只支持 24/32 位 BI_RGB / BI_BITFIELDS，够覆盖截图与常见绘图软件）
-unsafe fn dib_to_rgba(ptr: *const u8, len: usize) -> Option<(Vec<u8>, u32, u32)> {
-    if ptr.is_null() || len < 40 {
-        return None;
-    }
-    let hdr = std::ptr::read_unaligned(ptr as *const BitmapInfoHeader);
-    if hdr.bi_size < 40 || hdr.bi_width <= 0 || hdr.bi_height == 0 {
-        return None;
-    }
-    let bpp = hdr.bi_bit_count;
-    if !((bpp == 24 || bpp == 32) && (hdr.bi_compression == BI_RGB || hdr.bi_compression == BI_BITFIELDS)) {
-        return None;
-    }
-    let w = hdr.bi_width as u32;
-    let h = hdr.bi_height.unsigned_abs();
-    if w == 0 || h == 0 || (w as u64) * (h as u64) > MAX_IMAGE_PIXELS {
-        return None;
-    }
-    let top_down = hdr.bi_height < 0;
-    let bytes_pp = (bpp / 8) as usize;
-    let stride = ((w as usize * bytes_pp + 3) / 4) * 4;
-    let mut offset = hdr.bi_size as usize;
-    // 40 字节 BITMAPINFOHEADER + BI_BITFIELDS：3 个 DWORD 颜色掩码紧跟在头后面，
-    // 像素起点是 bi_size + 12。掩码不是标准 0x00RRGGBB 布局时直接跳过——
-    // 宁可不记录这张图，也不要静默存一张错位/错色的图。
-    if hdr.bi_compression == BI_BITFIELDS && offset < 52 {
-        if len < offset + 12 {
             return None;
         }
-        let m = ptr.add(offset) as *const u32;
-        let masks = (
-            std::ptr::read_unaligned(m),
-            std::ptr::read_unaligned(m.add(1)),
-            std::ptr::read_unaligned(m.add(2)),
-        );
-        if masks != (0x00FF_0000, 0x0000_FF00, 0x0000_00FF) {
+        let len_u16 = GlobalSize(handle) / 2;
+        let slice = std::slice::from_raw_parts(ptr as *const u16, len_u16);
+        let end = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+        let text = String::from_utf16_lossy(&slice[..end]);
+        GlobalUnlock(handle);
+        if text.is_empty() || text.len() > MAX_TEXT_BYTES {
             return None;
         }
-        offset += 12;
+        Some(text)
     }
-    if offset + stride * h as usize > len {
-        return None;
-    }
-    let mut rgba = vec![0u8; w as usize * h as usize * 4];
-    for y in 0..h as usize {
-        let src_y = if top_down { y } else { h as usize - 1 - y };
-        let src = ptr.add(offset + src_y * stride);
-        for x in 0..w as usize {
-            let s = src.add(x * bytes_pp);
-            let b = *s;
-            let g = *s.add(1);
-            let r = *s.add(2);
-            let a = if bytes_pp == 4 { *s.add(3) } else { 255 };
-            let d = (y * w as usize + x) * 4;
-            rgba[d] = r;
-            rgba[d + 1] = g;
-            rgba[d + 2] = b;
-            rgba[d + 3] = a;
+
+    /// CF_DIB / CF_DIBV5 → RGBA（只支持 24/32 位 BI_RGB / BI_BITFIELDS，够覆盖截图与常见绘图软件）
+    unsafe fn dib_to_rgba(ptr: *const u8, len: usize) -> Option<(Vec<u8>, u32, u32)> {
+        if ptr.is_null() || len < 40 {
+            return None;
         }
-    }
-    // 32 位 DIB 的 alpha 通道经常全 0（不透明语义），统一按不透明处理
-    if bytes_pp == 4 && rgba.chunks_exact(4).all(|p| p[3] == 0) {
-        for p in rgba.chunks_exact_mut(4) {
-            p[3] = 255;
+        let hdr = std::ptr::read_unaligned(ptr as *const BitmapInfoHeader);
+        if hdr.bi_size < 40 || hdr.bi_width <= 0 || hdr.bi_height == 0 {
+            return None;
         }
+        let bpp = hdr.bi_bit_count;
+        if !((bpp == 24 || bpp == 32)
+            && (hdr.bi_compression == BI_RGB || hdr.bi_compression == BI_BITFIELDS))
+        {
+            return None;
+        }
+        let w = hdr.bi_width as u32;
+        let h = hdr.bi_height.unsigned_abs();
+        if w == 0 || h == 0 || (w as u64) * (h as u64) > MAX_IMAGE_PIXELS {
+            return None;
+        }
+        let top_down = hdr.bi_height < 0;
+        let bytes_pp = (bpp / 8) as usize;
+        let stride = ((w as usize * bytes_pp + 3) / 4) * 4;
+        let mut offset = hdr.bi_size as usize;
+        // 40 字节 BITMAPINFOHEADER + BI_BITFIELDS：3 个 DWORD 颜色掩码紧跟在头后面，
+        // 像素起点是 bi_size + 12。掩码不是标准 0x00RRGGBB 布局时直接跳过——
+        // 宁可不记录这张图，也不要静默存一张错位/错色的图。
+        if hdr.bi_compression == BI_BITFIELDS && offset < 52 {
+            if len < offset + 12 {
+                return None;
+            }
+            let m = ptr.add(offset) as *const u32;
+            let masks = (
+                std::ptr::read_unaligned(m),
+                std::ptr::read_unaligned(m.add(1)),
+                std::ptr::read_unaligned(m.add(2)),
+            );
+            if masks != (0x00FF_0000, 0x0000_FF00, 0x0000_00FF) {
+                return None;
+            }
+            offset += 12;
+        }
+        if offset + stride * h as usize > len {
+            return None;
+        }
+        let mut rgba = vec![0u8; w as usize * h as usize * 4];
+        for y in 0..h as usize {
+            let src_y = if top_down { y } else { h as usize - 1 - y };
+            let src = ptr.add(offset + src_y * stride);
+            for x in 0..w as usize {
+                let s = src.add(x * bytes_pp);
+                let b = *s;
+                let g = *s.add(1);
+                let r = *s.add(2);
+                let a = if bytes_pp == 4 { *s.add(3) } else { 255 };
+                let d = (y * w as usize + x) * 4;
+                rgba[d] = r;
+                rgba[d + 1] = g;
+                rgba[d + 2] = b;
+                rgba[d + 3] = a;
+            }
+        }
+        // 32 位 DIB 的 alpha 通道经常全 0（不透明语义），统一按不透明处理
+        if bytes_pp == 4 && rgba.chunks_exact(4).all(|p| p[3] == 0) {
+            for p in rgba.chunks_exact_mut(4) {
+                p[3] = 255;
+            }
+        }
+        Some((rgba, w, h))
     }
-    Some((rgba, w, h))
+
+    /// 把文本写回系统剪贴板（不自动粘贴）。
+    pub fn set_clipboard_text(text: &str) -> Result<(), String> {
+        let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let bytes = utf16.len() * 2;
+        unsafe {
+            if !take_clipboard()? {
+                return Err("剪贴板被其他程序占用".into());
+            }
+            let h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+            if h == 0 {
+                CloseClipboard();
+                return Err("内存分配失败".into());
+            }
+            let p = GlobalLock(h);
+            if p.is_null() {
+                GlobalFree(h);
+                CloseClipboard();
+                return Err("内存锁定失败".into());
+            }
+            std::ptr::copy_nonoverlapping(utf16.as_ptr(), p as *mut u16, utf16.len());
+            GlobalUnlock(h);
+            if SetClipboardData(CF_UNICODETEXT, h) == 0 {
+                GlobalFree(h);
+                CloseClipboard();
+                return Err("写入剪贴板失败".into());
+            }
+            CloseClipboard();
+        }
+        Ok(())
+    }
+
+    /// 把 RGBA 位图写回系统剪贴板（CF_DIB，32 位自底向上）。
+    pub fn set_clipboard_image(rgba: &[u8], width: u32, height: u32) -> Result<(), String> {
+        if width == 0 || height == 0 || rgba.len() < (width as usize * height as usize * 4) {
+            return Err("图片数据无效".into());
+        }
+        let pixel_bytes = width as usize * height as usize * 4;
+        let total = 40 + pixel_bytes;
+        let mut buf = vec![0u8; total];
+        let hdr = BitmapInfoHeader {
+            bi_size: 40,
+            bi_width: width as i32,
+            bi_height: height as i32, // 正数 = 自底向上
+            bi_planes: 1,
+            bi_bit_count: 32,
+            bi_compression: BI_RGB,
+            bi_size_image: pixel_bytes as u32,
+            bi_x_pels_per_meter: 0,
+            bi_y_pels_per_meter: 0,
+            bi_clr_used: 0,
+            bi_clr_important: 0,
+        };
+        unsafe {
+            std::ptr::write_unaligned(buf.as_mut_ptr() as *mut BitmapInfoHeader, hdr);
+        }
+        for y in 0..height as usize {
+            let src_y = height as usize - 1 - y; // DIB 自底向上
+            for x in 0..width as usize {
+                let s = (src_y * width as usize + x) * 4;
+                let d = 40 + (y * width as usize + x) * 4;
+                buf[d] = rgba[s + 2]; // B
+                buf[d + 1] = rgba[s + 1]; // G
+                buf[d + 2] = rgba[s]; // R
+                buf[d + 3] = 255;
+            }
+        }
+        unsafe {
+            if !take_clipboard()? {
+                return Err("剪贴板被其他程序占用".into());
+            }
+            let h = GlobalAlloc(GMEM_MOVEABLE, total);
+            if h == 0 {
+                CloseClipboard();
+                return Err("内存分配失败".into());
+            }
+            let p = GlobalLock(h);
+            if p.is_null() {
+                GlobalFree(h);
+                CloseClipboard();
+                return Err("内存锁定失败".into());
+            }
+            std::ptr::copy_nonoverlapping(buf.as_ptr(), p as *mut u8, total);
+            GlobalUnlock(h);
+            if SetClipboardData(CF_DIB, h) == 0 {
+                GlobalFree(h);
+                CloseClipboard();
+                return Err("写入剪贴板失败".into());
+            }
+            CloseClipboard();
+        }
+        Ok(())
+    }
+
+    /// 打开并清空剪贴板；调用方负责 CloseClipboard（成功时）。
+    unsafe fn take_clipboard() -> Result<bool, String> {
+        if !open_clipboard() {
+            return Ok(false);
+        }
+        if EmptyClipboard() == 0 {
+            CloseClipboard();
+            return Err("清空剪贴板失败".into());
+        }
+        Ok(true)
+    }
 }
 
-/// 把文本写回系统剪贴板（不自动粘贴）。
-pub fn set_clipboard_text(text: &str) -> Result<(), String> {
-    let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let bytes = utf16.len() * 2;
-    unsafe {
-        if !take_clipboard()? {
-            return Err("剪贴板被其他程序占用".into());
-        }
-        let h = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if h == 0 {
-            CloseClipboard();
-            return Err("内存分配失败".into());
-        }
-        let p = GlobalLock(h);
-        if p.is_null() {
-            GlobalFree(h);
-            CloseClipboard();
-            return Err("内存锁定失败".into());
-        }
-        std::ptr::copy_nonoverlapping(utf16.as_ptr(), p as *mut u16, utf16.len());
-        GlobalUnlock(h);
-        if SetClipboardData(CF_UNICODETEXT, h) == 0 {
-            GlobalFree(h);
-            CloseClipboard();
-            return Err("写入剪贴板失败".into());
-        }
-        CloseClipboard();
-    }
-    Ok(())
+#[cfg(windows)]
+use platform::{read_clipboard, RawClip};
+#[cfg(windows)]
+pub use platform::{set_clipboard_image, set_clipboard_text};
+
+#[cfg(not(windows))]
+pub fn set_clipboard_text(_text: &str) -> Result<(), String> {
+    Err("当前 Mac 版本暂未启用剪贴板回填".into())
 }
 
-/// 把 RGBA 位图写回系统剪贴板（CF_DIB，32 位自底向上）。
-pub fn set_clipboard_image(rgba: &[u8], width: u32, height: u32) -> Result<(), String> {
-    if width == 0 || height == 0 || rgba.len() < (width as usize * height as usize * 4) {
-        return Err("图片数据无效".into());
-    }
-    let pixel_bytes = width as usize * height as usize * 4;
-    let total = 40 + pixel_bytes;
-    let mut buf = vec![0u8; total];
-    let hdr = BitmapInfoHeader {
-        bi_size: 40,
-        bi_width: width as i32,
-        bi_height: height as i32, // 正数 = 自底向上
-        bi_planes: 1,
-        bi_bit_count: 32,
-        bi_compression: BI_RGB,
-        bi_size_image: pixel_bytes as u32,
-        bi_x_pels_per_meter: 0,
-        bi_y_pels_per_meter: 0,
-        bi_clr_used: 0,
-        bi_clr_important: 0,
-    };
-    unsafe {
-        std::ptr::write_unaligned(buf.as_mut_ptr() as *mut BitmapInfoHeader, hdr);
-    }
-    for y in 0..height as usize {
-        let src_y = height as usize - 1 - y; // DIB 自底向上
-        for x in 0..width as usize {
-            let s = (src_y * width as usize + x) * 4;
-            let d = 40 + (y * width as usize + x) * 4;
-            buf[d] = rgba[s + 2]; // B
-            buf[d + 1] = rgba[s + 1]; // G
-            buf[d + 2] = rgba[s]; // R
-            buf[d + 3] = 255;
-        }
-    }
-    unsafe {
-        if !take_clipboard()? {
-            return Err("剪贴板被其他程序占用".into());
-        }
-        let h = GlobalAlloc(GMEM_MOVEABLE, total);
-        if h == 0 {
-            CloseClipboard();
-            return Err("内存分配失败".into());
-        }
-        let p = GlobalLock(h);
-        if p.is_null() {
-            GlobalFree(h);
-            CloseClipboard();
-            return Err("内存锁定失败".into());
-        }
-        std::ptr::copy_nonoverlapping(buf.as_ptr(), p as *mut u8, total);
-        GlobalUnlock(h);
-        if SetClipboardData(CF_DIB, h) == 0 {
-            GlobalFree(h);
-            CloseClipboard();
-            return Err("写入剪贴板失败".into());
-        }
-        CloseClipboard();
-    }
-    Ok(())
-}
-
-/// 打开并清空剪贴板；调用方负责 CloseClipboard（成功时）。
-unsafe fn take_clipboard() -> Result<bool, String> {
-    if !open_clipboard() {
-        return Ok(false);
-    }
-    if EmptyClipboard() == 0 {
-        CloseClipboard();
-        return Err("清空剪贴板失败".into());
-    }
-    Ok(true)
+#[cfg(not(windows))]
+pub fn set_clipboard_image(_rgba: &[u8], _width: u32, _height: u32) -> Result<(), String> {
+    Err("当前 Mac 版本暂未启用剪贴板回填".into())
 }
 
 // ---------- 历史存储 ----------
@@ -448,7 +487,11 @@ impl Store {
             .map(|f| f.entries)
             .unwrap_or_default();
         let next_id = entries.iter().map(|e| e.id + 1).max().unwrap_or(1);
-        let mut store = Self { dir, entries, next_id: next_id.max(1) };
+        let mut store = Self {
+            dir,
+            entries,
+            next_id: next_id.max(1),
+        };
         store.enforce_caps();
         store
     }
@@ -458,8 +501,13 @@ impl Store {
     }
 
     fn save(&self) {
-        let file = HistoryFile { version: HISTORY_VERSION, entries: self.entries.clone() };
-        let Ok(json) = serde_json::to_string(&file) else { return };
+        let file = HistoryFile {
+            version: HISTORY_VERSION,
+            entries: self.entries.clone(),
+        };
+        let Ok(json) = serde_json::to_string(&file) else {
+            return;
+        };
         let path = self.dir.join("history.json");
         let tmp = self.dir.join("history.json.tmp");
         let _ = std::fs::create_dir_all(&self.dir);
@@ -478,7 +526,13 @@ impl Store {
                     (ClipKind::Text, Some(t)) => {
                         let one_line: String = t
                             .chars()
-                            .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+                            .map(|c| {
+                                if c == '\n' || c == '\r' || c == '\t' {
+                                    ' '
+                                } else {
+                                    c
+                                }
+                            })
                             .take(160)
                             .collect();
                         one_line.trim().to_string()
@@ -514,7 +568,11 @@ impl Store {
         let now = chrono::Local::now().timestamp();
         // 已存在同内容：复用条目提到最前
         let mut existing: Option<ClipEntry> = None;
-        if let Some(pos) = self.entries.iter().position(|e| e.kind == ClipKind::Text && e.hash == hash) {
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|e| e.kind == ClipKind::Text && e.hash == hash)
+        {
             if pos == 0 {
                 // 已经在最前：只刷新时间戳。这里不能 save()——剪贴板同步工具会反复
                 // 重发同一段内容，每次全量重写 history.json 既无意义又卡 UI。
@@ -523,7 +581,10 @@ impl Store {
             }
             existing = Some(self.entries.remove(pos));
         }
-        let id = existing.as_ref().map(|e| e.id).unwrap_or_else(|| self.alloc_id());
+        let id = existing
+            .as_ref()
+            .map(|e| e.id)
+            .unwrap_or_else(|| self.alloc_id());
         let entry = ClipEntry {
             id,
             kind: ClipKind::Text,
@@ -641,7 +702,9 @@ fn write_png(path: &Path, rgba: &[u8], width: u32, height: u32) -> std::io::Resu
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
     let mut writer = enc.write_header().map_err(std::io::Error::other)?;
-    writer.write_image_data(rgba).map_err(std::io::Error::other)?;
+    writer
+        .write_image_data(rgba)
+        .map_err(std::io::Error::other)?;
     Ok(())
 }
 
@@ -675,14 +738,18 @@ pub fn load_png_rgba(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
 // ---------- 监听线程 ----------
 
 /// 消息线程 → 工作线程的信号通道（wndproc 是裸函数指针，没有闭包状态）
+#[cfg(windows)]
 static SIGNAL: OnceLock<Mutex<Sender<()>>> = OnceLock::new();
 
 pub struct Listener {
     pub rx: Receiver<()>,
     pub store: Arc<Mutex<Store>>,
+    /// 非 Windows 降级监听不生产线程，保留发送端避免接收端立即断开。
+    _notify_tx: Option<Sender<()>>,
 }
 
 /// 启动剪贴板监听：隐藏消息窗收通知，工作线程读剪贴板并落盘。
+#[cfg(windows)]
 pub fn spawn(dir: PathBuf, paused: Arc<AtomicBool>) -> Listener {
     let store = Arc::new(Mutex::new(Store::open(dir)));
     let (notify_tx, notify_rx) = mpsc::channel();
@@ -692,50 +759,48 @@ pub fn spawn(dir: PathBuf, paused: Arc<AtomicBool>) -> Listener {
     // 隐藏消息窗：只负责接收 WM_CLIPBOARDUPDATE
     thread::Builder::new()
         .name("clipboard-listener".into())
-        .spawn(|| {
-            unsafe {
-                let class_name = wide("RustSeekClipboardListener");
-                let instance = GetModuleHandleW(std::ptr::null());
-                let class = WndClassExW {
-                    cb_size: std::mem::size_of::<WndClassExW>() as u32,
-                    style: 0,
-                    lpfn_wnd_proc: Some(wndproc),
-                    cb_cls_extra: 0,
-                    cb_wnd_extra: 0,
-                    h_instance: instance,
-                    h_icon: 0,
-                    h_cursor: 0,
-                    hbr_background: 0,
-                    lpsz_menu_name: std::ptr::null(),
-                    lpsz_class_name: class_name.as_ptr(),
-                    h_icon_sm: 0,
-                };
-                if RegisterClassExW(&class) == 0 {
-                    return;
-                }
-                let title = wide("");
-                let hwnd = CreateWindowExW(
-                    0,
-                    class_name.as_ptr(),
-                    title.as_ptr(),
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    HWND_MESSAGE,
-                    0,
-                    instance,
-                    std::ptr::null_mut(),
-                );
-                if hwnd == 0 || AddClipboardFormatListener(hwnd) == 0 {
-                    return;
-                }
-                let mut msg = std::mem::zeroed::<Msg>();
-                while GetMessageW(&mut msg, 0, 0, 0) > 0 {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
+        .spawn(|| unsafe {
+            let class_name = wide("RustSeekClipboardListener");
+            let instance = GetModuleHandleW(std::ptr::null());
+            let class = WndClassExW {
+                cb_size: std::mem::size_of::<WndClassExW>() as u32,
+                style: 0,
+                lpfn_wnd_proc: Some(wndproc),
+                cb_cls_extra: 0,
+                cb_wnd_extra: 0,
+                h_instance: instance,
+                h_icon: 0,
+                h_cursor: 0,
+                hbr_background: 0,
+                lpsz_menu_name: std::ptr::null(),
+                lpsz_class_name: class_name.as_ptr(),
+                h_icon_sm: 0,
+            };
+            if RegisterClassExW(&class) == 0 {
+                return;
+            }
+            let title = wide("");
+            let hwnd = CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                title.as_ptr(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                0,
+                instance,
+                std::ptr::null_mut(),
+            );
+            if hwnd == 0 || AddClipboardFormatListener(hwnd) == 0 {
+                return;
+            }
+            let mut msg = std::mem::zeroed::<Msg>();
+            while GetMessageW(&mut msg, 0, 0, 0) > 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
             }
         })
         .ok();
@@ -755,8 +820,15 @@ pub fn spawn(dir: PathBuf, paused: Arc<AtomicBool>) -> Listener {
                     continue;
                 }
                 let changed = match read_clipboard() {
-                    Some(RawClip::Text(t)) => worker_store.lock().map(|mut s| s.add_text(t)).unwrap_or(false),
-                    Some(RawClip::Image { rgba, width, height }) => worker_store
+                    Some(RawClip::Text(t)) => worker_store
+                        .lock()
+                        .map(|mut s| s.add_text(t))
+                        .unwrap_or(false),
+                    Some(RawClip::Image {
+                        rgba,
+                        width,
+                        height,
+                    }) => worker_store
                         .lock()
                         .map(|mut s| s.add_image(&rgba, width, height))
                         .unwrap_or(false),
@@ -769,9 +841,26 @@ pub fn spawn(dir: PathBuf, paused: Arc<AtomicBool>) -> Listener {
         })
         .ok();
 
-    Listener { rx: notify_rx, store }
+    Listener {
+        rx: notify_rx,
+        store,
+        _notify_tx: None,
+    }
 }
 
+/// 保留历史文件读取与面板接口，但不在非 Windows 平台启动 Win32 监听。
+#[cfg(not(windows))]
+pub fn spawn(dir: PathBuf, _paused: Arc<AtomicBool>) -> Listener {
+    let store = Arc::new(Mutex::new(Store::open(dir)));
+    let (notify_tx, notify_rx) = mpsc::channel();
+    Listener {
+        rx: notify_rx,
+        store,
+        _notify_tx: Some(notify_tx),
+    }
+}
+
+#[cfg(windows)]
 extern "system" fn wndproc(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize {
     if msg == WM_CLIPBOARDUPDATE {
         if let Some(sig) = SIGNAL.get() {

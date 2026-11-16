@@ -151,7 +151,8 @@ impl Drop for BuildSlot {
 /// `observed_started` 是调用方看到的时间戳：期间若已开始新构建则不复位。
 fn reset_stuck_build(observed_started: u64) -> bool {
     let _g = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if !BUILDING.load(Ordering::SeqCst) || BUILD_STARTED.load(Ordering::SeqCst) != observed_started {
+    if !BUILDING.load(Ordering::SeqCst) || BUILD_STARTED.load(Ordering::SeqCst) != observed_started
+    {
         return false;
     }
     BUILDING.store(false, Ordering::SeqCst);
@@ -302,7 +303,9 @@ pub fn query(
                             }
                         }
                         let i = cursor.fetch_add(1, Ordering::Relaxed);
-                        let Some((lo, hi)) = tasks.get(i).copied() else { break };
+                        let Some((lo, hi)) = tasks.get(i).copied() else {
+                            break;
+                        };
                         for item in &index.items[lo..hi] {
                             // 单线程也设上限：命中上万的模式（比如搜 "a"）不该把结果集撑爆
                             if local.len() >= max {
@@ -357,7 +360,13 @@ pub fn query(
     }
 
     let age_ms = now_unix().saturating_sub(index.built_unix) as u128 * 1000;
-    Some((hits, index.items.len() as u64, age_ms, truncated, index.complete))
+    Some((
+        hits,
+        index.items.len() as u64,
+        age_ms,
+        truncated,
+        index.complete,
+    ))
 }
 
 /// 只按扩展名 + 根目录取候选文件，不做名字/内容匹配。
@@ -427,7 +436,13 @@ pub fn candidates(
     }
 
     let age_ms = now_unix().saturating_sub(index.built_unix) as u128 * 1000;
-    Some((hits, index.items.len() as u64, age_ms, truncated, index.complete))
+    Some((
+        hits,
+        index.items.len() as u64,
+        age_ms,
+        truncated,
+        index.complete,
+    ))
 }
 
 fn match_item(
@@ -446,7 +461,11 @@ fn match_item(
     if !re.is_match(target) {
         return None;
     }
-    hits.push(Hit { path: index.path(item).to_string(), size: item.size, mtime: item.mtime });
+    hits.push(Hit {
+        path: index.path(item).to_string(),
+        size: item.size,
+        mtime: item.mtime,
+    });
     Some(())
 }
 
@@ -720,14 +739,22 @@ fn refresh_stamp_path() -> Option<PathBuf> {
 }
 
 fn cross_process_recent_refresh(cooldown_secs: u64) -> bool {
-    let Some(path) = refresh_stamp_path() else { return false };
-    let Ok(text) = std::fs::read_to_string(&path) else { return false };
-    let Ok(last) = text.trim().parse::<u64>() else { return false };
+    let Some(path) = refresh_stamp_path() else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(last) = text.trim().parse::<u64>() else {
+        return false;
+    };
     now_unix().saturating_sub(last) < cooldown_secs
 }
 
 fn stamp_refresh_now() {
-    let Some(path) = refresh_stamp_path() else { return };
+    let Some(path) = refresh_stamp_path() else {
+        return;
+    };
     // 多进程并发读：先写临时文件再 rename，避免读到半截数字
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     if std::fs::write(&tmp, now_unix().to_string()).is_ok() {
@@ -858,9 +885,13 @@ impl Drop for RefreshSlot {
 /// 同步做一次「目录级增量刷新」：只重新枚举 mtime 变了的子树。
 /// 返回是否真的刷成了（索引不存在或有别的线程在刷时返回 false，调用方继续用旧快照）。
 pub fn refresh_now() -> bool {
-    let Some(_slot) = RefreshSlot::acquire() else { return false };
+    let Some(_slot) = RefreshSlot::acquire() else {
+        return false;
+    };
     let mut guard = lock();
-    let Some(index) = guard.as_mut() else { return false };
+    let Some(index) = guard.as_mut() else {
+        return false;
+    };
     refresh_with(index)
 }
 
@@ -869,7 +900,9 @@ pub fn refresh_now() -> bool {
 /// 全量 stat 巡约 10s，如果持着索引锁跑，后面所有查询都会堵在那儿。
 /// 所以扫描阶段只用「目录表快照」（20MB 量级），扫完再抢锁合并。
 pub fn spawn_refresh_async() -> bool {
-    let Some(slot) = RefreshSlot::acquire() else { return false };
+    let Some(slot) = RefreshSlot::acquire() else {
+        return false;
+    };
     std::thread::spawn(move || {
         let _slot = slot;
         let snapshot = {
@@ -878,7 +911,9 @@ pub fn spawn_refresh_async() -> bool {
                 .as_ref()
                 .map(|ix| (ix.dir_blob.clone(), ix.dirs.clone()))
         };
-        let Some((dir_blob, dirs)) = snapshot else { return };
+        let Some((dir_blob, dirs)) = snapshot else {
+            return;
+        };
         // 扫盘阶段：不持锁
         let (mut dirty, stat_failed) = scan_dirty_dirs(&dir_blob, &dirs, now_unix());
         drop(dir_blob);
@@ -995,7 +1030,7 @@ pub fn start_watchers() {
     let drives = integration::local_drives();
     WATCHED_DRIVES.store(drives.len() as u64, Ordering::Relaxed);
     for d in drives {
-        let root = format!("{d}/");
+        let root = integration::drive_root(&d);
         std::thread::spawn(move || watch_volume(&root));
     }
 }
@@ -1057,7 +1092,11 @@ fn journal_append(cache_unix: u64, dirs: &[String]) {
         batch.push('\n');
     }
     use std::io::Write as _;
-    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+    {
         let _ = f.write_all(batch.as_bytes());
     }
 }
@@ -1255,7 +1294,7 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
     let started = now_unix();
     let roots: Vec<PathBuf> = integration::local_drives()
         .into_iter()
-        .map(|d| PathBuf::from(format!("{d}/")))
+        .map(|d| PathBuf::from(integration::drive_root(&d)))
         .collect();
     if roots.is_empty() {
         return false;
@@ -1345,7 +1384,10 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
     for key in &worklist {
         // 根源目录的 mtime 只能现场取一次（遍历不会回调根自己）；根的数量很少
         let mtime = dir_mtime_secs(key).unwrap_or(0);
-        fresh_dirs.lock().unwrap().push((key.as_str().into(), mtime));
+        fresh_dirs
+            .lock()
+            .unwrap()
+            .push((key.as_str().into(), mtime));
         enumerated.lock().unwrap().push(key.as_str().into());
     }
 
@@ -1354,11 +1396,18 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
         let walk_roots: Vec<PathBuf> = worklist.iter().map(PathBuf::from).collect();
         fastwalk::walk(
             &walk_roots,
-            &fastwalk::Options { include_hidden: false, threads: num_cpus::get() },
+            &fastwalk::Options {
+                include_hidden: false,
+                threads: num_cpus::get(),
+            },
             &cancel,
             |path, info| {
                 if is_pruned(path) {
-                    return if info.is_dir { Step::Skip } else { Step::Continue };
+                    return if info.is_dir {
+                        Step::Skip
+                    } else {
+                        Step::Continue
+                    };
                 }
                 if info.is_dir {
                     let key = path.to_string_lossy().replace('\\', "/");
@@ -1370,7 +1419,10 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
                         })
                         .is_ok();
                     let is_dirty = dirty_all.contains(key.as_str()) || !known;
-                    fresh_dirs.lock().unwrap().push((key.as_str().into(), mtime));
+                    fresh_dirs
+                        .lock()
+                        .unwrap()
+                        .push((key.as_str().into(), mtime));
                     if is_dirty {
                         // 脏：枚举它，并且要往下走
                         enumerated.lock().unwrap().push(key.into_boxed_str());
@@ -1574,7 +1626,11 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
             }
             let path_off = index.dir_blob.len() as u32;
             index.dir_blob.push_str(path);
-            appended_d.push(DirRec { path_off, path_len: path.len() as u32, mtime: *mtime });
+            appended_d.push(DirRec {
+                path_off,
+                path_len: path.len() as u32,
+                mtime: *mtime,
+            });
         }
 
         let dir_blob = index.dir_blob.as_str();
@@ -1623,7 +1679,8 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
             }
         }
         eprintln!(
-            "rust-seek selfcheck: item_order_violations={} dir_order_violations={}", bad, dbad
+            "rust-seek selfcheck: item_order_violations={} dir_order_violations={}",
+            bad, dbad
         );
         eprintln!(
             "rust-seek refresh: dirty={} roots={} enumerated={} fresh_files={} kept={}/{} dirs_kept={}/{} scan={}ms ranges={}ms drop={}ms merge={}ms total={}ms stat_failed={}",
@@ -1693,7 +1750,11 @@ fn dir_mtime_secs(path: &str) -> Result<u64, u32> {
 fn dir_mtime_secs(path: &str) -> Result<u64, u32> {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
-        .map(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
+        .map(|t| {
+            t.duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        })
         .map_err(|_| 0)
 }
 
@@ -1726,15 +1787,15 @@ fn scan_dirty_dirs(
                     let key = dir_path_of(dir_blob, rec);
                     match dir_mtime_secs(key) {
                         Ok(mtime) => {
-                            if mtime != rec.mtime
-                                || mtime.saturating_add(DIR_SLACK_SECS) >= started
+                            if mtime != rec.mtime || mtime.saturating_add(DIR_SLACK_SECS) >= started
                             {
                                 local.push((key.to_string(), mtime));
                             }
                         }
                         // 目录已经不在了：它的父目录 mtime 必然也变过、会被枚举到，
                         // 那里会把这条记录清掉，这里不需要也不该标成「读不到」。
-                        Err(code) if code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND => {}
+                        Err(code)
+                            if code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND => {}
                         Err(_) => failed.store(true, Ordering::Relaxed),
                     }
                 }
@@ -1745,7 +1806,10 @@ fn scan_dirty_dirs(
         }
     });
 
-    (out.into_inner().unwrap_or_default(), failed.load(Ordering::Relaxed))
+    (
+        out.into_inner().unwrap_or_default(),
+        failed.load(Ordering::Relaxed),
+    )
 }
 
 /// 把（可能重叠的）区间排序并合并。
@@ -1869,7 +1933,7 @@ fn build_with_match(
     let build_started = now_unix();
     let roots: Vec<PathBuf> = integration::local_drives()
         .into_iter()
-        .map(|d| PathBuf::from(format!("{d}/")))
+        .map(|d| PathBuf::from(integration::drive_root(&d)))
         .collect();
     if roots.is_empty() {
         return None;
@@ -1899,11 +1963,18 @@ fn build_with_match(
         let tx = tx.clone();
         fastwalk::walk(
             &roots,
-            &fastwalk::Options { include_hidden: false, threads: num_cpus::get() },
+            &fastwalk::Options {
+                include_hidden: false,
+                threads: num_cpus::get(),
+            },
             &cancel,
             |path, info| {
                 if info.depth > 0 && is_pruned(path) {
-                    return if info.is_dir { Step::Skip } else { Step::Continue };
+                    return if info.is_dir {
+                        Step::Skip
+                    } else {
+                        Step::Continue
+                    };
                 }
                 if info.is_dir {
                     let key = path.to_string_lossy().replace('\\', "/");
@@ -1918,7 +1989,8 @@ fn build_with_match(
                     return Step::Quit;
                 }
                 let path_str = path.to_string_lossy().replace('\\', "/");
-                let mtime = info.modified
+                let mtime = info
+                    .modified
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
@@ -1934,7 +2006,11 @@ fn build_with_match(
                     if ok && re.is_match(target) {
                         let mut guard = hits.lock().unwrap();
                         if guard.len() < max {
-                            guard.push(Hit { path: path_str.clone(), size: info.size, mtime });
+                            guard.push(Hit {
+                                path: path_str.clone(),
+                                size: info.size,
+                                mtime,
+                            });
                         }
                     }
                 }
@@ -1991,7 +2067,11 @@ fn build_with_match(
         let path_off = dir_blob.len() as u32;
         let path_len = path.len() as u32;
         dir_blob.push_str(&path);
-        dirs.push(DirRec { path_off, path_len, mtime });
+        dirs.push(DirRec {
+            path_off,
+            path_len,
+            mtime,
+        });
     }
 
     let index = Index {
@@ -2108,9 +2188,7 @@ fn load_cache() -> Option<Index> {
             mtime: u64::from_le_bytes(chunk[8..16].try_into().ok()?),
         };
         let (o, l) = (rec.path_off as usize, rec.path_len as usize);
-        if !o
-            .checked_add(l)
-            .map_or(false, |end| end <= dir_blob.len())
+        if !o.checked_add(l).map_or(false, |end| end <= dir_blob.len())
             || !dir_blob.is_char_boundary(o)
             || !dir_blob.is_char_boundary(o + l)
         {
@@ -2136,7 +2214,10 @@ fn save_cache(index: &Index) {
         let _ = std::fs::create_dir_all(dir);
     }
     let mut buf = Vec::with_capacity(
-        HDR + index.blob.len() + index.items.len() * ITEM_BYTES + index.dir_blob.len() + index.dirs.len() * DIR_BYTES,
+        HDR + index.blob.len()
+            + index.items.len() * ITEM_BYTES
+            + index.dir_blob.len()
+            + index.dirs.len() * DIR_BYTES,
     );
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&index.built_unix.to_le_bytes());
@@ -2227,7 +2308,11 @@ mod tests {
         for d in &dir_set {
             let off = dir_blob.len() as u32;
             dir_blob.push_str(d);
-            dirs.push(DirRec { path_off: off, path_len: d.len() as u32, mtime: 0 });
+            dirs.push(DirRec {
+                path_off: off,
+                path_len: d.len() as u32,
+                mtime: 0,
+            });
         }
 
         Index {
@@ -2305,7 +2390,11 @@ mod tests {
             "C:/Windows",
             "D:/归档",
         ] {
-            assert_eq!(subtree(&idx, root), naive(&idx, root), "根 {root} 的子树区间不对");
+            assert_eq!(
+                subtree(&idx, root),
+                naive(&idx, root),
+                "根 {root} 的子树区间不对"
+            );
         }
     }
 

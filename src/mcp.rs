@@ -13,9 +13,7 @@
 use crate::fastwalk::{self, Step};
 use crate::index;
 use crate::integration;
-use crate::searcher::{
-    path_is_system_root, search_file, search_filename_meta_path, SKIP_DIRS,
-};
+use crate::searcher::{path_is_system_root, search_file, search_filename_meta_path, SKIP_DIRS};
 use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -58,8 +56,14 @@ pub fn run() -> io::Result<()> {
         };
 
         // 通知（没有 id）不需要回应
-        let Some(id) = req.get("id").cloned() else { continue };
-        let method = req.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+        let Some(id) = req.get("id").cloned() else {
+            continue;
+        };
+        let method = req
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
 
         let result = match method.as_str() {
             "initialize" => Ok(json!({
@@ -103,15 +107,15 @@ fn tool_defs() -> Value {
         {
             "name": "search_files",
             "description": "Search the local machine for files by name/path. Returns absolute paths with size and mtime. \
-The pattern is cleaned first (BOM / zero-width chars / surrounding whitespace are stripped); if it contains '/' or '\\\\' it is matched against the full path, otherwise only against the file name. \
-Traversal stops as soon as max_results matches are collected or budget_ms expires. Whole-drive queries without an explicit budget_ms may run up to ~60s (fresh, or index fallback); pass budget_ms to cap it. \
-roots defaults to the server's working directory (normally your project); pass roots like [\"C:/\",\"D:/\"] to search elsewhere or the whole machine. \
-node_modules/.git/target/WinSxS and drive-root system directories are pruned by default. \
-Whole-drive searches are served from an in-memory name index: the first such query builds it in a single ~19s pass (answering the query in the same walk) instead of running a competing background walk; once built, repeat queries come back in ~0.1-0.5s with source:\"index\". \
-The index is kept current by a directory-mtime based incremental refresh (sub-second: only subtrees whose directory LastWriteTime changed are re-enumerated), so newly created files are normally found without a full rebuild. \
-The result carries index_complete; if the index hit its entry cap on a very large machine, the call automatically falls back to a real walk and merges both result sets (source:\"index+walk\", index_complete:false) instead of returning a false negative. \
-A zero-hit index query, or one against an index that could not be refreshed for over a minute, also falls back to a real walk (source:\"index+walk\", index_stale:true) so files created after the snapshot are still found. \
-index_maybe_stale:true means the result is usable but files created/renamed after the index snapshot may be missing; pass fresh:true to force a fresh walk.",
+    The pattern is cleaned first (BOM / zero-width chars / surrounding whitespace are stripped); if it contains '/' or '\\\\' it is matched against the full path, otherwise only against the file name. \
+    Traversal stops as soon as max_results matches are collected or budget_ms expires. Whole-drive queries without an explicit budget_ms may run up to ~60s (fresh, or index fallback); pass budget_ms to cap it. \
+    roots defaults to the server's working directory (normally your project); pass roots like [\"C:/\",\"D:/\"] to search elsewhere or the whole machine. \
+    node_modules/.git/target/WinSxS and drive-root system directories are pruned by default. \
+    Whole-drive searches are served from an in-memory name index: the first such query builds it in a single ~19s pass (answering the query in the same walk) instead of running a competing background walk; once built, repeat queries come back in ~0.1-0.5s with source:\"index\". \
+    The index is kept current by a directory-mtime based incremental refresh (sub-second: only subtrees whose directory LastWriteTime changed are re-enumerated), so newly created files are normally found without a full rebuild. \
+    The result carries index_complete; if the index hit its entry cap on a very large machine, the call automatically falls back to a real walk and merges both result sets (source:\"index+walk\", index_complete:false) instead of returning a false negative. \
+    A zero-hit index query, or one against an index that could not be refreshed for over a minute, also falls back to a real walk (source:\"index+walk\", index_stale:true) so files created after the snapshot are still found. \
+    index_maybe_stale:true means the result is usable but files created/renamed after the index snapshot may be missing; pass fresh:true to force a fresh walk.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -135,11 +139,11 @@ index_maybe_stale:true means the result is usable but files created/renamed afte
         {
             "name": "search_text",
             "description": "Search file contents with a regex (ripgrep semantics: parallel walk, binary files and huge files skipped). \
-Returns one entry per file with line numbers and matching lines. \
-When roots are drive roots and exts is given, candidates come from the name index and only those files are read (source:\"index\"), skipping the ~19s whole-drive walk. \
-The index is a snapshot: a zero-hit index scan also falls back to a walk that reads only files modified after the index snapshot (source:\"walk\", index_fallback:true, recent_only:true), so files created after the index was built are still found. Files renamed after the snapshot without a new mtime can still be missed — pass fresh:true to walk everything (raise budget_ms if a whole-drive content scan needs more than the default ~60s). \
-Without an explicit budget_ms, a fallback walk may run up to ~60s; pass budget_ms to cap it. \
-index_maybe_stale:true means candidates may miss files created/renamed after the index snapshot.",
+    Returns one entry per file with line numbers and matching lines. \
+    When roots are drive roots and exts is given, candidates come from the name index and only those files are read (source:\"index\"), skipping the ~19s whole-drive walk. \
+    The index is a snapshot: a zero-hit index scan also falls back to a walk that reads only files modified after the index snapshot (source:\"walk\", index_fallback:true, recent_only:true), so files created after the index was built are still found. Files renamed after the snapshot without a new mtime can still be missed — pass fresh:true to walk everything (raise budget_ms if a whole-drive content scan needs more than the default ~60s). \
+    Without an explicit budget_ms, a fallback walk may run up to ~60s; pass budget_ms to cap it. \
+    index_maybe_stale:true means candidates may miss files created/renamed after the index snapshot.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -172,7 +176,10 @@ index_maybe_stale:true means candidates may miss files created/renamed after the
 
 fn call_tool(params: &Value) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     let body = match name {
         "search_files" => run_search_files(&args),
@@ -193,7 +200,7 @@ fn call_tool(params: &Value) -> Result<Value, (i64, String)> {
 fn list_drives() -> String {
     let drives: Vec<Value> = integration::local_drives_detailed()
         .into_iter()
-        .map(|(d, kind)| json!({ "root": format!("{d}/"), "kind": kind }))
+        .map(|(d, kind)| json!({ "root": integration::drive_root(&d), "kind": kind }))
         .collect();
     json!({ "drives": drives }).to_string()
 }
@@ -298,63 +305,59 @@ fn run_search_files(args: &Value) -> Result<String, String> {
         && (is_drive_query || force_index)
     {
         let budget = if budget_ms > 0 {
-                Some(Duration::from_millis(budget_ms as u64))
-            } else {
-                None
-            };
-            // 真冷启动（无内存索引、无后台在建、无磁盘缓存）：一趟遍历建索引 + 答查询
-            let mut seeded_from_build = false;
-            if is_drive_query
-                && !index::is_ready()
-                && !index::is_building()
-                && !index::try_load()
+            Some(Duration::from_millis(budget_ms as u64))
+        } else {
+            None
+        };
+        // 真冷启动（无内存索引、无后台在建、无磁盘缓存）：一趟遍历建索引 + 答查询
+        let mut seeded_from_build = false;
+        if is_drive_query && !index::is_ready() && !index::is_building() && !index::try_load() {
+            if let Some((hits, entries, complete)) =
+                index::build_and_match(&re, &exts, max_results, match_path)
             {
-                if let Some((hits, entries, complete)) =
-                    index::build_and_match(&re, &exts, max_results, match_path)
-                {
-                    if complete || hits.len() >= max_results {
-                        let truncated = hits.len() >= max_results;
-                        return Ok(files_index_result(
-                            &pattern,
-                            &roots,
-                            hits,
-                            entries,
-                            0,
-                            truncated,
-                            false,
-                            complete,
-                            start.elapsed(),
-                        ));
-                    }
-                    seed = Some((hits, entries, 0, false));
-                    seeded_from_build = true;
+                if complete || hits.len() >= max_results {
+                    let truncated = hits.len() >= max_results;
+                    return Ok(files_index_result(
+                        &pattern,
+                        &roots,
+                        hits,
+                        entries,
+                        0,
+                        truncated,
+                        false,
+                        complete,
+                        start.elapsed(),
+                    ));
                 }
+                seed = Some((hits, entries, 0, false));
+                seeded_from_build = true;
             }
-            if !seeded_from_build {
-                index::ensure_ready();
-                if let Some((hits, entries, age, full, complete)) =
-                    index::query(&re, &roots, &exts, max_results, budget, match_path)
-                {
-                    // 索引完整但零命中：缓存可能比新文件旧，继续遍历兜底
-                    let stale = index::suspicious_miss(hits.len(), age, complete);
-                    if (complete && !stale) || hits.len() >= max_results {
-                        return Ok(files_index_result(
-                            &pattern,
-                            &roots,
-                            hits,
-                            entries,
-                            age,
-                            full,
-                            false,
-                            complete,
-                            start.elapsed(),
-                        ));
-                    }
-                    // 撞上限（complete=false）或零命中但可能过期（stale）：留着当种子，
-                    // 下面遍历补齐后再合并
-                    seed = Some((hits, entries, age, stale));
+        }
+        if !seeded_from_build {
+            index::ensure_ready();
+            if let Some((hits, entries, age, full, complete)) =
+                index::query(&re, &roots, &exts, max_results, budget, match_path)
+            {
+                // 索引完整但零命中：缓存可能比新文件旧，继续遍历兜底
+                let stale = index::suspicious_miss(hits.len(), age, complete);
+                if (complete && !stale) || hits.len() >= max_results {
+                    return Ok(files_index_result(
+                        &pattern,
+                        &roots,
+                        hits,
+                        entries,
+                        age,
+                        full,
+                        false,
+                        complete,
+                        start.elapsed(),
+                    ));
                 }
+                // 撞上限（complete=false）或零命中但可能过期（stale）：留着当种子，
+                // 下面遍历补齐后再合并
+                seed = Some((hits, entries, age, stale));
             }
+        }
     }
     // 整盘查询顺手把索引准备好，后续同类查询就只剩内存扫描。
     // fresh=true 时不建：调用方明确要遍历，后台再起一趟整盘建索引只会抢 I/O；
@@ -376,7 +379,9 @@ fn run_search_files(args: &Value) -> Result<String, String> {
     };
     let seen: Arc<Mutex<std::collections::HashSet<String>>> =
         Arc::new(Mutex::new(std::collections::HashSet::new()));
-    let seed_meta = seed.as_ref().map(|(h, entries, age, stale)| (h.len(), *entries, *age, *stale));
+    let seed_meta = seed
+        .as_ref()
+        .map(|(h, entries, age, stale)| (h.len(), *entries, *age, *stale));
     if let Some((seed_hits, _, _, _)) = &seed {
         let mut hg = hits.lock().unwrap();
         let mut sg = seen.lock().unwrap();
@@ -408,10 +413,18 @@ fn run_search_files(args: &Value) -> Result<String, String> {
         }
         // 盘符下的 Windows / Program Files 等大头目录整棵剪掉（roots 自身不剪）
         if prune_system && info.depth > 0 && path_is_system_root(path) {
-            return if info.is_dir { Step::Skip } else { Step::Continue };
+            return if info.is_dir {
+                Step::Skip
+            } else {
+                Step::Continue
+            };
         }
         if is_skipped(path, &skip_c) {
-            return if info.is_dir { Step::Skip } else { Step::Continue };
+            return if info.is_dir {
+                Step::Skip
+            } else {
+                Step::Continue
+            };
         }
         if !exts_c.is_empty() && !ext_matches(path, &exts_c) {
             return Step::Continue;
@@ -437,7 +450,11 @@ fn run_search_files(args: &Value) -> Result<String, String> {
         }));
         let full = guard.len() >= max_results;
         drop(guard);
-        if full { Step::Quit } else { Step::Continue }
+        if full {
+            Step::Quit
+        } else {
+            Step::Continue
+        }
     });
 
     let mut files: Vec<Value> = hits.lock().map(|g| g.clone()).unwrap_or_default();
@@ -536,7 +553,13 @@ fn run_search_text(args: &Value) -> Result<String, String> {
             // 索引被条目上限截断时候选集不全，直接退回遍历，宁可慢也不给假阴性
             if complete {
                 let (mut files, cand_timed_out) = search_text_candidates(
-                    &cands, &re, max_bytes, per_file, max_files, budget_ms, search_start,
+                    &cands,
+                    &re,
+                    max_bytes,
+                    per_file,
+                    max_files,
+                    budget_ms,
+                    search_start,
                 );
                 files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
                 files.truncate(max_files);
@@ -570,8 +593,7 @@ fn run_search_text(args: &Value) -> Result<String, String> {
                 // 零命中且快照可能过期：落到下面的遍历兜底。
                 // 只补扫索引建立之后修改过的文件（缺的正是这些），
                 // 文件名遍历约 30s，但内容只读新文件，不会整盘重读。
-                recent_after =
-                    Some(now_unix_secs().saturating_sub(age as u64 / 1000 + 60));
+                recent_after = Some(now_unix_secs().saturating_sub(age as u64 / 1000 + 60));
                 index_fallback = true;
                 index_scan_timed_out = cand_timed_out;
                 index_scan_trunc = cand_trunc;
@@ -606,10 +628,18 @@ fn run_search_text(args: &Value) -> Result<String, String> {
             return Step::Quit;
         }
         if prune_system && info.depth > 0 && path_is_system_root(path) {
-            return if info.is_dir { Step::Skip } else { Step::Continue };
+            return if info.is_dir {
+                Step::Skip
+            } else {
+                Step::Continue
+            };
         }
         if is_skipped(path, &skip_c) {
-            return if info.is_dir { Step::Skip } else { Step::Continue };
+            return if info.is_dir {
+                Step::Skip
+            } else {
+                Step::Continue
+            };
         }
         if info.is_dir {
             return Step::Continue;
@@ -640,7 +670,11 @@ fn run_search_text(args: &Value) -> Result<String, String> {
         }));
         let full = guard.len() >= max_files;
         drop(guard);
-        if full { Step::Quit } else { Step::Continue }
+        if full {
+            Step::Quit
+        } else {
+            Step::Continue
+        }
     });
 
     let mut files: Vec<Value> = hits.lock().map(|g| g.clone()).unwrap_or_default();
@@ -728,16 +762,22 @@ fn search_text_candidates(
         }
     });
 
-    (results.into_inner().unwrap_or_default(), timed_out.load(Ordering::Relaxed))
+    (
+        results.into_inner().unwrap_or_default(),
+        timed_out.load(Ordering::Relaxed),
+    )
 }
 
 /// 并行遍历若干根目录；回调返回 `Step::Quit` 或外部 `stop` 置位时立即结束整次遍历。
 fn walk_roots<F>(roots: &[String], include_hidden: bool, stop: Arc<AtomicBool>, visit: F) -> u64
 where
-    F: Fn(&Path, &fastwalk::Info) -> Step + Sync,
+    F: Fn(&Path, &fastwalk::Info) -> Step + Sync + Send,
 {
     let paths: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
-    let opts = fastwalk::Options { include_hidden, threads: num_cpus::get() };
+    let opts = fastwalk::Options {
+        include_hidden,
+        threads: num_cpus::get(),
+    };
     fastwalk::walk(&paths, &opts, &stop, visit)
 }
 
@@ -793,7 +833,10 @@ fn default_roots() -> Vec<String> {
             return vec![p];
         }
     }
-    integration::local_drives().into_iter().map(|d| format!("{d}/")).collect()
+    integration::local_drives()
+        .into_iter()
+        .map(|d| integration::drive_root(&d))
+        .collect()
 }
 
 /// 未指定 roots 时用工作目录 / 所有本地磁盘；不存在的路径直接剔除，避免整体报错
@@ -827,7 +870,11 @@ fn resolve_roots(args: &Value) -> Result<Vec<String>, String> {
 fn build_regex(pattern: &str, is_regex: bool, case_sensitive: bool) -> Result<Regex, String> {
     // 粘贴来的模式常带 BOM / 零宽字符 / 首尾空白：不清洗就永远 0 命中
     let (pattern, _) = crate::searcher::clean_pattern(pattern);
-    let src = if is_regex { pattern } else { regex::escape(&pattern) };
+    let src = if is_regex {
+        pattern
+    } else {
+        regex::escape(&pattern)
+    };
     RegexBuilder::new(&src)
         .case_insensitive(!case_sensitive)
         .build()
@@ -890,6 +937,9 @@ fn roots_are_drives(roots: &[String]) -> bool {
     !roots.is_empty()
         && roots.iter().all(|r| {
             let b = r.as_bytes();
-            b.len() == 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
+            b.len() == 3
+                && b[0].is_ascii_alphabetic()
+                && b[1] == b':'
+                && (b[2] == b'/' || b[2] == b'\\')
         })
 }

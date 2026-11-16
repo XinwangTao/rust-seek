@@ -91,11 +91,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resume_rules() {        let info = JournalInfo { journal_id: 7, next_usn: 100, lowest_valid: 10 };
+    fn resume_rules() {
+        let info = JournalInfo {
+            journal_id: 7,
+            next_usn: 100,
+            lowest_valid: 10,
+        };
         assert!(can_resume(&info, 7, 50));
         assert!(!can_resume(&info, 8, 50), "日志被重建时必须回退");
         assert!(!can_resume(&info, 7, 5), "起点早于 lowest_valid 必须回退");
-        assert!(!can_resume(&info, 7, 101), "起点超过 next_usn 不可信，必须回退");
+        assert!(
+            !can_resume(&info, 7, 101),
+            "起点超过 next_usn 不可信，必须回退"
+        );
     }
 
     /// 实机探针（默认忽略）：需要管理员权限才能读卷。

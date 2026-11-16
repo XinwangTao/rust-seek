@@ -26,7 +26,9 @@ pub struct SearchResult {
 #[allow(dead_code)]
 pub fn search_filename(path: &Path, pattern: &Regex) -> Option<SearchResult> {
     search_filename_meta(path, pattern, || {
-        std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().ok()))
+        std::fs::metadata(path)
+            .ok()
+            .map(|m| (m.len(), m.modified().ok()))
     })
 }
 
@@ -35,11 +37,7 @@ pub fn search_filename(path: &Path, pattern: &Regex) -> Option<SearchResult> {
 /// 遍历时给每个条目取元数据（walkdir 的 `metadata()` 走 `symlink_metadata`）在整机
 /// 250 万条目上就是 250 万次系统调用，而命中通常只有几十个。走 [`crate::fastwalk`]
 /// 时枚举本身已经带回大小和时间，闭包直接给出、一次系统调用都不用。
-pub fn search_filename_meta<F>(
-    path: &Path,
-    pattern: &Regex,
-    meta: F,
-) -> Option<SearchResult>
+pub fn search_filename_meta<F>(path: &Path, pattern: &Regex, meta: F) -> Option<SearchResult>
 where
     F: FnOnce() -> Option<(u64, Option<std::time::SystemTime>)>,
 {
@@ -61,7 +59,11 @@ where
 {
     let (display_path, win_path) = make_paths(path);
     let name = path.file_name()?.to_string_lossy();
-    let target = if match_path { display_path.as_str() } else { name.as_ref() };
+    let target = if match_path {
+        display_path.as_str()
+    } else {
+        name.as_ref()
+    };
     let mut ranges = Vec::new();
     for m in pattern.find_iter(target) {
         ranges.push((m.start(), m.end()));
@@ -77,12 +79,23 @@ where
     }
     let icon = file_icon(&display_path);
     let (file_size, modified) = meta().unwrap_or((0, None));
-    let line = if match_path { display_path.clone() } else { name.into_owned() };
+    let line = if match_path {
+        display_path.clone()
+    } else {
+        name.into_owned()
+    };
     Some(SearchResult {
-        icon, win_path, path: display_path, file_size, modified,
+        icon,
+        win_path,
+        path: display_path,
+        file_size,
+        modified,
         matches: vec![Match {
-            line_num: 0, line, ranges,
-            context_before: None, context_after: None,
+            line_num: 0,
+            line,
+            ranges,
+            context_before: None,
+            context_after: None,
         }],
     })
 }
@@ -91,7 +104,9 @@ where
 /// 按字面匹配就永远 0 命中（看着就是「搜不到」）。
 /// 返回 `(清洗后的模式, 去掉的字符数)`。
 pub fn clean_pattern(s: &str) -> (String, usize) {
-    const INVISIBLE: &[char] = &['\u{feff}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{00a0}'];
+    const INVISIBLE: &[char] = &[
+        '\u{feff}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{00a0}',
+    ];
     let mut out = String::with_capacity(s.len());
     let mut removed = 0usize;
     for ch in s.chars() {
@@ -130,29 +145,48 @@ pub fn looks_like_path(s: &str, is_regex: bool) -> bool {
 const MAX_LINE_LEN: usize = 512;
 const BINARY_CHECK_LEN: usize = 1024;
 
-pub fn search_file(path: &Path, pattern: &Regex, max_filesize: u64) -> Result<Option<SearchResult>> {
+pub fn search_file(
+    path: &Path,
+    pattern: &Regex,
+    max_filesize: u64,
+) -> Result<Option<SearchResult>> {
     let metadata = std::fs::metadata(path)?;
     let file_len = metadata.len();
-    if file_len == 0 || file_len > max_filesize { return Ok(None); }
+    if file_len == 0 || file_len > max_filesize {
+        return Ok(None);
+    }
 
     let matches = if file_len < 4096 {
         let bytes = std::fs::read(path)?;
-        if is_binary(&bytes, bytes.len().min(BINARY_CHECK_LEN)) { return Ok(None); }
+        if is_binary(&bytes, bytes.len().min(BINARY_CHECK_LEN)) {
+            return Ok(None);
+        }
         let s = decode(&bytes);
         collect_matches(&s, pattern)
     } else {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        if is_binary(&mmap, BINARY_CHECK_LEN) { return Ok(None); }
+        if is_binary(&mmap, BINARY_CHECK_LEN) {
+            return Ok(None);
+        }
         let s = decode(&mmap);
         collect_matches(&s, pattern)
     };
 
-    if matches.is_empty() { return Ok(None); }
+    if matches.is_empty() {
+        return Ok(None);
+    }
     let (display_path, win_path) = make_paths(path);
     let icon = file_icon(&display_path);
     let modified = metadata.modified().ok();
-    Ok(Some(SearchResult { path: display_path, win_path, icon, matches, file_size: file_len, modified }))
+    Ok(Some(SearchResult {
+        path: display_path,
+        win_path,
+        icon,
+        matches,
+        file_size: file_len,
+        modified,
+    }))
 }
 
 /// Compute both display path (forward slash) and win_path (backslash) in one pass
@@ -212,8 +246,7 @@ fn collect_matches(content: &str, pattern: &Regex) -> Vec<Match> {
             .collect();
         let display = truncate(line);
         let context_before = prev.clone();
-        let context_after = lines_iter.peek()
-            .map(|(_, next)| Arc::new(truncate(next)));
+        let context_after = lines_iter.peek().map(|(_, next)| Arc::new(truncate(next)));
         matches.push(Match {
             line_num: i + 1,
             line: display,
@@ -228,7 +261,11 @@ fn collect_matches(content: &str, pattern: &Regex) -> Vec<Match> {
 
 fn truncate(line: &str) -> String {
     if line.len() > MAX_LINE_LEN {
-        let end = line.char_indices().nth(MAX_LINE_LEN).map(|(i, _)| i).unwrap_or(line.len());
+        let end = line
+            .char_indices()
+            .nth(MAX_LINE_LEN)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len());
         line[..end].to_string() + "…"
     } else {
         line.to_string()
@@ -318,24 +355,21 @@ fn is_system_root_name(name: &str) -> bool {
 pub fn file_icon(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
-        "exe" | "msi"                          => "⚙",
-        "bat" | "cmd" | "ps1" | "sh"           => "⚙",
-        "rs" | "py" | "js" | "ts" | "go"
-        | "c" | "cpp" | "java" | "cs" | "rb"  => "📝",
-        "toml" | "json" | "yaml" | "yml"
-        | "xml" | "ini" | "cfg" | "env"        => "🔧",
-        "md" | "txt" | "log"                   => "📄",
-        "png" | "jpg" | "jpeg" | "gif"
-        | "svg" | "ico" | "bmp" | "webp"       => "🖼",
-        "mp4" | "mkv" | "avi" | "mov"          => "🎬",
-        "mp3" | "wav" | "flac" | "ogg"         => "🎵",
-        "zip" | "rar" | "7z" | "tar" | "gz"   => "📦",
-        "pdf"                                  => "📕",
-        "doc" | "docx"                         => "📘",
-        "xls" | "xlsx"                         => "📗",
-        "ppt" | "pptx"                         => "📙",
-        "lnk"                                  => "🔗",
-        "db" | "sqlite" | "sql"                => "🗄",
-        _                                      => "📄",
+        "exe" | "msi" => "⚙",
+        "bat" | "cmd" | "ps1" | "sh" => "⚙",
+        "rs" | "py" | "js" | "ts" | "go" | "c" | "cpp" | "java" | "cs" | "rb" => "📝",
+        "toml" | "json" | "yaml" | "yml" | "xml" | "ini" | "cfg" | "env" => "🔧",
+        "md" | "txt" | "log" => "📄",
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "ico" | "bmp" | "webp" => "🖼",
+        "mp4" | "mkv" | "avi" | "mov" => "🎬",
+        "mp3" | "wav" | "flac" | "ogg" => "🎵",
+        "zip" | "rar" | "7z" | "tar" | "gz" => "📦",
+        "pdf" => "📕",
+        "doc" | "docx" => "📘",
+        "xls" | "xlsx" => "📗",
+        "ppt" | "pptx" => "📙",
+        "lnk" => "🔗",
+        "db" | "sqlite" | "sql" => "🗄",
+        _ => "📄",
     }
 }

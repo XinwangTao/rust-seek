@@ -7,6 +7,7 @@ mod integration;
 mod mcp;
 mod searcher;
 mod updater;
+#[cfg(windows)]
 #[allow(dead_code)]
 mod usn;
 
@@ -50,25 +51,37 @@ fn main() -> eframe::Result {
         viewport,
         ..Default::default()
     };
-    eframe::run_native("Rust Seek", options, Box::new(move |cc| {
-        // Load Microsoft YaHei for CJK support
-        let mut fonts = egui::FontDefinitions::default();
-        if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\msyh.ttc") {
-            fonts.font_data.insert(
-                "msyh".to_owned(),
-                egui::FontData::from_owned(bytes).into(),
-            );
-            // Add as fallback after the default proportional font
-            fonts.families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .push("msyh".to_owned());
-            fonts.families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .push("msyh".to_owned());
-        }
-        cc.egui_ctx.set_fonts(fonts);
-        Ok(Box::new(app::App::new(start_hidden)))
-    }))
+    eframe::run_native(
+        "Rust Seek",
+        options,
+        Box::new(move |cc| {
+            // Load a system CJK font so Chinese labels remain readable.
+            let mut fonts = egui::FontDefinitions::default();
+            #[cfg(windows)]
+            let cjk_font_path = "C:\\Windows\\Fonts\\msyh.ttc";
+            #[cfg(target_os = "macos")]
+            let cjk_font_path = "/System/Library/Fonts/Hiragino Sans GB.ttc";
+            #[cfg(not(any(windows, target_os = "macos")))]
+            let cjk_font_path = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+            if let Ok(bytes) = std::fs::read(cjk_font_path) {
+                fonts.font_data.insert(
+                    "system-cjk".to_owned(),
+                    egui::FontData::from_owned(bytes).into(),
+                );
+                // Add as fallback after the default proportional font
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .push("system-cjk".to_owned());
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Monospace)
+                    .or_default()
+                    .push("system-cjk".to_owned());
+            }
+            cc.egui_ctx.set_fonts(fonts);
+            Ok(Box::new(app::App::new(start_hidden)))
+        }),
+    )
 }

@@ -18,5 +18,9 @@ pub fn rgba() -> Option<(Vec<u8>, u32, u32)> {
 /// eframe/egui 窗口图标（任务栏、Alt+Tab）。
 pub fn egui_icon() -> Option<egui::IconData> {
     let (rgba, width, height) = rgba()?;
-    Some(egui::IconData { rgba, width, height })
+    Some(egui::IconData {
+        rgba,
+        width,
+        height,
+    })
 }

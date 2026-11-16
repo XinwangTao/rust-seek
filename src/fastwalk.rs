@@ -39,7 +39,7 @@ pub struct Options {
 /// `cancel` 置位后各线程尽快退出；`visit` 返回 `Quit` 会立即结束整次遍历。
 pub fn walk<F>(roots: &[PathBuf], opts: &Options, cancel: &AtomicBool, visit: F) -> u64
 where
-    F: Fn(&Path, &Info) -> Step + Sync,
+    F: Fn(&Path, &Info) -> Step + Sync + Send,
 {
     imp::walk(roots, opts, cancel, visit)
 }
@@ -70,13 +70,13 @@ mod imp {
 
     pub fn walk<F>(roots: &[PathBuf], opts: &Options, cancel: &AtomicBool, visit: F) -> u64
     where
-        F: Fn(&Path, &Info) -> Step + Sync,
+        F: Fn(&Path, &Info) -> Step + Sync + Send,
     {
-        let jobs: VecDeque<(PathBuf, usize)> = roots
-            .iter()
-            .map(|r| (absolutize(r), 0))
-            .collect();
-        let state = Mutex::new(State { pending: jobs.len(), queue: jobs });
+        let jobs: VecDeque<(PathBuf, usize)> = roots.iter().map(|r| (absolutize(r), 0)).collect();
+        let state = Mutex::new(State {
+            pending: jobs.len(),
+            queue: jobs,
+        });
         let wake = Condvar::new();
         let stop = AtomicBool::new(false);
         let count = AtomicU64::new(0);
@@ -188,7 +188,10 @@ mod imp {
                     let info = Info {
                         is_dir,
                         size: ((data.nFileSizeHigh as u64) << 32) | data.nFileSizeLow as u64,
-                        modified: filetime(data.ftLastWriteTime.dwHighDateTime, data.ftLastWriteTime.dwLowDateTime),
+                        modified: filetime(
+                            data.ftLastWriteTime.dwHighDateTime,
+                            data.ftLastWriteTime.dwLowDateTime,
+                        ),
                         depth: depth + 1,
                     };
                     count.fetch_add(1, Ordering::Relaxed);
@@ -313,7 +316,7 @@ mod imp {
 
     pub fn walk<F>(roots: &[PathBuf], opts: &Options, cancel: &AtomicBool, visit: F) -> u64
     where
-        F: Fn(&Path, &Info) -> Step + Sync,
+        F: Fn(&Path, &Info) -> Step + Sync + Send,
     {
         let mut builder = WalkBuilder::new(&roots[0]);
         for r in &roots[1..] {
@@ -337,7 +340,9 @@ mod imp {
                 if stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
                     return WalkState::Quit;
                 }
-                let Ok(entry) = entry else { return WalkState::Continue };
+                let Ok(entry) = entry else {
+                    return WalkState::Continue;
+                };
                 let meta = entry.metadata().ok();
                 let info = Info {
                     is_dir: entry.file_type().map_or(false, |t| t.is_dir()),

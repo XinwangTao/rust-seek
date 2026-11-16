@@ -63,7 +63,11 @@ fn log(msg: &str) {
     if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > LOG_MAX_BYTES {
         let _ = fs::remove_file(&path);
     }
-    let line = format!("{} {}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), msg);
+    let line = format!(
+        "{} {}\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        msg
+    );
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
     }
@@ -86,20 +90,27 @@ fn session_blocked(version: &str) -> bool {
 
 /// 后台线程入口：清理上次遗留的 .old，延迟首查。
 /// **只在启动后查一次**，不再定时轮询（2026-11-05 用户确认）。
+#[cfg(windows)]
 pub fn spawn() {
     if std::env::var_os("RUST_SEEK_NO_UPDATE").is_some() {
         return;
     }
-    let _ = std::thread::Builder::new().name("updater".into()).spawn(|| {
-        cleanup_old();
-        std::thread::sleep(first_delay());
-        match check_once() {
-            Ok(()) => {}
-            // 只查一次：本次失败就等下次启动，不再退避重试
-            Err(e) => log(&format!("检查更新失败: {e}")),
-        }
-    });
+    let _ = std::thread::Builder::new()
+        .name("updater".into())
+        .spawn(|| {
+            cleanup_old();
+            std::thread::sleep(first_delay());
+            match check_once() {
+                Ok(()) => {}
+                // 只查一次：本次失败就等下次启动，不再退避重试
+                Err(e) => log(&format!("检查更新失败: {e}")),
+            }
+        });
 }
+
+/// Windows 的 latest.json 资产不能用于其他平台；降级版本不启动自动更新。
+#[cfg(not(windows))]
+pub fn spawn() {}
 
 #[derive(serde::Deserialize)]
 struct Manifest {
@@ -142,7 +153,10 @@ fn check_once() -> Result<(), String> {
                 manifest.version
             ));
         } else {
-            log(&format!("已是最新（本地 v{current}，远端 v{}）", manifest.version));
+            log(&format!(
+                "已是最新（本地 v{current}，远端 v{}）",
+                manifest.version
+            ));
         }
         return Ok(());
     }
@@ -181,7 +195,10 @@ fn check_once() -> Result<(), String> {
         prompt.push_str("\n\n更新说明：\n");
         prompt.push_str(&brief);
     }
-    log(&format!("发现新版本 v{}（当前 v{current}），等待用户确认", manifest.version));
+    log(&format!(
+        "发现新版本 v{}（当前 v{current}），等待用户确认",
+        manifest.version
+    ));
 
     match confirm(&prompt, "Rust Seek 更新") {
         Answer::Yes => {}
@@ -201,7 +218,10 @@ fn check_once() -> Result<(), String> {
     if let Err(e) = download_verified(&asset.url, &asset.sha256, &tmp) {
         let _ = fs::remove_file(&tmp);
         log(&format!("下载/校验失败: {e}"));
-        info_box(&format!("更新失败：{e}\n\n当前版本仍可正常使用。"), "Rust Seek 更新");
+        info_box(
+            &format!("更新失败：{e}\n\n当前版本仍可正常使用。"),
+            "Rust Seek 更新",
+        );
         block_session(&manifest.version);
         return Ok(());
     }
@@ -210,7 +230,10 @@ fn check_once() -> Result<(), String> {
     if let Err(e) = replace_and_restart(&tmp, &manifest.version) {
         let _ = fs::remove_file(&tmp);
         log(&format!("替换失败: {e}"));
-        info_box(&format!("更新失败：{e}\n\n当前版本仍可正常使用。"), "Rust Seek 更新");
+        info_box(
+            &format!("更新失败：{e}\n\n当前版本仍可正常使用。"),
+            "Rust Seek 更新",
+        );
         block_session(&manifest.version);
     }
     Ok(())
@@ -235,7 +258,9 @@ fn download_verified(url: &str, expect_sha: &str, dest: &Path) -> Result<(), Str
     let mut buf = vec![0u8; 64 * 1024];
     let mut total = 0usize;
     loop {
-        let n = reader.read(&mut buf).map_err(|e| format!("下载中断: {e}"))?;
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("下载中断: {e}"))?;
         if n == 0 {
             break;
         }
@@ -340,11 +365,15 @@ fn free_old_path(cur: &Path, name: &str) -> PathBuf {
 
 /// 启动时清理上一轮替换留下的 .old / 半截 .new（此时旧进程已退出，可删）。
 fn cleanup_old() {
-    let Ok(cur) = std::env::current_exe() else { return };
+    let Ok(cur) = std::env::current_exe() else {
+        return;
+    };
     let Some(name) = cur.file_name() else { return };
     let name = name.to_string_lossy().into_owned();
     if let Some(dir) = cur.parent() {
-        let Ok(entries) = fs::read_dir(dir) else { return };
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             let fname = entry.file_name().to_string_lossy().into_owned();
             if fname.starts_with(&format!("{name}.old")) || fname == format!("{name}.new") {
