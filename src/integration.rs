@@ -812,24 +812,21 @@ pub fn gui_alive() -> bool {
 }
 
 /// GUI 启动时调用：后台线程每 10 秒刷新一次心跳，进程退出即停。
-pub fn start_gui_heartbeat() {
+/// **由维护循环调用**（不是独立心跳线程）：心跳代表「索引真的在被维护」，
+/// 而不是「进程还活着」。维护线程卡住时心跳自然停跳，读者据此判断快照不可信。
+pub fn touch_gui_alive() {
     let Some(path) = gui_alive_path() else { return };
-    std::thread::spawn(move || {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        loop {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-            if std::fs::write(&tmp, now.to_string()).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
-            std::thread::sleep(std::time::Duration::from_secs(10));
-        }
-    });
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, now.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// 当前任务栏搜索框是否被隐藏（SearchboxTaskbarMode == 0）。

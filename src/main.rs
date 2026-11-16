@@ -28,7 +28,7 @@ fn main() -> eframe::Result {
     let start_hidden = std::env::args().any(|a| a == "--hidden");
     // GUI 是索引的唯一写者：宣告身份并开始心跳，MCP 进程据此只读共享快照。
     index::set_gui_mode();
-    integration::start_gui_heartbeat();
+    integration::touch_gui_alive();
     // GUI 是写者：后台每 30 秒把「有变更就刷新 + 落盘」跑一遍。
     // 否则用户不搜的时候索引一直不更新，只读的 MCP 进程就会看到很旧的快照。
     let _ = std::thread::Builder::new()
@@ -37,6 +37,8 @@ fn main() -> eframe::Result {
             std::thread::sleep(std::time::Duration::from_secs(30));
             index::ensure_fresh(index::auto_refresh_secs());
             index::persist_if_dirty();
+            // 维护循环跑完才跳心跳：心跳 = 索引真的在被维护
+            integration::touch_gui_alive();
         });
     // 自动更新检查（仅 GUI 模式；--mcp 已在上面提前返回）
     updater::spawn();
