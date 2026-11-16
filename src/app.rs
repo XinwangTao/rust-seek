@@ -986,6 +986,8 @@ impl App {
         let indexable = prune_system && matches!(mode, SearchMode::Filename) && indexable_scope;
         let walk_roots: Vec<std::path::PathBuf> =
             roots.iter().map(std::path::PathBuf::from).collect();
+        // 实时输入（边打字边搜）不在搜索路径上刷新索引：先出结果，变更交给后台补。
+        let realtime = !record_history;
 
         thread::spawn(move || {
             let start = Instant::now();
@@ -1015,7 +1017,11 @@ impl App {
             if use_index && (index::is_ready() || index::try_load()) {
                 // 索引是快照：先做一次目录级增量刷新（只重扫 mtime 变了的子树，
                 // 通常几十毫秒），新建文件才不会被漏掉。
-                index::ensure_fresh(index::auto_refresh_secs());
+                if realtime {
+                    index::ensure_fresh_quick(index::auto_refresh_secs());
+                } else {
+                    index::ensure_fresh(index::auto_refresh_secs());
+                }
                 let ext_set: HashSet<String> =
                     exts.iter().map(|e| e.to_ascii_lowercase()).collect();
                 if let Some((hits, _, age, _, complete)) =

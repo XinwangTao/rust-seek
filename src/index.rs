@@ -683,6 +683,45 @@ pub fn ensure_fresh(max_age_secs: u64) -> bool {
     }
 }
 
+/// 上一次「先答后补」的后台刷新安排时间（秒）。
+static LAST_QUICK_REQ: AtomicU64 = AtomicU64::new(0);
+
+/// 实时输入用：**绝不在搜索路径上刷新**。
+///
+/// 刷新要把 760 万条条目重拼一遍（100–300ms），挂在每次按键上就是
+/// 「打字一顿一顿」的直接来源——而系统后台总在写文件，脏目录几乎从不清空。
+/// 这里只用当前快照作答，另起后台线程把变更补上；显式搜索（回车）仍走同步刷新。
+pub fn ensure_fresh_quick(max_age_secs: u64) -> bool {
+    start_watchers();
+    if !is_ready() {
+        return false;
+    }
+    let stale = current_age_secs().map_or(true, |a| a > max_age_secs);
+    if stale || has_pending_changes() {
+        schedule_refresh();
+    }
+    true
+}
+
+/// 安排一次后台增量刷新：只在进程内节流（1 秒一次），不阻塞调用方。
+/// 用 `refresh_now_mode(false)`——绝不在后台顺手起全盘巡，那会长时间持锁。
+pub fn schedule_refresh() {
+    let now = now_unix();
+    let last = LAST_QUICK_REQ.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 1 {
+        return;
+    }
+    if LAST_QUICK_REQ
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    std::thread::spawn(|| {
+        let _ = refresh_now_mode(false);
+    });
+}
+
 /// 监听是否攒着还没应用的变更事件。
 fn has_pending_changes() -> bool {
     DIRTY_DIRS
@@ -2419,6 +2458,24 @@ mod tests {
     //!   2) `prefix_bounds` 给出的区间 == 线性筛出的子树（不漏不多）
     //! 以后改存储格式（目录/名字分离、mmap）时，这些用例必须原样通过。
     use super::*;
+
+    /// 实机探针（默认忽略）：实时输入路径必须立刻返回，刷新只能甩后台。
+    /// 运行：cargo test --release live_realtime_path -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_realtime_path() {
+        let _ = try_load();
+        let t = std::time::Instant::now();
+        let ok = ensure_fresh_quick(auto_refresh_secs());
+        let took = t.elapsed();
+        println!("ensure_fresh_quick: {:?} ok={}", took, ok);
+        assert!(ok);
+        assert!(
+            took < std::time::Duration::from_millis(50),
+            "实时路径阻塞了 {took:?}，打字会卡"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
 
     /// 实机探针（默认忽略）：拆 ensure_ready 与查询各自的耗时。
     /// 运行：cargo test --release live_ready_timing -- --ignored --nocapture
