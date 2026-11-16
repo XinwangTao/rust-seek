@@ -36,6 +36,7 @@ fn main() -> eframe::Result {
         .spawn(|| loop {
             std::thread::sleep(std::time::Duration::from_secs(30));
             index::ensure_fresh(index::auto_refresh_secs());
+            index::persist_if_dirty();
         });
     // 自动更新检查（仅 GUI 模式；--mcp 已在上面提前返回）
     updater::spawn();

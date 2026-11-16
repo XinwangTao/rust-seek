@@ -904,6 +904,18 @@ fn current_usn_state() -> std::collections::HashMap<String, crate::usn::VolState
     lock().as_ref().map(|ix| usn_state(ix)).unwrap_or_default()
 }
 
+/// 写者定时调用：内存索引比磁盘缓存新就落盘一次，让只读读者看到最新快照。
+/// 没有变更时是 O(1)，不会每 30 秒白写 790MB。
+pub fn persist_if_dirty() {
+    if SAVED_GEN.load(Ordering::Relaxed) == CONTENT_GEN.load(Ordering::Relaxed) {
+        return;
+    }
+    let guard = lock();
+    if let Some(index) = guard.as_ref() {
+        save_cache(index);
+    }
+}
+
 /// 实时输入用：**绝不在搜索路径上刷新**。
 ///
 /// 刷新要把 760 万条条目重拼一遍（100–300ms），挂在每次按键上就是
@@ -1213,6 +1225,7 @@ pub fn spawn_refresh_async() -> bool {
         let hint: Vec<String> = dirty.into_iter().map(|(k, _)| k).collect();
         if refresh_in_place(index, Some(hint)) {
             NEED_FULL_SCAN.store(false, Ordering::Relaxed);
+            CONTENT_GEN.fetch_add(1, Ordering::Relaxed);
             let _ = &sweep;
         }
         // 扫盘期间（约 10s）又攒下的变更，接着补上，最多 3 轮
@@ -1258,7 +1271,11 @@ fn refresh_with_mode(index: &mut Index, allow_full_sweep: bool) -> bool {
             index.built_unix = now_unix();
             return true;
         }
+        let had_changes = !dirty.is_empty();
         let ok = refresh_in_place(index, Some(dirty.clone()));
+        if ok && had_changes {
+            CONTENT_GEN.fetch_add(1, Ordering::Relaxed);
+        }
         if !ok {
             // 刷新失败不能当成成功：把脏目录放回队列，并强制下一轮全量扫描。
             // 否则这批变更永久缺失，而 built_unix 还会被推进到当前时间，
@@ -1363,6 +1380,11 @@ static READER_MODE: AtomicBool = AtomicBool::new(false);
 static READER_DECIDED: AtomicBool = AtomicBool::new(false);
 /// 当前映射对应的缓存文件戳（长度, mtime），用来判断「文件换了，要重映射」。
 static MAPPED_STAMP: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+/// 内存索引内容改动代数 / 上次落盘时的代数。
+/// 只读读者靠缓存文件看世界，写者必须把「内容变了」及时发布出去，
+/// 否则读者会一直停在旧快照（实测遇到过 13 分钟没更新的情况）。
+static CONTENT_GEN: AtomicU64 = AtomicU64::new(0);
+static SAVED_GEN: AtomicU64 = AtomicU64::new(0);
 static WATCHED_DRIVES: AtomicU64 = AtomicU64::new(0);
 
 /// 启动目录监听（幂等）。GUI 与 MCP 都会调，重复调用无代价。
@@ -2747,6 +2769,7 @@ fn save_cache(index: &Index) -> bool {
     if let Some(j) = journal_path() {
         let _ = std::fs::remove_file(j);
     }
+    SAVED_GEN.store(CONTENT_GEN.load(Ordering::Relaxed), Ordering::Relaxed);
     true
 }
 
