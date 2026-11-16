@@ -130,6 +130,11 @@ struct Mapped {
     dirs: (usize, usize),
 }
 
+// 缓存里的条目/目录块是按固定字节布局排布的，mmap 后直接当切片读。
+// 改了字段就必须同步改 ITEM_BYTES/DIR_BYTES 并升 MAGIC，否则会静默读错。
+const _: () = assert!(std::mem::size_of::<Item>() == ITEM_BYTES);
+const _: () = assert!(std::mem::size_of::<DirRec>() == DIR_BYTES);
+
 struct Index {
     payload: Payload,
     /// 这份索引覆盖到的 USN 水位（每块盘一条）。**必须和缓存同生共死**：
@@ -747,13 +752,12 @@ pub fn reader_mode() -> bool {
     if IS_GUI.load(Ordering::Relaxed) {
         return false;
     }
-    if READER_DECIDED.load(Ordering::Relaxed) {
-        return READER_MODE.load(Ordering::Relaxed);
-    }
-    let r = integration::gui_alive();
-    READER_MODE.store(r, Ordering::Relaxed);
-    READER_DECIDED.store(true, Ordering::Relaxed);
-    r
+    // 每次现判，不缓存结论：写者可能已经退出（GUI 关掉），
+    // 读者必须能自己接管；写者回来后再退回去读。
+    // gui_alive() 只是一次小文件读取，代价可忽略。
+    let alive = integration::gui_alive();
+    READER_MODE.store(alive, Ordering::Relaxed);
+    alive
 }
 
 fn cache_stamp() -> Option<(u64, u64)> {
@@ -772,9 +776,9 @@ fn cache_stamp() -> Option<(u64, u64)> {
 fn ensure_mapped() {
     let stamp = cache_stamp();
     let same = {
-        let g = MAPPED_STAMP.try_lock().ok();
-        match (g.as_deref(), &stamp) {
-            (Some(Some(cur)), Some(new)) => cur == new,
+        let g = MAPPED_STAMP.lock().unwrap_or_else(|e| e.into_inner());
+        match (&*g, &stamp) {
+            (Some(cur), Some(new)) => cur == new,
             _ => false,
         }
     };
@@ -910,10 +914,17 @@ pub fn persist_if_dirty() {
     if SAVED_GEN.load(Ordering::Relaxed) == CONTENT_GEN.load(Ordering::Relaxed) {
         return;
     }
-    let guard = lock();
-    if let Some(index) = guard.as_ref() {
-        save_cache(index);
+    // 只在锁内做序列化；1–3 秒的写盘放到锁外，别把写者自己的查询堵住
+    let bytes = {
+        let guard = lock();
+        guard.as_ref().map(|ix| build_cache_bytes(ix.as_ref()))
+    };
+    let Some(bytes) = bytes else { return };
+    let Some(path) = cache_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
     }
+    write_cache_bytes(&bytes, &path);
 }
 
 /// 实时输入用：**绝不在搜索路径上刷新**。
@@ -1375,9 +1386,8 @@ static USN_TRUSTED: AtomicBool = AtomicBool::new(false);
 static SEED_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// 本进程是 GUI（天然写者）。
 static IS_GUI: AtomicBool = AtomicBool::new(false);
-/// 已判定过的角色：true = 只读读者（GUI 在世，索引由它维护）。
+/// 当前角色：true = 只读读者（GUI 在世，索引由它维护）。
 static READER_MODE: AtomicBool = AtomicBool::new(false);
-static READER_DECIDED: AtomicBool = AtomicBool::new(false);
 /// 当前映射对应的缓存文件戳（长度, mtime），用来判断「文件换了，要重映射」。
 static MAPPED_STAMP: Mutex<Option<(u64, u64)>> = Mutex::new(None);
 /// 内存索引内容改动代数 / 上次落盘时的代数。
@@ -2688,11 +2698,8 @@ fn load_cache() -> Option<Index> {
     })
 }
 
-fn save_cache(index: &Index) -> bool {
-    let Some(path) = cache_path() else { return false };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
+/// 只做序列化，不碰磁盘。需要持有索引锁，但耗时只到内存拷贝（~300ms）。
+fn build_cache_bytes(index: &Index) -> Vec<u8> {
     let pad1 = pad8(HDR_V5 + index.blob().len());
     let pad2 = pad8(
         HDR_V5
@@ -2750,18 +2757,24 @@ fn save_cache(index: &Index) -> bool {
         buf.extend_from_slice(&rec);
     }
 
-    // 临时文件名带 pid：多个 MCP 进程同时重建时各写各的，最后 rename 覆盖
+    buf
+}
+
+/// 把序列化好的字节写盘（临时文件 + rename）。**不需要索引锁**：
+/// 790MB 写盘要 1–3 秒，持锁写会让写者自己的查询卡住——这正是要拆开的原因。
+fn write_cache_bytes(buf: &[u8], path: &std::path::Path) -> bool {
+    // 临时文件名带 pid：多个进程同时重建时各写各的，最后 rename 覆盖
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     let mut file = match std::fs::File::create(&tmp) {
         Ok(f) => f,
         Err(_) => return false,
     };
-    if file.write_all(&buf).is_err() {
+    if file.write_all(buf).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return false;
     }
     drop(file);
-    if std::fs::rename(&tmp, &path).is_err() {
+    if std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return false;
     }
@@ -2771,6 +2784,15 @@ fn save_cache(index: &Index) -> bool {
     }
     SAVED_GEN.store(CONTENT_GEN.load(Ordering::Relaxed), Ordering::Relaxed);
     true
+}
+
+fn save_cache(index: &Index) -> bool {
+    let Some(path) = cache_path() else { return false };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let buf = build_cache_bytes(index);
+    write_cache_bytes(&buf, &path)
 }
 
 #[cfg(test)]
