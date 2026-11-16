@@ -1,0 +1,243 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Rust Seek 单写者 + 只读快照共享索引",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "output": "docs/archify/shared_index_workflow.html",
+    "views": [
+      {
+        "id": "startup",
+        "label": "启动时怎么定角色",
+        "focus": [
+          "start",
+          "lock",
+          "writer",
+          "reader"
+        ],
+        "note": "谁先拿到写者锁谁维护索引；拿不到就做只读读者。"
+      },
+      {
+        "id": "writer",
+        "label": "写者：维护 + 发布",
+        "focus": [
+          "writer",
+          "refresh",
+          "publish"
+        ],
+        "note": "只读快照随缓存落盘一起发布，读者靠文件变化感知。"
+      },
+      {
+        "id": "reader",
+        "label": "读者：零拷贝查询",
+        "focus": [
+          "reader",
+          "map",
+          "query"
+        ],
+        "note": "mmap 直接查，不复制、不监听、不刷新。"
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "boot",
+      "label": "启动"
+    },
+    {
+      "id": "owner",
+      "label": "索引所有权"
+    },
+    {
+      "id": "data",
+      "label": "数据面"
+    }
+  ],
+  "phases": [
+    {
+      "id": "elect",
+      "label": "定角色",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "serve",
+      "label": "维护或查询",
+      "fromCol": 2,
+      "toCol": 4,
+      "variant": "emphasis"
+    }
+  ],
+  "groups": [
+    {
+      "id": "writer_work",
+      "label": "写者独占",
+      "lane": "owner",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "emphasis"
+    }
+  ],
+  "mainPath": [
+    "start",
+    "lock",
+    "writer",
+    "refresh",
+    "publish"
+  ],
+  "nodes": [
+    {
+      "id": "start",
+      "lane": "boot",
+      "col": 0,
+      "type": "external",
+      "label": "进程启动",
+      "sublabel": "GUI 或 MCP",
+      "width": 124
+    },
+    {
+      "id": "lock",
+      "lane": "boot",
+      "col": 1,
+      "type": "security",
+      "label": "抢写者锁",
+      "sublabel": "独占文件句柄",
+      "width": 140
+    },
+    {
+      "id": "writer",
+      "lane": "owner",
+      "col": 2,
+      "type": "backend",
+      "label": "写者",
+      "sublabel": "监听 + 增量刷新",
+      "tag": "唯一",
+      "width": 140
+    },
+    {
+      "id": "reader",
+      "lane": "owner",
+      "col": 2,
+      "type": "backend",
+      "label": "读者",
+      "sublabel": "不监听、不刷新",
+      "width": 140,
+      "yOffset": 96
+    },
+    {
+      "id": "refresh",
+      "lane": "data",
+      "col": 3,
+      "type": "backend",
+      "label": "增量刷新",
+      "sublabel": "USN / 监听",
+      "width": 128
+    },
+    {
+      "id": "publish",
+      "lane": "data",
+      "col": 4,
+      "type": "database",
+      "label": "写缓存 + 水位",
+      "sublabel": "原子 rename",
+      "width": 150
+    },
+    {
+      "id": "map",
+      "lane": "data",
+      "col": 3,
+      "type": "database",
+      "label": "mmap 快照",
+      "sublabel": "文件变了才重映射",
+      "width": 150,
+      "yOffset": 96
+    },
+    {
+      "id": "query",
+      "lane": "data",
+      "col": 4,
+      "type": "frontend",
+      "label": "零拷贝查询",
+      "sublabel": "页缓存跨进程共享",
+      "width": 150,
+      "yOffset": 96
+    }
+  ],
+  "edges": [
+    {
+      "id": "start-lock",
+      "from": "start",
+      "to": "lock",
+      "variant": "default"
+    },
+    {
+      "id": "lock-writer",
+      "from": "lock",
+      "to": "writer",
+      "label": "拿到",
+      "variant": "emphasis"
+    },
+    {
+      "id": "lock-reader",
+      "from": "lock",
+      "to": "reader",
+      "label": "已被占用",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "writer-refresh",
+      "from": "writer",
+      "to": "refresh",
+      "variant": "emphasis"
+    },
+    {
+      "id": "refresh-publish",
+      "from": "refresh",
+      "to": "publish",
+      "variant": "emphasis"
+    },
+    {
+      "id": "reader-map",
+      "from": "reader",
+      "to": "map",
+      "variant": "default"
+    },
+    {
+      "id": "map-query",
+      "from": "map",
+      "to": "query",
+      "variant": "emphasis"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "要解决的两笔账",
+      "items": [
+        "每个进程各持一份 790MB 索引，9 个进程约 7GB",
+        "每次载入要复制 + 校验，约 390ms",
+        "读者共享页缓存后，内存和载入都趋近于零"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "不变量",
+      "items": [
+        "任何时刻最多一个写者，靠独占文件句柄保证（进程退出自动释放）",
+        "读者永不写文件，只按文件变化重映射",
+        "写者宕掉后，下一次启动的进程自动接管"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "取舍",
+      "items": [
+        "读者最多比写者旧一个发布周期（有变化才发布，通常几十秒）",
+        "回车搜索仍由写者保证最新；读者命中零结果时可提示「按回车刷新」",
+        "快照文件格式升版，需一次性重建索引"
+      ]
+    }
+  ]
+}

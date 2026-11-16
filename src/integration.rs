@@ -792,6 +792,46 @@ pub fn set_autostart(on: bool) -> std::io::Result<()> {
     }
 }
 
+/// GUI 心跳文件：写者在世时每 10 秒更新一次时间戳。
+/// 只在「索引所有权」判定里用——心跳新鲜说明有人在做写者，MCP 进程只读即可。
+fn gui_alive_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from)?;
+    Some(base.join("rust-seek").join("gui-alive"))
+}
+
+/// GUI 进程是否还活着（心跳不超过 60 秒）。
+pub fn gui_alive() -> bool {
+    let Some(p) = gui_alive_path() else { return false };
+    let Ok(text) = std::fs::read_to_string(&p) else { return false };
+    let Ok(ts) = text.trim().parse::<u64>() else { return false };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(ts) < 60
+}
+
+/// GUI 启动时调用：后台线程每 10 秒刷新一次心跳，进程退出即停。
+pub fn start_gui_heartbeat() {
+    let Some(path) = gui_alive_path() else { return };
+    std::thread::spawn(move || {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        loop {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+            if std::fs::write(&tmp, now.to_string()).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+    });
+}
+
 /// 当前任务栏搜索框是否被隐藏（SearchboxTaskbarMode == 0）。
 pub fn taskbar_search_hidden() -> bool {
     taskbar_search_mode() == Some(0)

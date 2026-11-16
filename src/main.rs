@@ -26,6 +26,17 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let start_hidden = std::env::args().any(|a| a == "--hidden");
+    // GUI 是索引的唯一写者：宣告身份并开始心跳，MCP 进程据此只读共享快照。
+    index::set_gui_mode();
+    integration::start_gui_heartbeat();
+    // GUI 是写者：后台每 30 秒把「有变更就刷新 + 落盘」跑一遍。
+    // 否则用户不搜的时候索引一直不更新，只读的 MCP 进程就会看到很旧的快照。
+    let _ = std::thread::Builder::new()
+        .name("index-keeper".into())
+        .spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            index::ensure_fresh(index::auto_refresh_secs());
+        });
     // 自动更新检查（仅 GUI 模式；--mcp 已在上面提前返回）
     updater::spawn();
     // 启动即在后台预热索引：否则「打开软件后第一次搜索」要等 17–22 秒的全盘
