@@ -1016,9 +1016,19 @@ fn refresh_with_mode(index: &mut Index, allow_full_sweep: bool) -> bool {
     // 毫秒级；不需要 17-22 秒的全盘 stat 巡。任何一步不可信（没管理员权限 / 非 NTFS /
     // 日志重建 / 起点被截断 / 有条目解析不出路径）都返回 None，直接落回下面的全盘巡。
     let drives = integration::local_drives();
-    if let Some((dirty, commits)) = crate::usn::dirty_dirs_since_snapshot(&drives) {
+    let __t = Instant::now();
+    let __usn = crate::usn::dirty_dirs_since_snapshot(&drives);
+    if std::env::var_os("RUST_SEEK_DEBUG").is_some() {
+        eprintln!("[debug] usn dirty={:?} in {:?}", __usn.as_ref().map(|(d, _)| d.len()), __t.elapsed());
+    }
+    if let Some((dirty, commits)) = __usn {
         // 空脏目录同样走一遍：它会推进 built_unix 并保持索引不变
-        if refresh_in_place(index, Some(dirty.clone())) {
+        let __t2 = Instant::now();
+        let __ok = refresh_in_place(index, Some(dirty.clone()));
+        if std::env::var_os("RUST_SEEK_DEBUG").is_some() {
+            eprintln!("[debug] refresh_in_place {:?} ok={}", __t2.elapsed(), __ok);
+        }
+        if __ok {
             NEED_FULL_SCAN.store(false, Ordering::Relaxed);
             index.built_unix = now_unix();
             if !dirty.is_empty() {
@@ -1385,6 +1395,9 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
         None => scan_dirty_dirs(&index.dir_blob, &old_dirs, started),
     };
     let scan_ms = t_start.elapsed().as_millis();
+    if std::env::var_os("RUST_SEEK_DEBUG").is_some() {
+        eprintln!("[debug] refresh_in_place dirty={} scan_ms={}", dirty.len(), scan_ms);
+    }
     dirty.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
     // 把「这些目录变过」记进变更日志：下一个进程载入同一份缓存时直接回放，
@@ -1489,6 +1502,9 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
         );
     }
 
+    if std::env::var_os("RUST_SEEK_DEBUG").is_some() {
+        eprintln!("[debug] worklist={:?} walk={:?}ms", worklist, t_start.elapsed().as_millis());
+    }
     let mut fresh = fresh_files.into_inner().unwrap_or_default();
     fresh.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     // 兜底去重：万一某棵子树被枚举了两次（重命名的两个事件、重叠的工作根），
@@ -1521,6 +1537,9 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
         if dhi > dlo {
             enumer_dir_sub.push((dlo, dhi));
         }
+    }
+    if std::env::var_os("RUST_SEEK_DEBUG").is_some() {
+        eprintln!("[debug] ranges {:?}ms fresh={} enumer={}", t_start.elapsed().as_millis(), fresh.len(), enumer.len());
     }
     let enumer_set: HashSet<&str> = enumer.iter().map(|k| k.as_ref()).collect();
     let mut keep_sub: Vec<(usize, usize)> = Vec::new();
@@ -1573,6 +1592,9 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
     }
 
     let t_drop = t_start.elapsed().as_millis();
+    if std::env::var_os("RUST_SEEK_DEBUG").is_some() {
+        eprintln!("[debug] drop_plan {:?}ms kept={} of {}", t_drop, kept_len, old_items.len());
+    }
     if fresh.is_empty() && kept_len == old_items.len() {
         index.items = old_items;
     } else {
@@ -2131,6 +2153,129 @@ fn cache_path() -> Option<PathBuf> {
     Some(base.join("rust-seek").join("index-v1.bin"))
 }
 
+/// 并行校验 UTF-8。切点取 ASCII 字节（<0x80），这样每一段都从合法字符边界开始。
+///
+/// 载入 790MB 缓存时这一步约 220ms（7.5M 条目 / 180MB 路径池），单线程跑是首查延迟的
+/// 主要固定成本之一；切段校验后降到几十毫秒。
+fn utf8_valid_parallel(bytes: &[u8]) -> bool {
+    const MIN_PARALLEL: usize = 4 << 20;
+    let workers = num_cpus::get().clamp(1, 16);
+    if workers == 1 || bytes.len() < MIN_PARALLEL {
+        return std::str::from_utf8(bytes).is_ok();
+    }
+    let mut cuts: Vec<usize> = Vec::with_capacity(workers + 1);
+    cuts.push(0);
+    for k in 1..workers {
+        let mut i = bytes.len() * k / workers;
+        while i < bytes.len() && bytes[i] >= 0x80 {
+            i += 1;
+        }
+        cuts.push(i);
+    }
+    cuts.push(bytes.len());
+    std::thread::scope(|s| {
+        let handles: Vec<_> = cuts
+            .windows(2)
+            .filter(|w| w[0] < w[1])
+            .map(|w| {
+                let seg = &bytes[w[0]..w[1]];
+                s.spawn(move || std::str::from_utf8(seg).is_ok())
+            })
+            .collect();
+        handles.into_iter().all(|h| h.join().unwrap_or(false))
+    })
+}
+
+/// 按条切块并行反序列化；任何一块校验失败整体作废（返回 None）。
+fn parallel_parse<T, F>(
+    count: usize,
+    item_bytes: usize,
+    raw: &[u8],
+    parse: F,
+) -> Option<Vec<T>>
+where
+    F: Fn(&[u8]) -> Option<Vec<T>> + Sync,
+    T: Send,
+{
+    const MIN_PARALLEL: usize = 200_000;
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    let workers = num_cpus::get().clamp(1, 16).min(count);
+    if workers == 1 || count < MIN_PARALLEL {
+        return parse(raw);
+    }
+    let per = count.div_ceil(workers);
+    let parse = &parse;
+    let mut parts: Vec<Option<Vec<T>>> = Vec::with_capacity(workers);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|i| {
+                let lo = i * per;
+                let hi = ((i + 1) * per).min(count);
+                let seg = &raw[lo * item_bytes..hi * item_bytes];
+                s.spawn(move || parse(seg))
+            })
+            .collect();
+        for h in handles {
+            parts.push(h.join().ok().flatten());
+        }
+    });
+    let mut out: Vec<T> = Vec::with_capacity(count);
+    for p in parts {
+        out.extend(p?);
+    }
+    Some(out)
+}
+
+fn parse_items(raw: &[u8], blob: &str) -> Option<Vec<Item>> {
+    let mut items = Vec::with_capacity(raw.len() / ITEM_BYTES);
+    for chunk in raw.chunks_exact(ITEM_BYTES) {
+        let item = Item {
+            path_off: u32::from_le_bytes(chunk[0..4].try_into().ok()?),
+            path_len: u32::from_le_bytes(chunk[4..8].try_into().ok()?),
+            name_off: u32::from_le_bytes(chunk[8..12].try_into().ok()?),
+            name_len: u32::from_le_bytes(chunk[12..16].try_into().ok()?),
+            size: u64::from_le_bytes(chunk[16..24].try_into().ok()?),
+            mtime: u64::from_le_bytes(chunk[24..32].try_into().ok()?),
+        };
+        // 偏移必须落在 blob 内且在 UTF-8 边界上，否则整份缓存作废
+        let ok = |off: u32, len: u32| {
+            let (o, l) = (off as usize, len as usize);
+            o.checked_add(l).map_or(false, |end| end <= blob.len())
+                && blob.is_char_boundary(o)
+                && blob.is_char_boundary(o + l)
+        };
+        if !ok(item.path_off, item.path_len) || !ok(item.name_off, item.name_len) {
+            return None;
+        }
+        items.push(item);
+    }
+    Some(items)
+}
+
+fn parse_dirs(raw: &[u8], blob: &str) -> Option<Vec<DirRec>> {
+    let mut dirs = Vec::with_capacity(raw.len() / DIR_BYTES);
+    for chunk in raw.chunks_exact(DIR_BYTES) {
+        let rec = DirRec {
+            path_off: u32::from_le_bytes(chunk[0..4].try_into().ok()?),
+            path_len: u32::from_le_bytes(chunk[4..8].try_into().ok()?),
+            mtime: u64::from_le_bytes(chunk[8..16].try_into().ok()?),
+        };
+        let (o, l) = (rec.path_off as usize, rec.path_len as usize);
+        if !o
+            .checked_add(l)
+            .map_or(false, |end| end <= blob.len())
+            || !blob.is_char_boundary(o)
+            || !blob.is_char_boundary(o + l)
+        {
+            return None;
+        }
+        dirs.push(rec);
+    }
+    Some(dirs)
+}
+
 fn load_cache() -> Option<Index> {
     let path = cache_path()?;
     let len = std::fs::metadata(&path).ok()?.len();
@@ -2167,52 +2312,36 @@ fn load_cache() -> Option<Index> {
         return None;
     }
 
+    let t_load = Instant::now();
     let blob_end = HDR + blob_len;
-    let blob = String::from_utf8(buf[HDR..blob_end].to_vec()).ok()?;
-    let items_end = blob_end + count * ITEM_BYTES;
-    let raw = &buf[blob_end..items_end];
-    let mut items = Vec::with_capacity(count);
-    for chunk in raw.chunks_exact(ITEM_BYTES) {
-        let item = Item {
-            path_off: u32::from_le_bytes(chunk[0..4].try_into().ok()?),
-            path_len: u32::from_le_bytes(chunk[4..8].try_into().ok()?),
-            name_off: u32::from_le_bytes(chunk[8..12].try_into().ok()?),
-            name_len: u32::from_le_bytes(chunk[12..16].try_into().ok()?),
-            size: u64::from_le_bytes(chunk[16..24].try_into().ok()?),
-            mtime: u64::from_le_bytes(chunk[24..32].try_into().ok()?),
-        };
-        // 偏移必须落在 blob 内且在 UTF-8 边界上，否则整份缓存作废
-        let ok = |off: u32, len: u32| {
-            let (o, l) = (off as usize, len as usize);
-            o.checked_add(l).map_or(false, |end| end <= blob.len())
-                && blob.is_char_boundary(o)
-                && blob.is_char_boundary(o + l as usize)
-        };
-        if !ok(item.path_off, item.path_len) || !ok(item.name_off, item.name_len) {
-            return None;
-        }
-        items.push(item);
+    let blob_bytes = buf[HDR..blob_end].to_vec();
+    if !utf8_valid_parallel(&blob_bytes) {
+        return None;
     }
+    // SAFETY: 上一行已校验整段是合法 UTF-8
+    let blob = unsafe { String::from_utf8_unchecked(blob_bytes) };
+    let items_end = blob_end + count * ITEM_BYTES;
+    let items = parallel_parse(count, ITEM_BYTES, &buf[blob_end..items_end], |raw| {
+        parse_items(raw, &blob)
+    })?;
 
     let dir_blob_end = items_end + dir_blob_len;
-    let dir_blob = String::from_utf8(buf[items_end..dir_blob_end].to_vec()).ok()?;
-    let mut dirs = Vec::with_capacity(dir_count);
-    for chunk in buf[dir_blob_end..].chunks_exact(DIR_BYTES) {
-        let rec = DirRec {
-            path_off: u32::from_le_bytes(chunk[0..4].try_into().ok()?),
-            path_len: u32::from_le_bytes(chunk[4..8].try_into().ok()?),
-            mtime: u64::from_le_bytes(chunk[8..16].try_into().ok()?),
-        };
-        let (o, l) = (rec.path_off as usize, rec.path_len as usize);
-        if !o
-            .checked_add(l)
-            .map_or(false, |end| end <= dir_blob.len())
-            || !dir_blob.is_char_boundary(o)
-            || !dir_blob.is_char_boundary(o + l)
-        {
-            return None;
-        }
-        dirs.push(rec);
+    let dir_bytes = buf[items_end..dir_blob_end].to_vec();
+    if !utf8_valid_parallel(&dir_bytes) {
+        return None;
+    }
+    // SAFETY: 同上
+    let dir_blob = unsafe { String::from_utf8_unchecked(dir_bytes) };
+    let dirs = parallel_parse(dir_count, DIR_BYTES, &buf[dir_blob_end..], |raw| {
+        parse_dirs(raw, &dir_blob)
+    })?;
+    if std::env::var_os("RUST_SEEK_DEBUG").is_some() {
+        eprintln!(
+            "[debug] cache load {} items / {} dirs in {:?}",
+            items.len(),
+            dirs.len(),
+            t_load.elapsed()
+        );
     }
 
     Some(Index {
@@ -2290,6 +2419,43 @@ mod tests {
     //!   2) `prefix_bounds` 给出的区间 == 线性筛出的子树（不漏不多）
     //! 以后改存储格式（目录/名字分离、mmap）时，这些用例必须原样通过。
     use super::*;
+
+    /// 实机探针（默认忽略）：拆 ensure_ready 与查询各自的耗时。
+    /// 运行：cargo test --release live_ready_timing -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_ready_timing() {
+        let t = std::time::Instant::now();
+        ensure_ready();
+        println!("ensure_ready: {:?}", t.elapsed());
+        let re = Regex::new("zzzz_no_such_q1").unwrap();
+        let exts = HashSet::new();
+        for i in 0..3 {
+            let t = std::time::Instant::now();
+            let r = query(&re, &["C:/".into(), "D:/".into()], &exts, 20, None, false);
+            println!(
+                "query {i}: {:?} hits={:?}",
+                t.elapsed(),
+                r.as_ref().map(|x| x.0.len())
+            );
+        }
+    }
+
+    /// 实机探针（默认忽略）：量一下载入 790MB 缓存到底花在哪。
+    /// 运行：cargo test --release live_cache_load_timing -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_cache_load_timing() {
+        for i in 0..3 {
+            let t = std::time::Instant::now();
+            let ix = load_cache();
+            println!(
+                "load {i}: {:?} entries={:?}",
+                t.elapsed(),
+                ix.as_ref().map(|x| x.items.len())
+            );
+        }
+    }
 
     /// 实机探针（默认忽略）：全盘建一次索引，验证「种下 USN 增量起点」。
     /// 运行：cargo test --release live_seed_usn -- --ignored --nocapture

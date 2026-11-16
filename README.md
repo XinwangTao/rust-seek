@@ -5,7 +5,7 @@
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue?logo=windows)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Version](https://img.shields.io/badge/version-5.4.0-brightgreen)
+![Version](https://img.shields.io/badge/version-5.4.1-brightgreen)
 
 ---
 

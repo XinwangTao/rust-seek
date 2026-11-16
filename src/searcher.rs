@@ -241,6 +241,8 @@ fn truncate(line: &str) -> String {
 /// 这些目录里的文件 Agent 基本不会要，却常常占掉整盘一半条目。
 pub const SKIP_DIRS: &[&str] = &[
     "$recycle.bin",
+    // NTFS 元数据目录：普通权限枚举不了，USN 里还会把被删项挂到这里
+    "$extend",
     "system volume information",
     "winsxs",
     "node_modules",

@@ -111,13 +111,16 @@ pub fn can_resume(info: &JournalInfo, expected_id: u64, start_usn: i64) -> bool 
 // ---------- 读记录 ----------
 
 /// 一条 USN 记录里我们需要的部分。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
-    /// 被改动条目自己的 FRN（重命名时要用来定位新位置，这里先保留备用）
+    /// 被改动条目自己的 FRN
     pub frn: u64,
     /// 父目录 FRN —— 索引只需要知道「哪个目录脏了」
     pub parent_frn: u64,
     pub reason: u32,
+    /// 条目名（UTF-16 转成 String）。父目录已被删掉、FRN 解析不出来时，
+    /// 靠「父路径 + 名字」把路径拼回来，避免为一条临时目录退化到全盘巡。
+    pub name: String,
 }
 
 /// 解析 `FSCTL_READ_USN_JOURNAL` 的返回缓冲：前 8 字节是下一个 USN，其后是记录串。
@@ -134,9 +137,20 @@ fn parse_records(buf: &[u8]) -> Vec<Record> {
         let frn = u64::from_le_bytes(buf[off + 8..off + 16].try_into().unwrap());
         let parent = u64::from_le_bytes(buf[off + 16..off + 24].try_into().unwrap());
         let reason = u32::from_le_bytes(buf[off + 40..off + 44].try_into().unwrap());
+        let name_len = u16::from_le_bytes(buf[off + 56..off + 58].try_into().unwrap()) as usize;
+        let name_off = u16::from_le_bytes(buf[off + 58..off + 60].try_into().unwrap()) as usize;
         // V2 用 64 位 FRN；V3 是 128 位，同一个字段解析方式不同，跳过。
         if major == 2 {
-            out.push(Record { frn, parent_frn: parent, reason });
+            let name = if name_off + name_len <= len && name_off >= 60 {
+                let units: Vec<u16> = buf[off + name_off..off + name_off + name_len]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                String::from_utf16_lossy(&units)
+            } else {
+                String::new()
+            };
+            out.push(Record { frn, parent_frn: parent, reason, name });
         }
         off += len;
     }
@@ -255,6 +269,33 @@ fn normalize(path: &str) -> String {
     p
 }
 
+/// 把目录 FRN 解析成索引用的路径。
+///
+/// 先直接开句柄问系统；目录已被删掉（临时目录很常见）时开不到，就顺着 USN 记录里的
+/// 「父 FRN + 名字」往上拼。拼出来的目录虽然已经不存在，但把它的路径交给增量刷新，
+/// 正好能把它整棵子树从索引里删掉——比因为一条临时目录退化到 17 秒全盘巡划算得多。
+fn resolve_dir(
+    volume: HANDLE,
+    frn: u64,
+    links: &HashMap<u64, (u64, String)>,
+    depth: usize,
+) -> Option<String> {
+    if let Some(p) = path_of_frn(volume, frn) {
+        return Some(p);
+    }
+    if depth == 0 {
+        return None;
+    }
+    let (parent, name) = links.get(&frn)?;
+    let base = resolve_dir(volume, *parent, links, depth - 1)?;
+    let joined = if base.ends_with('/') {
+        format!("{base}{name}")
+    } else {
+        format!("{base}/{name}")
+    };
+    Some(normalize(&joined))
+}
+
 // ---------- 快照状态 ----------
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -355,21 +396,67 @@ pub fn dirty_dirs_since_snapshot(drives: &[String]) -> Option<(Vec<String>, Vec<
     // 先把每块盘的增量都算出来：任何一块盘不可信，整体就不可信。
     let mut dirty: HashSet<String> = HashSet::new();
     let mut commits: Vec<Commit> = Vec::new();
+    let debug = std::env::var_os("RUST_SEEK_DEBUG").is_some();
     for drive_str in drives {
         let Some(ch) = drive_str.chars().next() else { return None };
-        let st = state.get(&key_of(ch))?;
-        let h = open_volume(ch)?;
+        let Some(st) = state.get(&key_of(ch)) else {
+            if debug {
+                eprintln!("[debug] usn {ch}: 没有快照");
+            }
+            return None;
+        };
+        let Some(h) = open_volume(ch) else {
+            if debug {
+                eprintln!("[debug] usn {ch}: 开卷失败");
+            }
+            return None;
+        };
         let outcome = (|| {
             let info = query_journal(h)?;
             if !can_resume(&info, st.journal_id, st.next_usn) {
+                if debug {
+                    eprintln!(
+                        "[debug] usn {ch}: 不能续 id_saved={} id_now={} start={} lowest={} next={}",
+                        st.journal_id, info.journal_id, st.next_usn, info.lowest_valid, info.next_usn
+                    );
+                }
                 return None;
             }
             let (records, next_usn) = read_from(h, info.journal_id, st.next_usn)?;
+            // 记录里带 FRN 和名字：父目录已被删掉时，靠父链把路径拼回来
+            let mut links: HashMap<u64, (u64, String)> = HashMap::with_capacity(records.len());
+            for r in &records {
+                if !r.name.is_empty() {
+                    links.insert(r.frn, (r.parent_frn, r.name.clone()));
+                }
+            }
             // 父目录去重后逐个解析成路径
             let parents: HashSet<u64> = records.iter().map(|r| r.parent_frn).collect();
             let mut dirs: Vec<String> = Vec::with_capacity(parents.len());
-            for frn in parents {
-                dirs.push(path_of_frn(h, frn)?);
+            let mut failed = 0usize;
+            for frn in &parents {
+                match resolve_dir(h, *frn, &links, 8) {
+                    Some(p) => dirs.push(p),
+                    None => {
+                        failed += 1;
+                        if debug && failed <= 5 {
+                            eprintln!("[debug] usn {ch}: FRN 解析失败 {frn:#x}");
+                        }
+                    }
+                }
+            }
+            if debug {
+                eprintln!(
+                    "[debug] usn {ch}: records={} parents={} dirs={} failed={}",
+                    records.len(),
+                    parents.len(),
+                    dirs.len(),
+                    failed
+                );
+            }
+            // 拼不回来的目录没法定位：这时才回退全盘巡（宁慢勿错）。
+            if failed > 0 {
+                return None;
             }
             Some((dirs, Commit { drive: ch, journal_id: info.journal_id, next_usn }))
         })();
@@ -469,6 +556,30 @@ mod tests {
         // 状态文件不存在时必须是 None（回退全盘巡），不能返回「零脏目录」
         let drives = vec!["Z:".to_string()];
         assert!(dirty_dirs_since_snapshot(&drives).is_none());
+    }
+
+    /// 实机探针（默认忽略）：目录建了又删时，父 FRN 已经打不开——
+    /// 必须靠「父链 + 名字」把路径拼回来，而不是直接放弃增量。
+    /// 运行：cargo test --release live_usn_deleted_dir -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_usn_deleted_dir_resolves() {
+        let drives = vec!["C:".to_string()];
+        let root = std::path::Path::new(r"C:\usn_probe_dir_zz");
+        let _ = std::fs::remove_dir_all(root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("a.txt"), b"x").unwrap();
+        commit(&snapshot_before_sweep(&drives));
+        std::fs::remove_dir_all(root).unwrap();
+        // 关键性质：删掉一整棵树之后，增量仍然可用（不能退回 17 秒全盘巡）。
+        // NTFS 会把被删子项重挂到 $Extend/$Deleted，父 FRN 往往已经打不开，
+        // 这时靠父链 + 名字把路径拼回来，或者至少落到仍存在的祖先目录上。
+        let (dirty, _) = dirty_dirs_since_snapshot(&drives).expect("删除后增量不可用");
+        println!("dirty={dirty:?}");
+        assert!(
+            !dirty.is_empty(),
+            "删掉一棵树却没有任何脏目录，索引会留下幽灵条目"
+        );
     }
 
     /// 实机探针（默认忽略）：提交快照 → 再算增量，验证整条链路能跑通。
