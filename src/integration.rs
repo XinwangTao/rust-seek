@@ -738,50 +738,55 @@ pub fn autostart_enabled() -> bool {
     task_exists() || legacy_run_present()
 }
 
+/// 创建「登录时触发、最高权限」的计划任务。抽出来是为了让实机探针能用临时任务名验证参数转义。
+fn create_task(name: &str, exe: &std::path::Path) -> std::io::Result<()> {
+    let out = run_quiet(
+        "schtasks",
+        &[
+            "/Create".to_string(),
+            "/TN".to_string(),
+            name.to_string(),
+            "/TR".to_string(),
+            format!("\"{}\" --hidden", exe.display()),
+            "/SC".to_string(),
+            "ONLOGON".to_string(),
+            "/RL".to_string(),
+            "HIGHEST".to_string(),
+            "/F".to_string(),
+        ],
+    )?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let msg = if msg.is_empty() {
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    } else {
+        msg
+    };
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        if msg.is_empty() { "schtasks 创建任务失败".to_string() } else { msg },
+    ))
+}
+
+fn delete_task(name: &str) {
+    let _ = run_quiet(
+        "schtasks",
+        &["/Delete".to_string(), "/TN".to_string(), name.to_string(), "/F".to_string()],
+    );
+}
+
 pub fn set_autostart(on: bool) -> std::io::Result<()> {
     if on {
         let exe = std::env::current_exe()?;
-        let out = run_quiet(
-            "schtasks",
-            &[
-                "/Create".to_string(),
-                "/TN".to_string(),
-                TASK_NAME.to_string(),
-                "/TR".to_string(),
-                format!("\"{}\" --hidden", exe.display()),
-                "/SC".to_string(),
-                "ONLOGON".to_string(),
-                "/RL".to_string(),
-                "HIGHEST".to_string(),
-                "/F".to_string(),
-            ],
-        )?;
-        if !out.status.success() {
-            let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let msg = if msg.is_empty() {
-                String::from_utf8_lossy(&out.stdout).trim().to_string()
-            } else {
-                msg
-            };
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                if msg.is_empty() { "schtasks 创建任务失败".to_string() } else { msg },
-            ));
-        }
+        create_task(TASK_NAME, &exe)?;
         // 旧的 HKCU\Run 条目必须清掉：否则登录时会先起一个普通权限实例，
         // 单实例互斥让它占位，计划任务的管理员实例反而起不来。
         remove_legacy_run();
         Ok(())
     } else {
-        let _ = run_quiet(
-            "schtasks",
-            &[
-                "/Delete".to_string(),
-                "/TN".to_string(),
-                TASK_NAME.to_string(),
-                "/F".to_string(),
-            ],
-        );
+        delete_task(TASK_NAME);
         remove_legacy_run();
         Ok(())
     }
@@ -835,3 +840,52 @@ pub fn restart_explorer() {
         .spawn();
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode(raw: &[u8]) -> String {
+        // schtasks /XML 在中文系统上是 UTF-16LE（含 BOM），英文系统是 ANSI
+        let odd_zeros = raw.iter().skip(1).step_by(2).filter(|b| **b == 0).count();
+        if odd_zeros * 2 > raw.len() / 2 {
+            let units: Vec<u16> = raw
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        } else {
+            String::from_utf8_lossy(raw).into_owned()
+        }
+    }
+
+    /// 实机探针（默认忽略）：用临时任务名跑「创建 → 校验 → 删除」，
+    /// 确认 schtasks 收到的参数真的变成「最高权限 + 登录触发 + 指向本 exe」。
+    /// 运行：cargo test --release live_autostart_task -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_autostart_task() {
+        let name = "RustSeekSelftest";
+        let exe = std::env::current_exe().unwrap();
+        create_task(name, &exe).expect("创建计划任务失败");
+        let out = run_quiet(
+            "schtasks",
+            &[
+                "/Query".to_string(),
+                "/TN".to_string(),
+                name.to_string(),
+                "/XML".to_string(),
+            ],
+        )
+        .unwrap();
+        delete_task(name);
+        let xml = decode(&out.stdout);
+        let lower = xml.to_lowercase();
+        assert!(lower.contains("highestavailable"), "RunLevel 不是 Highest:
+{xml}");
+        assert!(lower.contains("<logontrigger>"), "触发器不是登录:
+{xml}");
+        assert!(lower.contains("rust_seek-"), "命令没指向当前 exe:
+{xml}");
+    }
+}
