@@ -2122,10 +2122,36 @@ fn fmt_time_short(unix: i64) -> String {
     }
 }
 
+fn explorer_reveal_command(path: &str) -> std::process::Command {
+    let native = path.replace('/', "\\");
+    let mut cmd = std::process::Command::new("explorer.exe");
+    cmd.arg("/select,").arg(native);
+    cmd
+}
+
 fn reveal_in_explorer(path: &str) {
-    // /select, and the path must be a single argument — splitting them breaks explorer
-    let arg = format!("/select,{}", path);
-    let _ = std::process::Command::new("explorer").arg(arg).spawn();
+    // Explorer 的解析不是普通 argv 语义：`/select,` 必须单独一项，路径是下一项。
+    // 合成 `/select,C:\a\b` 一个参数时，进程能启动、甚至返回退出码 1，但目录不会打开。
+    // 索引结果使用正斜杠，顺手归一成 Windows 原生形式，避免不同结果来源行为不一致。
+    if let Err(e) = explorer_reveal_command(path).spawn() {
+        eprintln!("rust-seek: 无法在文件夹中显示 {path}: {e}");
+    }
+}
+
+#[cfg(test)]
+mod explorer_reveal_tests {
+    #[test]
+    #[ignore]
+    fn live_reveal_opens_real_explorer() {
+        super::reveal_in_explorer("C:/Users/Administrator/rust-seek/target/release/rust-seek.exe");
+    }
+
+    #[test]
+    fn select_switch_and_native_path_are_separate_arguments() {
+        let cmd = super::explorer_reveal_command("D:/a folder/report.md");
+        let args: Vec<_> = cmd.get_args().map(|s| s.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["/select,", r"D:\a folder\report.md"]);
+    }
 }
 
 fn push_history(history: &mut Vec<String>, value: String) {

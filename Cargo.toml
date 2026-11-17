@@ -1,6 +1,6 @@
 [package]
 name = "rust-seek"
-version = "5.4.7"
+version = "5.4.8"
 edition = "2021"
 description = "A high-performance file and text search tool"
 
