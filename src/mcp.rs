@@ -932,14 +932,29 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// roots 全是盘符根（`C:/`、`D:/`）时才可能有对应的整盘索引。
+/// roots 全是卷根（`C:/`、`D:/`，或 Unix/macOS 的 `/`）时才可能有对应的整盘索引。
 fn roots_are_drives(roots: &[String]) -> bool {
     !roots.is_empty()
         && roots.iter().all(|r| {
             let b = r.as_bytes();
-            b.len() == 3
+            let windows_drive = b.len() == 3
                 && b[0].is_ascii_alphabetic()
                 && b[1] == b':'
-                && (b[2] == b'/' || b[2] == b'\\')
+                && (b[2] == b'/' || b[2] == b'\\');
+            // macOS/Linux 的整个卷根也是「整盘」。
+            windows_drive || r == "/"
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volume_roots_are_recognised() {
+        assert!(roots_are_drives(&["C:/".to_string(), "D:\\".to_string()]));
+        assert!(roots_are_drives(&["/".to_string()]));
+        assert!(!roots_are_drives(&["/Users/a".to_string()]));
+        assert!(!roots_are_drives(&[]));
+    }
 }

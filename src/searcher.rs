@@ -317,20 +317,51 @@ pub fn path_in_noise_dir(path: &Path) -> bool {
     })
 }
 
-/// 盘符根下第一层的大头目录（`C:\Windows`、`C:\Program Files` 等）。
+/// 卷根下第一层的大头目录（Windows 的 `C:\Windows`、`C:\Program Files`；
+/// macOS 的 `/System`、`/Library`、`/private` 等）。
 ///
-/// 只认「盘符 + 目录名」这两段，绝不按任意层级匹配：项目里常有 `src\windows`、
+/// 只认「卷根 + 目录名」这两段，绝不按任意层级匹配：项目里常有 `src\windows`、
 /// `web\Program Files` 这类同名目录，整层剪掉会直接搜不到代码。
+///
+/// macOS 上 `local_drives()` 返回 `/`，整盘索引会把 `/System`（约占目录 70%、
+/// 文件 61%）、`/Library`、`/usr`、`/private` 全部收进来：本机实测 141.8 万文件 /
+/// 41.1 万目录 / 290MB 缓存。这些目录与 Windows 的系统目录同义，必须同样剪掉，
+/// 否则每次全量巡/兜底遍历都在扫系统文件，弱机器上直接卡死。
 pub fn path_is_system_root(path: &Path) -> bool {
-    let mut comps = path
-        .components()
-        .filter(|c| !matches!(c, std::path::Component::RootDir));
+    let mut comps = path.components();
     match (comps.next(), comps.next()) {
         (Some(std::path::Component::Prefix(_)), Some(std::path::Component::Normal(s))) => {
             s.to_str().map_or(false, is_system_root_name)
         }
+        (Some(std::path::Component::RootDir), Some(std::path::Component::Normal(s))) => {
+            s.to_str().map_or(false, is_unix_system_root_name)
+        }
         _ => false,
     }
+}
+
+/// macOS 卷根下的系统目录（大小写敏感，按实际名字精确匹配）。
+#[cfg(target_os = "macos")]
+fn is_unix_system_root_name(name: &str) -> bool {
+    matches!(
+        name,
+        "System" | "Library" | "private" | "usr" | "bin" | "sbin" | "dev" | "cores"
+    )
+}
+
+/// 其他 Unix 卷根下的系统目录（保守列表：只含明确不该出现在搜索结果里的）。
+#[cfg(all(unix, not(target_os = "macos")))]
+fn is_unix_system_root_name(name: &str) -> bool {
+    matches!(
+        name,
+        "proc" | "sys" | "dev" | "usr" | "bin" | "sbin" | "lib" | "lib64" | "boot"
+    )
+}
+
+/// Windows 上没有 Unix 风格的卷根系统目录；保留函数让匹配分支保持穷举。
+#[cfg(windows)]
+fn is_unix_system_root_name(_name: &str) -> bool {
+    false
 }
 
 fn is_system_root_name(name: &str) -> bool {
@@ -371,5 +402,63 @@ pub fn file_icon(path: &str) -> &'static str {
         "lnk" => "🔗",
         "db" | "sqlite" | "sql" => "🗄",
         _ => "📄",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_volume_root_system_dirs_are_pruned() {
+        for p in [
+            "/System",
+            "/System/Volumes/Data",
+            "/Library/Application Support",
+            "/private/var/log",
+            "/usr/local/bin",
+            "/bin",
+            "/sbin",
+            "/dev",
+            "/cores",
+        ] {
+            assert!(path_is_system_root(Path::new(p)), "{p} 应被剪掉");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_user_and_app_dirs_are_not_pruned() {
+        for p in [
+            "/",
+            "/Users/Zhuanz2/Documents/System",
+            "/Users/Zhuanz2/Library/Application Support",
+            "/Applications/Xcode.app",
+            "/opt/homebrew/bin",
+            "System/Library", // 相对路径：不是卷根下第一层
+        ] {
+            assert!(!path_is_system_root(Path::new(p)), "{p} 不应被剪掉");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn noise_dirs_still_apply_at_any_depth() {
+        assert!(path_in_noise_dir(Path::new(
+            "/Users/a/project/node_modules/pkg/index.js"
+        )));
+        assert!(!path_in_noise_dir(Path::new(
+            "/Users/a/project/src/main.rs"
+        )));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_root_system_dirs_are_pruned() {
+        assert!(path_is_system_root(Path::new("C:\\Windows\\System32")));
+        assert!(path_is_system_root(Path::new("D:\\Program Files\\App")));
+        assert!(!path_is_system_root(Path::new("C:\\Users\\a\\Windows")));
+        assert!(!path_is_system_root(Path::new("C:\\")));
     }
 }

@@ -37,10 +37,12 @@ const TTL_SECS: u64 = 24 * 3600;
 /// 超过这个年龄的缓存直接不用，重新遍历
 const MAX_CACHE_AGE_SECS: u64 = 7 * 24 * 3600;
 
-/// 缓存格式 v4：在 v3 基础上加一张「目录表」（目录路径 + 该目录自身的 LastWriteTime）。
+/// 缓存格式 v5：在 v4 基础上收紧剪枝口径 —— macOS 同样剪掉卷根下的
+/// `/System`、`/Library`、`/private`、`/usr` 等系统目录。旧缓存里含这些条目，
+/// 必须整体作废重扫一次，否则旧条目会一直留在目录表里被 stat 巡反复扫到。
 /// 目录 mtime 不变 ⇒ 里面没有增删改名 ⇒ 整棵子树可以整段复用，增量刷新不用重扫全盘。
 /// 旧版本缓存因 MAGIC 不匹配自动作废，重新建一次即可。
-const MAGIC: &[u8; 8] = b"RSKIDX\x04\x00";
+const MAGIC: &[u8; 8] = b"RSKIDX\x05\x00";
 const HDR: usize = 56;
 const FLAG_COMPLETE: u64 = 1 << 0;
 /// 刷新时有目录读不到：该子树按旧快照给出，结果里要如实标注
@@ -2109,8 +2111,12 @@ fn ext_matches(name: &str, exts: &HashSet<String>) -> bool {
 // ---------- 磁盘缓存 ----------
 
 fn cache_path() -> Option<PathBuf> {
+    // Windows 用 %LOCALAPPDATA%；macOS/Linux 用系统缓存目录（~/Library/Caches 等）。
+    // 以前非 Windows 落到 std::env::temp_dir()，系统清临时目录后每次启动都要
+    // 重建整盘索引，白白多扫一遍盘。
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
+        .or_else(dirs::cache_dir)
         .unwrap_or_else(std::env::temp_dir);
     Some(base.join("rust-seek").join("index-v1.bin"))
 }

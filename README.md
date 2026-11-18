@@ -175,7 +175,8 @@ claude mcp add rust-seek -- "F:\path\to\rust-seek.exe" --mcp
 | 进程重启后首次查询（从磁盘缓存载入） | **0.12s** |
 | 项目内查询（不走索引） | < 10ms |
 
-- 缓存位置 `%LOCALAPPDATA%\rust-seek\index-v1.bin`（约 590MB），**每 2 分钟没刷新过就先做一次增量刷新**，24 小时以上才排一次后台整盘重建，7 天后强制重建
+- 缓存位置：Windows `%LOCALAPPDATA%\rust-seek\index-v1.bin`；macOS/Linux `~/Library/Caches/rust-seek/index-v1.bin`（约 60–590MB，随条目数变化），**每 2 分钟没刷新过就先做一次增量刷新**，24 小时以上才排一次后台整盘重建，7 天后强制重建
+- 剪枝只在「卷根下一层」生效：Windows 剪 `C:\Windows`、`Program Files` 等，macOS 剪 `/System`、`/Library`、`/private`、`/usr` 等；项目里的同名目录不受影响
 - 常驻内存约 800MB（620 万条）；只存文件（目录只存“路径 + mtime” 用于增量刷新），剪枝规则和普通搜索一致，所以结果集相同
 
 ### 增量刷新（v5.0.0）
