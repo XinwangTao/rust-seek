@@ -217,6 +217,8 @@ macOS 没有 `ReadDirectoryChangesW`，改用原生 FSEvents 做同一套增量�
   系统噪声不会进入用户态，也不会把索引刷新变成永动机
 - 持久化 `FSEventStreamEventId`，新进程用 `sinceWhen` 回放停机期间的事件；
   回放完成前不信任索引，只有丢事件（`MustScanSubDirs` 等）才退回一次全量 stat 巡
+- 首次升级 / 事件 ID 丢失 / 换启动卷：做一次后台对账（本机 43k 目录，约 0.5–1s），
+  随后把当前事件 ID 落盘；此后不再全量巡
 - 监听、索引构建/刷新线程降到 `QOS_CLASS_BACKGROUND` + `IOPOL_THROTTLE`，
   用户搜索线程保持前台优先级：后台维护不抢 I/O，搜索速度不变
 - 本机实测（8GB Intel）：索引 192,312 文件 / 43,022 目录 / 35MB；

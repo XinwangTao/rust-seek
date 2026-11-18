@@ -921,6 +921,7 @@ pub fn spawn_refresh_async() -> bool {
             return;
         };
         // 扫盘阶段：不持锁
+        let snap = snapshot_event_id();
         let (mut dirty, stat_failed) = scan_dirty_dirs(&dir_blob, &dirs, now_unix(), true);
         drop(dir_blob);
         if !dirty.is_empty() {
@@ -936,11 +937,17 @@ pub fn spawn_refresh_async() -> bool {
             index.built_unix = now_unix();
             index.incomplete_dirs = stat_failed;
             NEED_FULL_SCAN.store(false, Ordering::Relaxed);
+            if !stat_failed {
+                stamp_snapshot(snap);
+            }
             return;
         }
         let hint: Vec<String> = dirty.into_iter().map(|(k, _)| k).collect();
         if refresh_in_place(index, Some(hint), true) {
             NEED_FULL_SCAN.store(false, Ordering::Relaxed);
+            if !stat_failed {
+                stamp_snapshot(snap);
+            }
         }
         // 扫盘期间（约 10s）又攒下的变更，接着补上，最多 3 轮
         for _ in 0..3 {
@@ -990,6 +997,9 @@ fn refresh_with(index: &mut Index) -> bool {
         }
         return ok;
     }
+    // 记下巡开始前的事件 ID：巡完之后把「这次快照」的时间点落盘，
+    // 下次启动从该点回放，连这次巡之后发生的变更也不会漏。
+    let snap = snapshot_event_id();
     let ok = refresh_in_place(index, None, false);
     if ok {
         NEED_FULL_SCAN.store(false, Ordering::Relaxed);
@@ -1000,6 +1010,7 @@ fn refresh_with(index: &mut Index) -> bool {
         // 都要各自再巡一遍 31.7 万目录（本机约 20s）。写盘后后来者加载到的
         // 缓存年龄接近 0，ensure_ready 会直接跳过巡。
         save_cache(index);
+        stamp_snapshot(snap);
     }
     ok
 }
@@ -1325,6 +1336,22 @@ fn watch_volume(root: &str) {
 #[cfg(all(unix, not(target_os = "macos")))]
 fn watch_volume(_root: &str) {}
 
+/// 全量构建/巡开始时的事件 ID（macOS）；成功后作为快照点落盘。
+#[cfg(target_os = "macos")]
+fn snapshot_event_id() -> u64 {
+    mac_watch::current_id()
+}
+#[cfg(not(target_os = "macos"))]
+fn snapshot_event_id() -> u64 {
+    0
+}
+#[cfg(target_os = "macos")]
+fn stamp_snapshot(id: u64) {
+    mac_watch::stamp(id)
+}
+#[cfg(not(target_os = "macos"))]
+fn stamp_snapshot(_id: u64) {}
+
 /// macOS 原生 FSEvents 监听：内核事件驱动索引增量刷新，不轮询、不扫盘。
 ///
 /// 要点：
@@ -1353,6 +1380,12 @@ mod mac_watch {
     /// 回放期间没有丢事件/没有 MustScanSubDirs
     static HISTORY_TRUSTED: AtomicBool = AtomicBool::new(true);
     static LAST_ID: AtomicU64 = AtomicU64::new(0);
+    /// 只有在「索引已经成为可信快照」之后才允许落 ID：
+    /// 否则一个短命进程会把「流刚启动的 ID」写成快照点，下次启动回放会漏掉空窗，
+    /// 从而错误地信任旧索引。
+    static SNAPSHOT_READY: AtomicBool = AtomicBool::new(false);
+    /// 本次流的起点 ID（有持久 ID 时）；没有事件时用它落盘
+    static SINCE_ID: AtomicU64 = AtomicU64::new(0);
     /// 只用于 journal 落盘，不在 FSEvents 回调里做磁盘 I/O
     static JOURNAL_BATCH: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -1360,8 +1393,13 @@ mod mac_watch {
         crate::qos::set_background();
         let root = normalize_root(root);
         let saved = read_last_id();
+        // 有持久 ID 就回放停机期间的变更；没有（首次升级/ID 丢失/换卷）只能
+        // 让调用方做一次后台对账。之后每次运行都会把当前 ID 落盘，不再重复巡。
+        // 注：FSEventsGetLastEventIdForDeviceBeforeTime 在本机 APFS 上恒返回 0，
+        // 无法用「缓存快照时刻」直接换 ID，故不采用。
         HAS_HISTORY.store(saved.is_some(), Ordering::Relaxed);
         let since = saved.unwrap_or(fs::kFSEventStreamEventIdSinceNow);
+        SINCE_ID.store(since, Ordering::Relaxed);
 
         let watch_paths = vec![root];
         let exclusions = exclusion_paths();
@@ -1456,6 +1494,9 @@ mod mac_watch {
         }
         flush_journal();
         if HISTORY_TRUSTED.load(Ordering::Relaxed) {
+            // 历史回放已经把停机期间的变化补进脏队列，此刻的索引就是可信快照
+            SNAPSHOT_READY.store(true, Ordering::Relaxed);
+            persist_id();
             NEED_FULL_SCAN.store(false, Ordering::Relaxed);
         }
     }
@@ -1632,9 +1673,48 @@ mod mac_watch {
         cache_path().map(|p| p.with_file_name("fsevent-id"))
     }
 
+    /// 当前全局事件 ID：建索引/全量巡开始时取一次，成功后作为快照点落盘。
+    pub fn current_id() -> u64 {
+        unsafe { fs::FSEventsGetCurrentEventId() }
+    }
+
+    /// 索引已成为可信快照（构建或全量巡完成）后调用：把快照点写入 `fsevent-id`。
+    pub fn stamp(id: u64) {
+        if id == 0 || id == fs::kFSEventStreamEventIdSinceNow {
+            return;
+        }
+        SNAPSHOT_READY.store(true, Ordering::Relaxed);
+        let _ = LAST_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            if id > cur {
+                Some(id)
+            } else {
+                None
+            }
+        });
+        persist_id();
+    }
+
+    /// 当前启动卷的设备号：FSEvents 事件 ID 是「每卷」的，换卷后不能沿用。
+    fn root_dev() -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/").map_or(0, |m| m.dev())
+    }
+
+    /// `fsevent-id` 内容：`<dev> <id>`（旧版本是单个 id）。
+    /// 设备号对不上就不认，避免换启动卷后拿别的卷的事件 ID 回放。
     fn read_last_id() -> Option<u64> {
         let text = std::fs::read_to_string(id_path()?).ok()?;
-        let id = text.trim().parse::<u64>().ok()?;
+        let mut it = text.split_whitespace();
+        let first = it.next()?.parse::<u64>().ok()?;
+        let id = match it.next().and_then(|s| s.parse::<u64>().ok()) {
+            Some(id) => {
+                if first != root_dev() {
+                    return None;
+                }
+                id
+            }
+            None => first, // 旧格式
+        };
         if id == 0 || id == fs::kFSEventStreamEventIdSinceNow {
             None
         } else {
@@ -1645,13 +1725,29 @@ mod mac_watch {
     /// 只前进不后退：多个进程共享同一份 ID，落后的一份回放更多（无害），
     /// 但绝不能让 ID 倒退而漏事件。
     fn persist_id() {
-        let id = LAST_ID.load(Ordering::Relaxed);
-        if id == 0 {
+        // 只有索引已是可信快照时才允许落 ID；否则下一次启动会把
+        // 「流刚启动的 ID」当快照点，回放漏掉空窗，错误信任旧索引。
+        if !SNAPSHOT_READY.load(Ordering::Relaxed) {
             return;
         }
+        let id = match LAST_ID.load(Ordering::Relaxed) {
+            0 => SINCE_ID.load(Ordering::Relaxed),
+            id => id,
+        };
+        if id == 0 || id == fs::kFSEventStreamEventIdSinceNow {
+            return;
+        }
+        let dev = root_dev();
         let Some(path) = id_path() else { return };
         if let Ok(text) = std::fs::read_to_string(&path) {
-            if text.trim().parse::<u64>().map_or(false, |cur| cur >= id) {
+            let parts: Vec<&str> = text.split_whitespace().collect();
+            let (cur_dev, cur_id) = match parts.as_slice() {
+                [d, i] => (d.parse::<u64>().ok(), i.parse::<u64>().ok()),
+                [i] => (None, i.parse::<u64>().ok()),
+                _ => (None, None),
+            };
+            let same_vol = cur_dev.map_or(true, |d| d == dev);
+            if same_vol && cur_id.map_or(false, |cur| cur >= id) {
                 return;
             }
         }
@@ -1659,7 +1755,7 @@ mod mac_watch {
             let _ = std::fs::create_dir_all(parent);
         }
         let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-        if std::fs::write(&tmp, id.to_string()).is_ok() {
+        if std::fs::write(&tmp, format!("{dev} {id}")).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
     }
@@ -2342,6 +2438,8 @@ fn build_with_match(
     // 遍历过程中新建的文件可能落在已扫过的目录里而没进索引。
     // 用开始时间做新鲜度基准，零命中兜底才不会被刚建完的索引误判为「已最新」。
     let build_started = now_unix();
+    // 构建开始前的事件 ID：构建完成后作为快照点落盘，下次启动只需回放构建期间的变更。
+    let snap = snapshot_event_id();
     let roots: Vec<PathBuf> = integration::local_drives()
         .into_iter()
         .map(|d| PathBuf::from(integration::drive_root(&d)))
@@ -2495,6 +2593,10 @@ fn build_with_match(
         complete,
         incomplete_dirs: false,
     };
+    if complete {
+        // 只有完整索引才能作为「可信快照点」；撞上限的部分索引仍要靠下次巡兜底
+        stamp_snapshot(snap);
+    }
     Some((index, hits.into_inner().unwrap_or_default()))
 }
 
