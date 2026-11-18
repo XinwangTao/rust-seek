@@ -33,6 +33,9 @@ pub struct Options {
     /// 是否把隐藏项（Windows 隐藏属性 / 点开头）也报出来
     pub include_hidden: bool,
     pub threads: usize,
+    /// 索引维护/后台预热：遍历线程降到后台 QoS + I/O throttle（macOS），
+    /// 不抢前台搜索与系统交互。用户主动发起的搜索传 false。
+    pub background: bool,
 }
 
 /// 遍历若干根目录，返回扫描到的条目数。
@@ -72,6 +75,8 @@ mod imp {
     where
         F: Fn(&Path, &Info) -> Step + Sync,
     {
+        // Windows 侧暂不接后台优先级；读一下字段避免「从未使用」告警。
+        let _ = opts.background;
         let jobs: VecDeque<(PathBuf, usize)> = roots
             .iter()
             .map(|r| (absolutize(r), 0))
@@ -329,11 +334,17 @@ mod imp {
         let count = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let visit = Arc::new(visit);
+        let background = opts.background;
         builder.build_parallel().run(|| {
             let count = count.clone();
             let stop = stop.clone();
             let visit = visit.clone();
             Box::new(move |entry| {
+                // 后台索引维护：让 OS 把本线程的 CPU/I-O 压到最低档（仅 macOS 生效；
+                // 线程本地标记保证每个遍历线程只调一次）。
+                if background {
+                    crate::qos::set_background();
+                }
                 if stop.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
                     return WalkState::Quit;
                 }
