@@ -303,18 +303,52 @@ pub fn is_noise_dir_name(name: &str) -> bool {
     )
 }
 
+/// `~/Library` 下高频抖动、几乎不承载用户文件的目录（macOS）。
+///
+/// 这些目录（缓存/容器/日志/窗口状态）在系统运行时每秒都有写入；把它们收进索引，
+/// FSEvents 会持续产生脏目录、索引刷新变成永动机。它们也不是文件搜索的目标，
+/// 与 node_modules / WinSxS 同属「噪声」，默认整棵剪掉。
+#[cfg(target_os = "macos")]
+pub fn path_is_user_library_noise(path: &Path) -> bool {
+    let Some(home) = home_dir_cached() else {
+        return false;
+    };
+    let Ok(rest) = path.strip_prefix(home.join("Library")) else {
+        return false;
+    };
+    matches!(
+        rest.components()
+            .next()
+            .and_then(|c| c.as_os_str().to_str()),
+        Some("Caches" | "Containers" | "Group Containers" | "Logs" | "Saved Application State")
+    )
+}
+
+/// `dirs::home_dir()` 可能走 getpwuid；FSEvents 回调里每条事件都调一次太贵。
+#[cfg(target_os = "macos")]
+fn home_dir_cached() -> Option<&'static std::path::Path> {
+    static HOME: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    HOME.get_or_init(dirs::home_dir).as_deref()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn path_is_user_library_noise(_path: &Path) -> bool {
+    false
+}
+
 /// 路径中任意一段是整机噪声目录：回收站/系统还原/WinSxS，以及 node_modules、
-/// .git、target 等常见构建/依赖目录。
+/// .git、target 等常见构建/依赖目录；macOS 另加 `~/Library` 的抖动目录。
 ///
 /// 口径必须与索引建库（`index::is_pruned`）一致：否则同一台机器的文件名搜索，
 /// 走索引和走遍历会返回不同结果集。
 pub fn path_in_noise_dir(path: &Path) -> bool {
-    path.components().any(|c| match c {
-        std::path::Component::Normal(s) => s.to_str().map_or(false, |n| {
-            is_noise_dir_name(n) || SKIP_DIRS.iter().any(|d| n.eq_ignore_ascii_case(d))
-        }),
-        _ => false,
-    })
+    path_is_user_library_noise(path)
+        || path.components().any(|c| match c {
+            std::path::Component::Normal(s) => s.to_str().map_or(false, |n| {
+                is_noise_dir_name(n) || SKIP_DIRS.iter().any(|d| n.eq_ignore_ascii_case(d))
+            }),
+            _ => false,
+        })
 }
 
 /// 卷根下第一层的大头目录（Windows 的 `C:\Windows`、`C:\Program Files`；
@@ -451,6 +485,28 @@ mod tests {
         assert!(!path_in_noise_dir(Path::new(
             "/Users/a/project/src/main.rs"
         )));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_user_library_noise_is_pruned_but_user_data_is_not() {
+        let home = dirs::home_dir().expect("home");
+        for p in [
+            "Caches",
+            "Containers",
+            "Group Containers",
+            "Logs",
+            "Saved Application State",
+        ] {
+            assert!(
+                path_in_noise_dir(&home.join("Library").join(p).join("x")),
+                "~/Library/{p} 应被剪掉"
+            );
+        }
+        assert!(!path_in_noise_dir(
+            &home.join("Library/Application Support/app/data.db")
+        ));
+        assert!(!path_in_noise_dir(&home.join("Downloads/Library/Caches/x")));
     }
 
     #[cfg(windows)]

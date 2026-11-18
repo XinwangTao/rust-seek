@@ -207,6 +207,23 @@ claude mcp add rust-seek -- "F:\path\to\rust-seek.exe" --mcp
 - 监听可信时索引就是当前文件系统的权威视图，零命中直接回「没有」，
   不必再花 20–50s 走一遍全盘遍历
 
+### macOS：FSEvents
+
+macOS 没有 `ReadDirectoryChangesW`，改用原生 FSEvents 做同一套增量维护：
+
+- **目录级事件 + 0.5s 合并**（不开启 `FileEvents`、不轮询），只记「哪个目录变了」
+- `FSEventStreamSetExclusionPaths` 在**内核侧**排除 `/System`、`/Library`、`/private`、`/usr`
+  以及 `~/Library/{Caches,Containers,Group Containers,Logs,Saved Application State}`；
+  系统噪声不会进入用户态，也不会把索引刷新变成永动机
+- 持久化 `FSEventStreamEventId`，新进程用 `sinceWhen` 回放停机期间的事件；
+  回放完成前不信任索引，只有丢事件（`MustScanSubDirs` 等）才退回一次全量 stat 巡
+- 监听、索引构建/刷新线程降到 `QOS_CLASS_BACKGROUND` + `IOPOL_THROTTLE`，
+  用户搜索线程保持前台优先级：后台维护不抢 I/O，搜索速度不变
+- 本机实测（8GB Intel）：索引 192,312 文件 / 43,022 目录 / 35MB；
+  停机新建的文件重启后 **0.43s** 命中、全程零全量巡；零命中查询 **0.2s** 返回（不再兜底遍历）
+- 剪枝口径：Windows 剪盘根 `C:\Windows`、`Program Files` 等；macOS 剪卷根
+  `/System`、`/Library`、`/private`、`/usr` 等，外加 `~/Library` 抖动目录；项目内同名目录不受影响
+
 ### 变更日志（v5.0.0）
 
 监听只在进程活着时有效。新进程启动时，「上次退出到现在」发生了什么并不知道——

@@ -1184,6 +1184,8 @@ impl App {
             let opts = fastwalk::Options {
                 include_hidden: false,
                 threads,
+                // 用户主动搜索：保持前台优先级
+                background: false,
             };
             let seen_walk = seen.clone();
             let visited = fastwalk::walk(&walk_roots, &opts, &cancelled, |path, info| {

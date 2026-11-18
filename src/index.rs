@@ -16,7 +16,7 @@
 
 use crate::fastwalk::{self, Step};
 use crate::integration;
-use crate::searcher::{is_noise_dir_name, path_is_system_root, SKIP_DIRS};
+use crate::searcher::{path_in_noise_dir, path_is_system_root};
 use regex::Regex;
 use std::collections::HashSet;
 use std::io::Write;
@@ -37,12 +37,11 @@ const TTL_SECS: u64 = 24 * 3600;
 /// 超过这个年龄的缓存直接不用，重新遍历
 const MAX_CACHE_AGE_SECS: u64 = 7 * 24 * 3600;
 
-/// 缓存格式 v5：在 v4 基础上收紧剪枝口径 —— macOS 同样剪掉卷根下的
-/// `/System`、`/Library`、`/private`、`/usr` 等系统目录。旧缓存里含这些条目，
-/// 必须整体作废重扫一次，否则旧条目会一直留在目录表里被 stat 巡反复扫到。
+/// 缓存格式 v6：在 v5 基础上补 macOS 的 `~/Library/{Caches,Containers,Logs,...}`
+/// 抖动目录剪枝。旧缓存里含这些条目，必须整体作废重扫一次。
 /// 目录 mtime 不变 ⇒ 里面没有增删改名 ⇒ 整棵子树可以整段复用，增量刷新不用重扫全盘。
 /// 旧版本缓存因 MAGIC 不匹配自动作废，重新建一次即可。
-const MAGIC: &[u8; 8] = b"RSKIDX\x05\x00";
+const MAGIC: &[u8; 8] = b"RSKIDX\x06\x00";
 const HDR: usize = 56;
 const FLAG_COMPLETE: u64 = 1 << 0;
 /// 刷新时有目录读不到：该子树按旧快照给出，结果里要如实标注
@@ -767,6 +766,8 @@ fn stamp_refresh_now() {
 fn spawn_build(slot: BuildSlot) {
     // slot 移进线程：构建结束或被 panic 展开时由 Drop 释放 BUILDING
     std::thread::spawn(move || {
+        // 后台构建：整条线程（含收尾的落盘/合并）都降到后台 I/O 档
+        crate::qos::set_background();
         let _slot = slot;
         let built = build();
         if let Some(index) = &built {
@@ -786,7 +787,8 @@ pub fn build_sync() -> bool {
     let Some(_slot) = BuildSlot::acquire() else {
         return false;
     };
-    let outcome = build();
+    // 同步建索引是查询的关键路径：不能降到后台 QoS，否则首次搜索会变慢。
+    let outcome = build_with_match(None, None, 0, false, false).map(|(index, _)| index);
     let ok = outcome.is_some();
     if let Some(index) = outcome {
         save_cache(&index);
@@ -808,7 +810,7 @@ pub fn build_and_match(
     match_path: bool,
 ) -> Option<(Vec<Hit>, u64, bool)> {
     let _slot = BuildSlot::acquire()?;
-    let outcome = build_with_match(Some(re), Some(exts), max, match_path);
+    let outcome = build_with_match(Some(re), Some(exts), max, match_path, false);
     match outcome {
         Some((index, hits)) => {
             let entries = index.items.len() as u64;
@@ -906,6 +908,8 @@ pub fn spawn_refresh_async() -> bool {
         return false;
     };
     std::thread::spawn(move || {
+        // 后台刷新：stat 巡、枚举、合并全程降到后台 I/O 档
+        crate::qos::set_background();
         let _slot = slot;
         let snapshot = {
             let guard = lock();
@@ -917,7 +921,7 @@ pub fn spawn_refresh_async() -> bool {
             return;
         };
         // 扫盘阶段：不持锁
-        let (mut dirty, stat_failed) = scan_dirty_dirs(&dir_blob, &dirs, now_unix());
+        let (mut dirty, stat_failed) = scan_dirty_dirs(&dir_blob, &dirs, now_unix(), true);
         drop(dir_blob);
         if !dirty.is_empty() {
             let keys: Vec<String> = dirty.iter().map(|(k, _)| k.clone()).collect();
@@ -935,7 +939,7 @@ pub fn spawn_refresh_async() -> bool {
             return;
         }
         let hint: Vec<String> = dirty.into_iter().map(|(k, _)| k).collect();
-        if refresh_in_place(index, Some(hint)) {
+        if refresh_in_place(index, Some(hint), true) {
             NEED_FULL_SCAN.store(false, Ordering::Relaxed);
         }
         // 扫盘期间（约 10s）又攒下的变更，接着补上，最多 3 轮
@@ -944,7 +948,7 @@ pub fn spawn_refresh_async() -> bool {
             if more.is_empty() {
                 break;
             }
-            if !refresh_in_place(index, Some(more)) {
+            if !refresh_in_place(index, Some(more), true) {
                 break;
             }
         }
@@ -974,7 +978,7 @@ fn refresh_with(index: &mut Index) -> bool {
             index.built_unix = now_unix();
             return true;
         }
-        let ok = refresh_in_place(index, Some(dirty.clone()));
+        let ok = refresh_in_place(index, Some(dirty.clone()), false);
         if !ok {
             // 刷新失败不能当成成功：把脏目录放回队列，并强制下一轮全量扫描。
             // 否则这批变更永久缺失，而 built_unix 还会被推进到当前时间，
@@ -986,7 +990,7 @@ fn refresh_with(index: &mut Index) -> bool {
         }
         return ok;
     }
-    let ok = refresh_in_place(index, None);
+    let ok = refresh_in_place(index, None, false);
     if ok {
         NEED_FULL_SCAN.store(false, Ordering::Relaxed);
         // 新鲜度记「巡完的时刻」而不是「开始巡的时刻」：本机巡一次约 17s，
@@ -1035,6 +1039,10 @@ pub fn start_watchers() {
         let root = integration::drive_root(&d);
         std::thread::spawn(move || watch_volume(&root));
     }
+    // 有持久化的事件 ID 时，等 FSEvents 把停机期间的变更回放完：
+    // 回放成功就无需全量 stat 巡；超时/丢事件则保持 NEED_FULL_SCAN=true 退回一次巡。
+    #[cfg(target_os = "macos")]
+    mac_watch::wait_ready(std::time::Duration::from_millis(1500));
 }
 
 /// 日志多久没被写过就不再信任：说明这段时间没有进程在看盘（空窗未知），
@@ -1138,7 +1146,7 @@ fn journal_replay(cache_unix: u64) -> Option<Vec<String>> {
         if line.len() <= 2 && line.ends_with(':') {
             return None;
         }
-        dirs.push(line.to_string());
+        dirs.push(normalize_dir_key(line));
     }
     dirs.sort_unstable();
     dirs.dedup();
@@ -1146,6 +1154,7 @@ fn journal_replay(cache_unix: u64) -> Option<Vec<String>> {
 }
 
 fn note_dirty(dir: &str) {
+    let dir = normalize_dir_key(dir);
     let mut g = DIRTY_DIRS.lock().unwrap_or_else(|e| e.into_inner());
     // 上限保护：疯狂抖动时别把内存吃穿，超了就让下一次退化成全量扫描
     if g.len() >= 20_000 {
@@ -1153,7 +1162,34 @@ fn note_dirty(dir: &str) {
         g.clear();
         return;
     }
-    g.push(dir.to_string());
+    g.push(dir);
+}
+
+/// 统一脏目录键：去掉尾部分隔符（根 `/` 与盘符根 `D:/` 例外）。
+///
+/// FSEvents 给的目录路径自带尾部 `/`。不统一的话 `format!("{dir}/")` 会拼出
+/// `.../Default//`，增量刷新「丢弃旧子树」的二分区间定位不到；旧条目留在表里、
+/// 新枚举再插一遍，索引出现重复路径，查询跟着错位。
+fn normalize_dir_key(dir: &str) -> String {
+    let t = dir.trim_end_matches('/');
+    if t.is_empty() {
+        return "/".to_string();
+    }
+    // Windows 盘符根必须保留尾部分隔符：`D:` 是盘符相对路径
+    if t.len() == 2 && t.as_bytes()[1] == b':' {
+        return format!("{t}/");
+    }
+    t.to_string()
+}
+
+/// 子树前缀：普通目录补一个 `/`；根 `/` 和盘符根 `D:/` 原样用。
+/// 直接 `format!("{dir}/")` 会把它们拼成 `//` / `D://`，二分区间定位不到。
+fn subtree_prefix(dir: &str) -> String {
+    if dir.ends_with('/') {
+        dir.to_string()
+    } else {
+        format!("{dir}/")
+    }
 }
 
 fn take_dirty() -> Vec<String> {
@@ -1281,8 +1317,353 @@ fn collect_changes(root: &str, buf: &[u8]) {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn watch_volume(root: &str) {
+    mac_watch::run(root);
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn watch_volume(_root: &str) {}
+
+/// macOS 原生 FSEvents 监听：内核事件驱动索引增量刷新，不轮询、不扫盘。
+///
+/// 要点：
+/// - 用**目录级事件**（不开启 `FileEvents`），只把「哪个目录变了」标脏；
+/// - 用 `FSEventStreamSetExclusionPaths` 在**内核侧**排除系统/缓存目录，
+///   事件根本不会送到用户态，避免系统噪声把刷新变成永动机；
+/// - 持久化 `FSEventStreamEventId`，下次启动用 `sinceWhen` 回放停机期间的事件，
+///   回放完成前不信任索引；回放丢事件（MustScanSubDirs 等）才退回一次全量 stat 巡；
+/// - 回调里只做 `note_dirty`（内存 push），journal 落盘交给 500ms 批处理线程。
+#[cfg(target_os = "macos")]
+mod mac_watch {
+    use super::*;
+    use fsevent_sys as fs;
+    use fsevent_sys::core_foundation as cf;
+    use std::ffi::{CStr, CString};
+    use std::os::raw::{c_char, c_void};
+    use std::ptr;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    static READY: AtomicBool = AtomicBool::new(false);
+    /// 本次流是从持久化 ID 回放的（需要等 HistoryDone 才敢信任索引）
+    static HAS_HISTORY: AtomicBool = AtomicBool::new(false);
+    static HISTORY_DONE: AtomicBool = AtomicBool::new(false);
+    /// 回放期间没有丢事件/没有 MustScanSubDirs
+    static HISTORY_TRUSTED: AtomicBool = AtomicBool::new(true);
+    static LAST_ID: AtomicU64 = AtomicU64::new(0);
+    /// 只用于 journal 落盘，不在 FSEvents 回调里做磁盘 I/O
+    static JOURNAL_BATCH: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub fn run(root: &str) {
+        crate::qos::set_background();
+        let root = normalize_root(root);
+        let saved = read_last_id();
+        HAS_HISTORY.store(saved.is_some(), Ordering::Relaxed);
+        let since = saved.unwrap_or(fs::kFSEventStreamEventIdSinceNow);
+
+        let watch_paths = vec![root];
+        let exclusions = exclusion_paths();
+
+        unsafe {
+            let Some(paths) = cf_array(&watch_paths) else {
+                fail();
+                return;
+            };
+            let excluded = cf_array(&exclusions);
+            let ctx = fs::FSEventStreamContext {
+                version: 0,
+                info: ptr::null_mut(),
+                retain: None,
+                release: None,
+                copy_description: None,
+            };
+            let flags =
+                fs::kFSEventStreamCreateFlagWatchRoot | fs::kFSEventStreamCreateFlagIgnoreSelf;
+            let stream = fs::FSEventStreamCreate(
+                cf::kCFAllocatorDefault,
+                callback,
+                &ctx,
+                paths,
+                since,
+                // 0.5s 合并窗口：宁可晚半秒，也不要被事件风暴打断
+                0.5,
+                flags,
+            );
+            cf::CFRelease(paths);
+            if stream.is_null() {
+                if let Some(e) = excluded {
+                    cf::CFRelease(e);
+                }
+                fail();
+                return;
+            }
+            if let Some(e) = excluded {
+                fs::FSEventStreamSetExclusionPaths(stream, e);
+                cf::CFRelease(e);
+            }
+            fs::FSEventStreamScheduleWithRunLoop(
+                stream,
+                cf::CFRunLoopGetCurrent(),
+                cf::kCFRunLoopDefaultMode,
+            );
+            if fs::FSEventStreamStart(stream) == 0 {
+                fail();
+                fs::FSEventStreamInvalidate(stream);
+                fs::FSEventStreamRelease(stream);
+                return;
+            }
+            WATCH_ACTIVE.store(true, Ordering::Relaxed);
+            READY.store(true, Ordering::Relaxed);
+            std::thread::spawn(flush_loop);
+            cf::CFRunLoopRun();
+            // 正常情况下不会走到这里（进程退出时线程被一起收掉）
+            WATCH_ACTIVE.store(false, Ordering::Relaxed);
+            fs::FSEventStreamStop(stream);
+            fs::FSEventStreamInvalidate(stream);
+            fs::FSEventStreamRelease(stream);
+        }
+    }
+
+    /// 监听起不来：明确交回全量扫描，同时唤醒等待者，别让首次查询白等超时。
+    fn fail() {
+        NEED_FULL_SCAN.store(true, Ordering::Relaxed);
+        WATCH_ACTIVE.store(false, Ordering::Relaxed);
+        HISTORY_TRUSTED.store(false, Ordering::Relaxed);
+        HISTORY_DONE.store(true, Ordering::Relaxed);
+        READY.store(true, Ordering::Relaxed);
+    }
+
+    /// 启动后等事件流就绪；若有停机期间的历史，等回放完成并落一次 journal。
+    /// 超时/丢事件时不改 NEED_FULL_SCAN，让调用方退回一次全量巡，保证不给假阴性。
+    pub fn wait_ready(timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while !READY.load(Ordering::Relaxed) {
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !HAS_HISTORY.load(Ordering::Relaxed) {
+            return;
+        }
+        while !HISTORY_DONE.load(Ordering::Relaxed) {
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        flush_journal();
+        if HISTORY_TRUSTED.load(Ordering::Relaxed) {
+            NEED_FULL_SCAN.store(false, Ordering::Relaxed);
+        }
+    }
+
+    extern "C" fn callback(
+        _stream: fs::FSEventStreamRef,
+        _info: *mut c_void,
+        num: usize,
+        paths: *mut c_void,
+        flags: *const fs::FSEventStreamEventFlags,
+        ids: *const fs::FSEventStreamEventId,
+    ) {
+        if num == 0 || paths.is_null() || flags.is_null() {
+            return;
+        }
+        let paths = paths as *const *const c_char;
+        let mut batch = JOURNAL_BATCH.lock().unwrap_or_else(|e| e.into_inner());
+        for i in 0..num {
+            let f = unsafe { *flags.add(i) };
+            if f & (fs::kFSEventStreamEventFlagMustScanSubDirs
+                | fs::kFSEventStreamEventFlagUserDropped
+                | fs::kFSEventStreamEventFlagKernelDropped
+                | fs::kFSEventStreamEventFlagEventIdsWrapped
+                | fs::kFSEventStreamEventFlagRootChanged
+                | fs::kFSEventStreamEventFlagMount
+                | fs::kFSEventStreamEventFlagUnmount)
+                != 0
+            {
+                NEED_FULL_SCAN.store(true, Ordering::Relaxed);
+                if !HISTORY_DONE.load(Ordering::Relaxed) {
+                    HISTORY_TRUSTED.store(false, Ordering::Relaxed);
+                }
+            }
+            if f & fs::kFSEventStreamEventFlagHistoryDone != 0 {
+                HISTORY_DONE.store(true, Ordering::Relaxed);
+                continue;
+            }
+            let ptr = unsafe { *paths.add(i) };
+            if ptr.is_null() {
+                continue;
+            }
+            let Ok(raw) = unsafe { CStr::from_ptr(ptr) }.to_str() else {
+                continue;
+            };
+            if let Some(dir) = event_dir(raw) {
+                note_dirty(&dir);
+                if batch.len() < 20_000 {
+                    batch.push(dir);
+                }
+            }
+        }
+        drop(batch);
+        if !ids.is_null() {
+            let id = unsafe { *ids.add(num - 1) };
+            if id != 0 {
+                LAST_ID.store(id, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// 事件路径本身就是一个目录；被删/改名的路径不存在时退回父目录，
+    /// 父目录枚举时会把旧子树清掉。
+    fn event_dir(raw: &str) -> Option<String> {
+        let p = Path::new(raw);
+        if is_pruned(p) || is_hidden_path(p) {
+            return None;
+        }
+        let key = raw.replace('\\', "/");
+        if p.is_dir() {
+            Some(normalize_dir_key(&key))
+        } else {
+            p.parent()
+                .map(|q| normalize_dir_key(&q.to_string_lossy().replace('\\', "/")))
+        }
+    }
+
+    fn flush_loop() {
+        crate::qos::set_background();
+        let mut last_persist = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            flush_journal();
+            if last_persist.elapsed() >= Duration::from_secs(2) {
+                persist_id();
+                last_persist = Instant::now();
+            }
+        }
+    }
+
+    fn flush_journal() {
+        let dirs = {
+            let mut b = JOURNAL_BATCH.lock().unwrap_or_else(|e| e.into_inner());
+            if b.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *b)
+        };
+        let mut dirs = dirs;
+        dirs.sort_unstable();
+        dirs.dedup();
+        journal_append(JOURNAL_CACHE_UNIX.load(Ordering::Relaxed), &dirs);
+    }
+
+    fn normalize_root(root: &str) -> String {
+        let t = root.trim_end_matches('/');
+        if t.is_empty() {
+            "/".to_string()
+        } else {
+            t.to_string()
+        }
+    }
+
+    /// 内核侧排除：系统目录、`~/Library` 抖动目录、本程序自己的缓存目录。
+    fn exclusion_paths() -> Vec<String> {
+        let mut v: Vec<String> = [
+            "/System", "/Library", "/private", "/usr", "/bin", "/sbin", "/dev", "/cores",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        if let Some(home) = dirs::home_dir() {
+            for name in [
+                "Caches",
+                "Containers",
+                "Group Containers",
+                "Logs",
+                "Saved Application State",
+            ] {
+                v.push(
+                    home.join("Library")
+                        .join(name)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        if let Some(dir) = cache_path().and_then(|p| p.parent().map(Path::to_path_buf)) {
+            v.push(dir.to_string_lossy().into_owned());
+        }
+        v.retain(|p| Path::new(p).exists());
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// `Vec<String>` → CFArray<CFString>；调用方负责 CFRelease。
+    unsafe fn cf_array(paths: &[String]) -> Option<cf::CFArrayRef> {
+        let arr = cf::CFArrayCreateMutable(
+            cf::kCFAllocatorDefault,
+            paths.len() as cf::CFIndex,
+            &cf::kCFTypeArrayCallBacks,
+        );
+        if arr.is_null() {
+            return None;
+        }
+        for p in paths {
+            let Ok(c) = CString::new(p.as_str()) else {
+                continue;
+            };
+            let s = cf::CFStringCreateWithCString(
+                cf::kCFAllocatorDefault,
+                c.as_ptr(),
+                cf::kCFStringEncodingUTF8,
+            );
+            if !s.is_null() {
+                cf::CFArrayAppendValue(arr, s);
+                cf::CFRelease(s);
+            }
+        }
+        Some(arr)
+    }
+
+    fn id_path() -> Option<PathBuf> {
+        cache_path().map(|p| p.with_file_name("fsevent-id"))
+    }
+
+    fn read_last_id() -> Option<u64> {
+        let text = std::fs::read_to_string(id_path()?).ok()?;
+        let id = text.trim().parse::<u64>().ok()?;
+        if id == 0 || id == fs::kFSEventStreamEventIdSinceNow {
+            None
+        } else {
+            Some(id)
+        }
+    }
+
+    /// 只前进不后退：多个进程共享同一份 ID，落后的一份回放更多（无害），
+    /// 但绝不能让 ID 倒退而漏事件。
+    fn persist_id() {
+        let id = LAST_ID.load(Ordering::Relaxed);
+        if id == 0 {
+            return;
+        }
+        let Some(path) = id_path() else { return };
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if text.trim().parse::<u64>().map_or(false, |cur| cur >= id) {
+                return;
+            }
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, id.to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
 
 /// 目录级增量刷新（原地、不拷整份 blob）。
 ///
@@ -1291,7 +1672,7 @@ fn watch_volume(_root: &str) {}
 /// 脏目录通常几十个，所以整次刷新通常在几十毫秒量级。
 ///
 /// 返回 false 表示这次刷新不可信（旧内容原样恢复，调用方继续用旧快照）。
-fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
+fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>, background: bool) -> bool {
     let t_start = Instant::now();
     let started = now_unix();
     let roots: Vec<PathBuf> = integration::local_drives()
@@ -1322,12 +1703,12 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
     let (mut dirty, stat_failed) = match hint {
         Some(dirs) => (
             dirs.into_iter()
-                .filter(|d| !is_pruned(Path::new(d)))
-                .map(|d| (d, 0u64))
+                .filter(|d| !is_pruned(Path::new(d)) && !is_hidden_path(Path::new(d)))
+                .map(|d| (normalize_dir_key(&d), 0u64))
                 .collect(),
             false,
         ),
-        None => scan_dirty_dirs(&index.dir_blob, &old_dirs, started),
+        None => scan_dirty_dirs(&index.dir_blob, &old_dirs, started, background),
     };
     let scan_ms = t_start.elapsed().as_millis();
     dirty.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -1401,6 +1782,7 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
             &fastwalk::Options {
                 include_hidden: false,
                 threads: num_cpus::get(),
+                background,
             },
             &cancel,
             |path, info| {
@@ -1458,6 +1840,21 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
     let mut enumer = enumerated.into_inner().unwrap_or_default();
     enumer.sort_unstable();
     enumer.dedup();
+    if std::env::var_os("RUST_SEEK_DEBUG_REFRESH").is_some() {
+        let mut miss = 0usize;
+        for key in &enumer {
+            if old_dirs
+                .binary_search_by(|rec| dir_path_of(&index.dir_blob, rec).cmp(key.as_ref()))
+                .is_err()
+            {
+                miss += 1;
+                if miss <= 5 {
+                    eprintln!("  enumer-miss: {key:?}");
+                }
+            }
+        }
+        eprintln!("  enumer total={} miss={}", enumer.len(), miss);
+    }
 
     // ---- 第 3 步：算要丢掉的旧条目 ----
     //
@@ -1470,7 +1867,7 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
     let mut enumer_sub: Vec<(usize, usize)> = Vec::new();
     let mut enumer_dir_sub: Vec<(usize, usize)> = Vec::new();
     for dir in &enumer {
-        let prefix = format!("{dir}/");
+        let prefix = subtree_prefix(dir);
         let (lo, hi) = prefix_bounds_raw(&index.blob, &old_items, &prefix);
         if hi > lo {
             enumer_sub.push((lo, hi));
@@ -1487,7 +1884,7 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>) -> bool {
         if enumer_set.contains(key.as_ref()) {
             continue; // 被枚举的目录不算「没变」，不豁免
         }
-        let prefix = format!("{key}/");
+        let prefix = subtree_prefix(key);
         let (lo, hi) = prefix_bounds_raw(&index.blob, &old_items, &prefix);
         if hi > lo {
             keep_sub.push((lo, hi));
@@ -1770,9 +2167,16 @@ fn scan_dirty_dirs(
     dir_blob: &str,
     old_dirs: &[DirRec],
     started: u64,
+    background: bool,
 ) -> (Vec<(String, u64)>, bool) {
     if old_dirs.is_empty() {
         return (Vec::new(), false);
+    }
+    if std::env::var_os("RUST_SEEK_DEBUG_SCAN").is_some() {
+        eprintln!(
+            "rust-seek: full stat sweep over {} dirs (background={background})",
+            old_dirs.len()
+        );
     }
     let threads = num_cpus::get().clamp(1, 16);
     let chunk = ((old_dirs.len() + threads - 1) / threads).max(1);
@@ -1784,6 +2188,9 @@ fn scan_dirty_dirs(
             let out = &out;
             let failed = &failed;
             scope.spawn(move || {
+                if background {
+                    crate::qos::set_background();
+                }
                 let mut local: Vec<(String, u64)> = Vec::new();
                 for rec in slice {
                     let key = dir_path_of(dir_blob, rec);
@@ -1918,7 +2325,8 @@ fn repack(index: &mut Index) {
 }
 
 fn build() -> Option<Index> {
-    build_with_match(None, None, 0, false).map(|(index, _)| index)
+    // 后台构建：遍历线程降 QoS，不抢前台 I/O。
+    build_with_match(None, None, 0, false, true).map(|(index, _)| index)
 }
 
 /// 一趟遍历收集所有文件；`match_re` 为 Some 时同时按文件名答查询（冷启动合并用）。
@@ -1928,6 +2336,7 @@ fn build_with_match(
     match_exts: Option<&HashSet<String>>,
     max: usize,
     match_path: bool,
+    background: bool,
 ) -> Option<(Index, Vec<Hit>)> {
     // 索引代表「开始遍历那一刻」的文件系统，而不是结束时刻：
     // 遍历过程中新建的文件可能落在已扫过的目录里而没进索引。
@@ -1968,6 +2377,7 @@ fn build_with_match(
             &fastwalk::Options {
                 include_hidden: false,
                 threads: num_cpus::get(),
+                background,
             },
             &cancel,
             |path, info| {
@@ -2090,15 +2500,29 @@ fn build_with_match(
 
 /// 与搜索默认剪枝完全一致：盘符根下的系统大头目录 + 任意层级的噪声目录。
 fn is_pruned(path: &Path) -> bool {
-    if path_is_system_root(path) {
-        return true;
+    // 与搜索遍历共用同一套口径（含 macOS ~/Library 抖动目录），
+    // 否则索引与遍历结果集会出现差异。
+    path_is_system_root(path) || path_in_noise_dir(path)
+}
+
+/// 索引建库时 `include_hidden=false`：隐藏项不进索引。
+/// 监听推来的脏目录若是隐藏的（macOS 上 `.claude`、`.workbuddy` 这类），
+/// 必须在刷新前丢掉；否则只枚举这一棵子树会把隐藏文件塞进索引，
+/// 和「遍历结果」出现差异，还会让条目数无端膨胀几十万。
+fn is_hidden_path(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        std::fs::metadata(path).map_or(false, |m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
     }
-    path.components().any(|c| match c {
-        std::path::Component::Normal(s) => s.to_str().map_or(false, |n| {
-            is_noise_dir_name(n) || SKIP_DIRS.iter().any(|d| n.eq_ignore_ascii_case(d))
-        }),
-        _ => false,
-    })
+    #[cfg(not(windows))]
+    {
+        path.components().any(|c| match c {
+            std::path::Component::Normal(s) => s.to_str().map_or(false, |n| n.starts_with('.')),
+            _ => false,
+        })
+    }
 }
 
 fn ext_matches(name: &str, exts: &HashSet<String>) -> bool {
@@ -2441,5 +2865,16 @@ mod tests {
             match_item(&idx, it, &re, &exts, &mut path_hits, true);
         }
         assert!(path_hits.is_empty());
+    }
+
+    #[test]
+    fn dirty_dir_keys_lose_trailing_slash_but_keep_roots() {
+        assert_eq!(normalize_dir_key("/Users/a/b/"), "/Users/a/b");
+        assert_eq!(normalize_dir_key("/"), "/");
+        assert_eq!(normalize_dir_key("D:/"), "D:/");
+        assert_eq!(normalize_dir_key("D:/x/"), "D:/x");
+        assert_eq!(subtree_prefix("/Users/a/b"), "/Users/a/b/");
+        assert_eq!(subtree_prefix("/"), "/");
+        assert_eq!(subtree_prefix("D:/"), "D:/");
     }
 }

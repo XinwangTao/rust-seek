@@ -13,7 +13,10 @@
 use crate::fastwalk::{self, Step};
 use crate::index;
 use crate::integration;
-use crate::searcher::{path_is_system_root, search_file, search_filename_meta_path, SKIP_DIRS};
+use crate::searcher::{
+    path_is_system_root, path_is_user_library_noise, search_file, search_filename_meta_path,
+    SKIP_DIRS,
+};
 use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -777,6 +780,8 @@ where
     let opts = fastwalk::Options {
         include_hidden,
         threads: num_cpus::get(),
+        // Agent 的搜索请求也是前台请求：保持正常优先级
+        background: false,
     };
     fastwalk::walk(&paths, &opts, &stop, visit)
 }
@@ -898,7 +903,7 @@ fn relax_for_explicit_roots(
                 }
             }
         }
-        if path_is_system_root(p) {
+        if path_is_system_root(p) || path_is_user_library_noise(p) {
             prune_system = false;
         }
     }

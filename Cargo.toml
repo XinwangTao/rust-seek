@@ -29,6 +29,10 @@ sha2 = "0.10"
 winreg = "0.56.0"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Security", "Win32_UI_WindowsAndMessaging"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+fsevent-sys = "4"
+libc = "0.2"
+
 [profile.release]
 opt-level = 3
 lto = true

@@ -5,6 +5,7 @@ mod icon;
 mod index;
 mod integration;
 mod mcp;
+mod qos;
 mod searcher;
 mod updater;
 #[cfg(windows)]
@@ -15,6 +16,8 @@ fn main() -> eframe::Result {
     // `--mcp`：作为 MCP server 跑在 stdio 上，供 AI Agent 调用。
     // 必须放在单实例判断之前——Agent 会按需拉起多个进程，不能被互斥体挡住。
     if std::env::args().any(|a| a == "--mcp") {
+        // 先挂上目录监听：Mac 上顺带回放停机期间的 FSEvents，避免首个查询再全量 stat 巡。
+        index::start_watchers();
         if let Err(e) = mcp::run() {
             eprintln!("rust-seek mcp server error: {e}");
             std::process::exit(1);
@@ -27,6 +30,8 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let start_hidden = std::env::args().any(|a| a == "--hidden");
+    // 目录监听尽早挂上：Mac 上事件流要做「停机期间变更」回放，越早开始越好。
+    index::start_watchers();
     // 自动更新检查（仅 GUI 模式；--mcp 已在上面提前返回）
     updater::spawn();
     // 启动即在后台预热索引：否则「打开软件后第一次搜索」要等 17–22 秒的全盘
@@ -36,6 +41,7 @@ fn main() -> eframe::Result {
     let _ = std::thread::Builder::new()
         .name("index-warmup".into())
         .spawn(|| {
+            qos::set_background();
             std::thread::sleep(std::time::Duration::from_secs(2));
             index::ensure_ready();
         });
