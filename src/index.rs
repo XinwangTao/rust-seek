@@ -163,6 +163,9 @@ fn reset_stuck_build(observed_started: u64) -> bool {
 }
 /// 兜底遍历后回填索引的节流时钟（unix 秒）
 static LAST_REFRESH_REQ: AtomicU64 = AtomicU64::new(0);
+/// 最近一次完整构建开始前的 FSEvents ID：**必须在缓存落盘成功之后**才写进
+/// `fsevent-id`，否则 ID 会比磁盘上的缓存新，下次启动会漏掉中间那段空窗。
+static LAST_BUILD_SNAP: AtomicU64 = AtomicU64::new(0);
 /// 内存索引最后一次被查询的时间（unix 秒）
 static LAST_USE: AtomicU64 = AtomicU64::new(0);
 static REAPER: AtomicBool = AtomicBool::new(false);
@@ -772,6 +775,7 @@ fn spawn_build(slot: BuildSlot) {
         let built = build();
         if let Some(index) = &built {
             save_cache(index);
+            stamp_snapshot(LAST_BUILD_SNAP.load(Ordering::Relaxed));
             adopt_cache(index.built_unix);
         }
         let mut guard = lock();
@@ -792,6 +796,7 @@ pub fn build_sync() -> bool {
     let ok = outcome.is_some();
     if let Some(index) = outcome {
         save_cache(&index);
+        stamp_snapshot(LAST_BUILD_SNAP.load(Ordering::Relaxed));
         let built = index.built_unix;
         *lock() = Some(Box::new(index));
         adopt_cache(built);
@@ -816,6 +821,7 @@ pub fn build_and_match(
             let entries = index.items.len() as u64;
             let complete = index.complete;
             save_cache(&index);
+            stamp_snapshot(LAST_BUILD_SNAP.load(Ordering::Relaxed));
             let built = index.built_unix;
             *lock() = Some(Box::new(index));
             adopt_cache(built);
@@ -920,8 +926,9 @@ pub fn spawn_refresh_async() -> bool {
         let Some((dir_blob, dirs)) = snapshot else {
             return;
         };
-        // 扫盘阶段：不持锁
-        let snap = snapshot_event_id();
+        // 扫盘阶段：不持锁。
+        // 注意：这条路径不落缓存，也**不推进** fsevent-id —— ID 必须与磁盘缓存同点，
+        // 否则下次启动会从更晚的 ID 回放，漏掉缓存与 ID 之间的变更。
         let (mut dirty, stat_failed) = scan_dirty_dirs(&dir_blob, &dirs, now_unix(), true);
         drop(dir_blob);
         if !dirty.is_empty() {
@@ -937,17 +944,11 @@ pub fn spawn_refresh_async() -> bool {
             index.built_unix = now_unix();
             index.incomplete_dirs = stat_failed;
             NEED_FULL_SCAN.store(false, Ordering::Relaxed);
-            if !stat_failed {
-                stamp_snapshot(snap);
-            }
             return;
         }
         let hint: Vec<String> = dirty.into_iter().map(|(k, _)| k).collect();
         if refresh_in_place(index, Some(hint), true) {
             NEED_FULL_SCAN.store(false, Ordering::Relaxed);
-            if !stat_failed {
-                stamp_snapshot(snap);
-            }
         }
         // 扫盘期间（约 10s）又攒下的变更，接着补上，最多 3 轮
         for _ in 0..3 {
@@ -2594,8 +2595,11 @@ fn build_with_match(
         incomplete_dirs: false,
     };
     if complete {
-        // 只有完整索引才能作为「可信快照点」；撞上限的部分索引仍要靠下次巡兜底
-        stamp_snapshot(snap);
+        // 只记录，不落盘：等调用方 save_cache 成功后再 stamp，避免 ID 比缓存新。
+        LAST_BUILD_SNAP.store(snap, Ordering::Relaxed);
+    } else {
+        // 部分索引不能当快照点；清掉，避免调用方误用上一次构建的 ID。
+        LAST_BUILD_SNAP.store(0, Ordering::Relaxed);
     }
     Some((index, hits.into_inner().unwrap_or_default()))
 }
