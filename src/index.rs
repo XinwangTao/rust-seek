@@ -1674,7 +1674,9 @@ mod mac_watch {
         cache_path().map(|p| p.with_file_name("fsevent-id"))
     }
 
-    /// 当前全局事件 ID：建索引/全量巡开始时取一次，成功后作为快照点落盘。
+    /// 当前事件 ID（建索引/全量巡开始时取一次，成功后作为快照点落盘）。
+    /// FSEvents 的事件 ID 是系统范围内单调递增的；`FSEventStreamGetLatestEventId`
+    /// 在流刚启动、还没有事件时返回 `SinceNow`，不能当快照点，故用全局当前 ID。
     pub fn current_id() -> u64 {
         unsafe { fs::FSEventsGetCurrentEventId() }
     }
