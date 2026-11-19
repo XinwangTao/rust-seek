@@ -410,6 +410,8 @@ pub fn query(
     let max = max.max(1);
     let mut hits: Vec<Hit> = Vec::new();
     let mut truncated = false;
+    // 纯字面量 + 名字匹配才走连续扫描；任意正则与路径查询一律保留逐条匹配
+    let fast_literal = !match_path && safe_literal(re);
 
     if !tasks.is_empty() {
         let cursor = std::sync::atomic::AtomicUsize::new(0);
@@ -425,6 +427,9 @@ pub fn query(
                 let tasks = &tasks;
                 scope.spawn(move || {
                     let mut local: Vec<Hit> = Vec::new();
+                    // 快路径缓冲按 worker 复用，跨任务只 clear 不重新分配
+                    let mut name_buf = String::new();
+                    let mut name_map: Vec<(usize, u32)> = Vec::new();
                     loop {
                         if stop.load(Ordering::Relaxed) {
                             break;
@@ -437,13 +442,31 @@ pub fn query(
                         }
                         let i = cursor.fetch_add(1, Ordering::Relaxed);
                         let Some((lo, hi)) = tasks.get(i).copied() else { break };
-                        for item in &index.items()[lo..hi] {
-                            // 单线程也设上限：命中上万的模式（比如搜 "a"）不该把结果集撑爆
-                            if local.len() >= max {
-                                stop.store(true, Ordering::Relaxed);
-                                break;
+                        let chunk = &index.items()[lo..hi];
+                        let limit_hit = if fast_literal {
+                            scan_literal_chunk(
+                                index,
+                                chunk,
+                                re,
+                                exts,
+                                max,
+                                &mut local,
+                                &mut name_buf,
+                                &mut name_map,
+                            )
+                        } else {
+                            for item in chunk {
+                                // 单线程也设上限：命中上万的模式（比如搜 "a"）不该把结果集撑爆
+                                if local.len() >= max {
+                                    break;
+                                }
+                                match_item(index, item, re, exts, &mut local, match_path);
                             }
-                            match_item(index, item, re, exts, &mut local, match_path);
+                            local.len() >= max
+                        };
+                        if limit_hit {
+                            stop.store(true, Ordering::Relaxed);
+                            break;
                         }
                     }
                     if !local.is_empty() {
@@ -582,6 +605,104 @@ fn match_item(
     }
     hits.push(Hit { path: index.path(item).to_string(), size: item.size, mtime: item.mtime });
     Some(())
+}
+
+/// 这个正则是不是「安全纯字面量」：非空、只由字面量字符组成（允许 `\.` 这类
+/// 转义元字符）、不含换行。
+///
+/// 只有这种模式才能把多条文件名用 `\n` 拼接后连续扫描而不改变语义：
+/// - 无「活的」元字符 ⇒ 匹配的就是这段字节本身（`re` 原样使用，忽略大小写设置也保留）；
+/// - 不含 `\n` ⇒ 命中不可能跨越条目分隔符；
+/// - 非空 ⇒ 不会产生零宽命中。
+///
+/// **转义元字面量仍然算字面量**：GUI 文件名「纯文本」模式与 MCP 非正则模式都先
+/// `regex::escape`，`main.rs` 会变成 `main\.rs`——它匹配的依旧是一段固定字节，
+/// 拼起来扫不会跨条目，放行才能让「带点的文件名」也吃到快路径。
+/// 其余模式（锚点、`\s`/`\d` 等字符类、字符类、内联 flag、反引用…）一律保留逐条匹配。
+fn safe_literal(re: &Regex) -> bool {
+    let s = re.as_str();
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // 分隔符本身：命中会跨条目
+            '\n' | '\r' => return false,
+            '\\' => match chars.next() {
+                // 只有「转义标点」是字面量；\s \d \w \b \n \x41 \u{..} 全是字母数字，一律回退
+                Some(n) if !n.is_ascii_alphanumeric() => {}
+                _ => return false,
+            },
+            '^' | '$' | '.' | '|' | '?' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}' => {
+                return false
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// chunk 级连续名字扫描（worker 复用 `buf` / `map`，不跨查询持有）。
+///
+/// 把通过扩展名筛选的文件名按条目顺序用 `\n` 拼接，用同一个正则连续扫；
+/// 命中后直接跳到该条目末尾——每个文件最多一个 Hit，也不会为一个文件里的
+/// 多次命中反复枚举。返回 true 表示本 worker 已达 `max`。
+///
+/// 调用前必须确认 `safe_literal(re)` 且 `match_path == false`。
+fn scan_literal_chunk(
+    index: &Index,
+    items: &[Item],
+    re: &Regex,
+    exts: &HashSet<String>,
+    max: usize,
+    hits: &mut Vec<Hit>,
+    buf: &mut String,
+    map: &mut Vec<(usize, u32)>,
+) -> bool {
+    // 小批拼接：64K 条目整块拼一次要写 1.6MB，早命中（比如搜 "a"）也要先付完
+    // 这笔钱；1024 条一批约 25KB，缓冲留在 L1/L2 里，命中上限就在批内立即返回。
+    // 批越小早停越及时，但整盘扫描的批数（7.6M/1024≈7.6K 次）摊到 16 个 worker
+    // 每人也只有几百次调用，正则调用开销可以忽略。
+    const BATCH: usize = 1024;
+    for (base, batch) in items.chunks(BATCH).enumerate() {
+        buf.clear();
+        map.clear();
+        for (i, item) in batch.iter().enumerate() {
+            let name = index.name(item);
+            if !exts.is_empty() && !ext_matches(name, exts) {
+                continue;
+            }
+            buf.push_str(name);
+            buf.push('\n');
+            // 记录「条目结束（含分隔符）」的累计偏移；条目 i 的名字在 [上一个 end, end-1)
+            map.push((buf.len(), (base * BATCH + i) as u32));
+        }
+        if map.is_empty() {
+            continue;
+        }
+
+        let mut pos = 0usize;
+        while pos < buf.len() {
+            let Some(m) = re.find_at(buf.as_str(), pos) else { break };
+            // 命中起点落在哪个条目：第一个 end > m.start() 的条目。
+            // 纯字面量不含换行，命中不可能跨分隔符，所以一定找得到。
+            let idx = map.partition_point(|&(end, _)| end <= m.start());
+            let Some(&(end, item_idx)) = map.get(idx) else { break };
+            let item = &items[item_idx as usize];
+            hits.push(Hit {
+                path: index.path(item).to_string(),
+                size: item.size,
+                mtime: item.mtime,
+            });
+            if hits.len() >= max {
+                return true;
+            }
+            // 同一个文件只算一次：跳到下一条目起点，跳过本名字剩余命中
+            pos = end;
+        }
+    }
+    false
 }
 
 /// `C:/Users` → `C:/Users/`，并把盘符统一成大写（索引里的写法）。
@@ -801,6 +922,7 @@ fn ensure_mapped() {
 }
 
 pub fn ensure_ready() {
+    cleanup_stale_tmp();
     if reader_mode() {
         ensure_mapped();
         return;
@@ -914,21 +1036,16 @@ fn current_usn_state() -> std::collections::HashMap<String, crate::usn::VolState
 
 /// 写者定时调用：内存索引比磁盘缓存新就落盘一次，让只读读者看到最新快照。
 /// 没有变更时是 O(1)，不会每 30 秒白写 790MB。
+///
+/// 失败时**不动** `SAVED_GEN`：内容代数保持「已保存 < 当前」，
+/// 下一轮维护会继续重试；否则读者会永远停在旧快照。
 pub fn persist_if_dirty() {
     if SAVED_GEN.load(Ordering::Relaxed) == CONTENT_GEN.load(Ordering::Relaxed) {
         return;
     }
-    // 只在锁内做序列化；1–3 秒的写盘放到锁外，别把写者自己的查询堵住
-    let bytes = {
-        let guard = lock();
-        guard.as_ref().map(|ix| build_cache_bytes(ix.as_ref()))
-    };
-    let Some(bytes) = bytes else { return };
-    let Some(path) = cache_path() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    if !publish_cache() && std::env::var_os("RUST_SEEK_DEBUG").is_some() {
+        eprintln!("[debug] persist_if_dirty: 缓存发布失败，保持脏，等待重试");
     }
-    write_cache_bytes(&bytes, &path);
 }
 
 /// 实时输入用：**绝不在搜索路径上刷新**。
@@ -1067,13 +1184,17 @@ fn spawn_build(slot: BuildSlot) {
         if let Some(index) = built.as_mut() {
             index.usn = sweep;
         }
-        if let Some(index) = &built {
-            save_cache(index);
-            adopt_cache(index.built_unix);
-        }
-        let mut guard = lock();
         if let Some(index) = built {
-            *guard = Some(Box::new(index));
+            let built_unix = index.built_unix;
+            {
+                let mut guard = lock();
+                *guard = Some(Box::new(index));
+                // 新内容已经进内存：代数必须前进，否则发布会被当成「没变化」跳过
+                CONTENT_GEN.fetch_add(1, Ordering::SeqCst);
+            }
+            // 锁外发布；失败也不洗白代数，周期维护会重试
+            let _ = publish_cache();
+            adopt_cache(built_unix);
         }
     });
 }
@@ -1089,9 +1210,13 @@ pub fn build_sync() -> bool {
     let ok = outcome.is_some();
     if let Some(mut index) = outcome {
         index.usn = sweep;
-        save_cache(&index);
         let built = index.built_unix;
-        *lock() = Some(Box::new(index));
+        {
+            let mut guard = lock();
+            *guard = Some(Box::new(index));
+            CONTENT_GEN.fetch_add(1, Ordering::SeqCst);
+        }
+        let _ = publish_cache();
         adopt_cache(built);
     }
     ok
@@ -1115,9 +1240,13 @@ pub fn build_and_match(
             let entries = index.items().len() as u64;
             let complete = index.complete;
             index.usn = sweep;
-            save_cache(&index);
             let built = index.built_unix;
-            *lock() = Some(Box::new(index));
+            {
+                let mut guard = lock();
+                *guard = Some(Box::new(index));
+                CONTENT_GEN.fetch_add(1, Ordering::SeqCst);
+            }
+            let _ = publish_cache();
             adopt_cache(built);
             Some((hits, entries, complete))
         }
@@ -1194,9 +1323,17 @@ pub fn refresh_now() -> bool {
 
 fn refresh_now_mode(allow_full_sweep: bool) -> bool {
     let Some(_slot) = RefreshSlot::acquire() else { return false };
-    let mut guard = lock();
-    let Some(index) = guard.as_mut() else { return false };
-    refresh_with_mode(index, allow_full_sweep)
+    let (ok, changed) = {
+        let mut guard = lock();
+        let Some(index) = guard.as_mut() else { return false };
+        refresh_with_mode(index, allow_full_sweep)
+    };
+    // 790MB 序列化 + 写盘都放到索引锁外：否则写者自己的查询会被整份缓存写盘堵住。
+    // 失败不推进 SAVED_GEN，下一轮维护会重试。
+    if ok && changed && SAVED_GEN.load(Ordering::SeqCst) != CONTENT_GEN.load(Ordering::SeqCst) {
+        let _ = publish_cache();
+    }
+    ok
 }
 
 /// 后台刷新：不阻塞查询。
@@ -1238,9 +1375,11 @@ pub fn spawn_refresh_async() -> bool {
             return;
         }
         let hint: Vec<String> = dirty.into_iter().map(|(k, _)| k).collect();
+        let mut changed = false;
         if refresh_in_place(index, Some(hint)) {
             NEED_FULL_SCAN.store(false, Ordering::Relaxed);
-            CONTENT_GEN.fetch_add(1, Ordering::Relaxed);
+            CONTENT_GEN.fetch_add(1, Ordering::SeqCst);
+            changed = true;
             let _ = &sweep;
         }
         // 扫盘期间（约 10s）又攒下的变更，接着补上，最多 3 轮
@@ -1252,6 +1391,14 @@ pub fn spawn_refresh_async() -> bool {
             if !refresh_in_place(index, Some(more)) {
                 break;
             }
+            // 每一轮都算内容变化：漏加代数会让读者停在更早的快照上
+            CONTENT_GEN.fetch_add(1, Ordering::SeqCst);
+            changed = true;
+        }
+        drop(guard);
+        // 序列化与写盘不持索引锁；失败保持脏，下一轮维护重试
+        if changed {
+            let _ = publish_cache();
         }
     });
     true
@@ -1273,7 +1420,9 @@ fn watcher_trusted() -> bool {
 /// - USN 不可信 ⇒ 全量 stat 巡（约 17s，交给后台）
 /// `allow_full_sweep=false`：只走「便宜的」路径（脏目录 / USN 增量），
 /// 需要全盘巡时直接返回 false，交给调用方决定要不要甩到后台。
-fn refresh_with_mode(index: &mut Index, allow_full_sweep: bool) -> bool {
+///
+/// 返回 `(ok, changed)`：`changed` 表示内存内容/水位真的改过、需要发布到缓存。
+fn refresh_with_mode(index: &mut Index, allow_full_sweep: bool) -> (bool, bool) {
     if integration::local_drives().len() as u64 != WATCHED_DRIVES.load(Ordering::Relaxed) {
         NEED_FULL_SCAN.store(true, Ordering::Relaxed);
     }
@@ -1284,12 +1433,12 @@ fn refresh_with_mode(index: &mut Index, allow_full_sweep: bool) -> bool {
         if dirty.is_empty() {
             // 没有任何变更事件：索引就是最新的，只更新新鲜度戳（O(1)）
             index.built_unix = now_unix();
-            return true;
+            return (true, false);
         }
         let had_changes = !dirty.is_empty();
         let ok = refresh_in_place(index, Some(dirty.clone()));
         if ok && had_changes {
-            CONTENT_GEN.fetch_add(1, Ordering::Relaxed);
+            CONTENT_GEN.fetch_add(1, Ordering::SeqCst);
         }
         if !ok {
             // 刷新失败不能当成成功：把脏目录放回队列，并强制下一轮全量扫描。
@@ -1300,7 +1449,7 @@ fn refresh_with_mode(index: &mut Index, allow_full_sweep: bool) -> bool {
             }
             NEED_FULL_SCAN.store(true, Ordering::Relaxed);
         }
-        return ok;
+        return (ok, ok && had_changes);
     }
 
     // ---- 全盘巡之前先试 USN 增量 ----
@@ -1329,18 +1478,18 @@ fn refresh_with_mode(index: &mut Index, allow_full_sweep: bool) -> bool {
             index.built_unix = now_unix();
             // 水位只在缓存真的写成功之后才推进，而且和缓存放在同一个文件里：
             // 内容与水位一起落盘，并发下也不会出现「旧内容 + 新水位」。
-            if !dirty.is_empty() {
+            // 发布交给调用方在锁外做；这里只把「内容变了」记进代数。
+            let changed = !dirty.is_empty();
+            if changed {
                 index.usn = commits;
-                if !save_cache(index) {
-                    return true;
-                }
+                CONTENT_GEN.fetch_add(1, Ordering::SeqCst);
             }
             USN_TRUSTED.store(true, Ordering::Relaxed);
-            return true;
+            return (true, changed);
         }
     }
     if !allow_full_sweep {
-        return false;
+        return (false, false);
     }
 
     // 全盘巡开始前记下日志位置：巡成功提交后，下次启动就能走增量
@@ -1356,9 +1505,10 @@ fn refresh_with_mode(index: &mut Index, allow_full_sweep: bool) -> bool {
         // 缓存年龄接近 0，ensure_ready 会直接跳过巡。
         // 水位跟着缓存一起写：这就是「全盘巡完成」的坐标。
         index.usn = sweep;
-        save_cache(index);
+        CONTENT_GEN.fetch_add(1, Ordering::SeqCst);
+        return (true, true);
     }
-    ok
+    (false, false)
 }
 
 // ---------- 目录变更监听（ReadDirectoryChangesW） ----------
@@ -1399,6 +1549,11 @@ static MAPPED_STAMP: Mutex<Option<(u64, u64)>> = Mutex::new(None);
 /// 否则读者会一直停在旧快照（实测遇到过 13 分钟没更新的情况）。
 static CONTENT_GEN: AtomicU64 = AtomicU64::new(0);
 static SAVED_GEN: AtomicU64 = AtomicU64::new(0);
+/// 缓存发布串行锁：并发发布会让旧快照最后落盘、覆盖新快照。
+static CACHE_PUBLISH: Mutex<()> = Mutex::new(());
+/// 进程内缓存写序号：临时文件名不能只用 pid——同进程两次发布并发时
+/// 会抢同一个临时文件。
+static CACHE_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 static WATCHED_DRIVES: AtomicU64 = AtomicU64::new(0);
 
 /// 启动目录监听（幂等）。GUI 与 MCP 都会调，重复调用无代价。
@@ -2248,35 +2403,65 @@ fn copy_gaps<T: Copy>(items: &[T], ranges: &[(usize, usize)], out: &mut Vec<T>) 
 }
 
 /// 把 blob 里已失效（条目被删）的路径文本清掉，重新紧凑排布。
+/// 原地压缩路径区：把还活着的路径往前搬，丢掉被删除路径留下的空洞。
+///
+/// **必须原地做**：老写法是「新开一个 String 再拷 470MB」，压缩那一刻进程里
+/// 同时躺着 579MB 旧串 + 468MB 新串，峰值白白多 470MB。
+///
+/// **必须按旧偏移升序搬**（不是按条目顺序）：条目按路径排序，但路径区是只追加的，
+/// 增量刷新把新路径写在尾部、条目插在中间，所以 `items[i].path_off` 并不单调。
+/// 若按条目顺序搬，写出的字节会盖掉后面某条还没读的源路径，把索引写坏
+/// （2026-11-19 实机踩过：8M 条里 320 万条路径被拼接错乱）。
+/// 按偏移升序处理时目标位置 cur 恒 ≤ 源位置，后面还没读的源一定在 cur 之后。
+///
+/// 阈值 1/8：垃圾超过 12.5% 就整理。多一次 8M 条索引的排序（约 0.2s），
+/// 换来路径区不随运行时间无限膨胀。
 fn repack(index: &mut Index) {
-    let used: usize = index.items().iter().map(|it| it.path_len as usize).sum();
-    if used > 0 && index.blob().len() > used + used / 4 {
-        // 先把旧 blob 取出来：循环里要同时可变借用条目表
-        let old_blob = std::mem::take(index.blob_mut());
-        let mut blob = String::with_capacity(used);
-        for it in index.items_mut().iter_mut() {
-            let path: &str =
-                &old_blob[it.path_off as usize..(it.path_off + it.path_len) as usize];
-            let path_off = blob.len() as u32;
-            let rel = path.rfind('/').map_or(0, |i| i + 1) as u32;
-            blob.push_str(path);
-            it.path_off = path_off;
-            it.name_off = path_off + rel;
-            it.name_len = it.path_len - rel;
+    index.ensure_owned();
+    let Payload::Owned { blob, items, dir_blob, dirs } = &mut index.payload else {
+        return;
+    };
+    let used: usize = items.iter().map(|it| it.path_len as usize).sum();
+    if used > 0 && blob.len() > used + used / 8 {
+        let mut order: Vec<u32> = (0..items.len() as u32).collect();
+        order.sort_unstable_by_key(|&i| items[i as usize].path_off);
+        // SAFETY: 只整段搬运已存在的路径子串并按 UTF-8 边界截断，内容仍是合法 UTF-8
+        let bytes = unsafe { blob.as_bytes_mut() };
+        let mut cur = 0usize;
+        for i in order {
+            let it = &mut items[i as usize];
+            let off = it.path_off as usize;
+            let len = it.path_len as usize;
+            if off != cur {
+                bytes.copy_within(off..off + len, cur);
+            }
+            let rel = (it.name_off - it.path_off) as usize;
+            it.path_off = cur as u32;
+            it.name_off = (cur + rel) as u32;
+            cur += len;
         }
-        *index.blob_mut() = blob;
+        unsafe { blob.as_mut_vec().truncate(cur) };
+        blob.shrink_to_fit();
     }
-    let dused: usize = index.dirs().iter().map(|r| r.path_len as usize).sum();
-    if dused > 0 && index.dir_blob().len() > dused + dused / 4 {
-        let old_dblob = std::mem::take(index.dir_blob_mut());
-        let mut blob = String::with_capacity(dused);
-        for rec in index.dirs_mut().iter_mut() {
-            let path: &str =
-                &old_dblob[rec.path_off as usize..(rec.path_off + rec.path_len) as usize];
-            rec.path_off = blob.len() as u32;
-            blob.push_str(path);
+    let dused: usize = dirs.iter().map(|r| r.path_len as usize).sum();
+    if dused > 0 && dir_blob.len() > dused + dused / 8 {
+        let mut order: Vec<u32> = (0..dirs.len() as u32).collect();
+        order.sort_unstable_by_key(|&i| dirs[i as usize].path_off);
+        // SAFETY: 同上，只搬完整的目录路径子串
+        let bytes = unsafe { dir_blob.as_bytes_mut() };
+        let mut cur = 0usize;
+        for i in order {
+            let rec = &mut dirs[i as usize];
+            let off = rec.path_off as usize;
+            let len = rec.path_len as usize;
+            if off != cur {
+                bytes.copy_within(off..off + len, cur);
+            }
+            rec.path_off = cur as u32;
+            cur += len;
         }
-        *index.dir_blob_mut() = blob;
+        unsafe { dir_blob.as_mut_vec().truncate(cur) };
+        dir_blob.shrink_to_fit();
     }
 }
 
@@ -2462,6 +2647,42 @@ fn cache_path() -> Option<PathBuf> {
     Some(base.join("rust-seek").join("index-v1.bin"))
 }
 
+/// 清掉异常退出留下的缓存临时文件（写一半被杀 / 改名没跑完）。
+///
+/// 这类文件与正式缓存等大：本机实测 801MB + 852MB 两个僵尸躺了三天，
+/// 白白占 1.6GB 盘。每个进程只扫一次，且只删「一小时前」的
+/// （别的进程此刻可能正在写自己的临时文件）。
+fn cleanup_stale_tmp() {
+    static CLEANED: AtomicBool = AtomicBool::new(false);
+    if CLEANED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Some(dir) = cache_path().and_then(|p| p.parent().map(Path::to_path_buf)) else {
+        return;
+    };
+    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    let now = std::time::SystemTime::now();
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let ours = name.starts_with("index-v1.") || name.starts_with("bench-copy");
+        if !ours || !name.ends_with(".tmp") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|d| d.as_secs() > 3600);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// 并行校验 UTF-8。切点取 ASCII 字节（<0x80），这样每一段都从合法字符边界开始。
 ///
 /// 载入 790MB 缓存时这一步约 220ms（7.5M 条目 / 180MB 路径池），单线程跑是首查延迟的
@@ -2586,14 +2807,17 @@ fn parse_dirs(raw: &[u8], blob: &str) -> Option<Vec<DirRec>> {
 }
 
 fn load_cache() -> Option<Index> {
-    let path = cache_path()?;
-    let len = std::fs::metadata(&path).ok()?.len();
+    load_cache_from(&cache_path()?)
+}
+
+fn load_cache_from(path: &Path) -> Option<Index> {
+    let len = std::fs::metadata(path).ok()?.len();
     if len < HDR as u64 + MAGIC.len() as u64 || len > 4_000_000_000 {
         return None;
     }
     // 用 mmap 读：600MB 缓存先 read_to_end 到 Vec 再切片复制，等于白占 600MB 堆；
     // mmap 只映射虚拟地址，真正复制的是后面必须 own 的路径池和数据段。
-    let file = std::fs::File::open(&path).ok()?;
+    let file = std::fs::File::open(path).ok()?;
     let map = unsafe { memmap2::Mmap::map(&file).ok()? };
     let buf: &[u8] = &map;
 
@@ -2703,7 +2927,8 @@ fn load_cache() -> Option<Index> {
 }
 
 /// 只做序列化，不碰磁盘。需要持有索引锁，但耗时只到内存拷贝（~300ms）。
-fn build_cache_bytes(index: &Index) -> Vec<u8> {
+/// 缓存文件三段对齐后的总字节数，以及两处填充长度。
+fn cache_layout(index: &Index) -> (usize, usize, usize) {
     let pad1 = pad8(HDR_V5 + index.blob().len());
     let pad2 = pad8(
         HDR_V5
@@ -2712,63 +2937,289 @@ fn build_cache_bytes(index: &Index) -> Vec<u8> {
             + index.items().len() * ITEM_BYTES
             + index.dir_blob().len(),
     );
-    let mut buf = Vec::with_capacity(
-        HDR_V5
-            + index.blob().len()
-            + pad1
-            + index.items().len() * ITEM_BYTES
-            + index.dir_blob().len()
-            + pad2
-            + index.dirs().len() * DIR_BYTES
-            + index.usn.len() * USN_BYTES,
-    );
-    buf.extend_from_slice(MAGIC);
-    buf.extend_from_slice(&index.built_unix.to_le_bytes());
-    buf.extend_from_slice(&(index.blob().len() as u64).to_le_bytes());
-    buf.extend_from_slice(&(index.items().len() as u64).to_le_bytes());
+    let total = HDR_V5
+        + index.blob().len()
+        + pad1
+        + index.items().len() * ITEM_BYTES
+        + index.dir_blob().len()
+        + pad2
+        + index.dirs().len() * DIR_BYTES
+        + index.usn.len() * USN_BYTES;
+    (pad1, pad2, total)
+}
+
+/// 发布时每次从索引里切出来搬运的字节数。写 730MB 期间索引锁只被切成
+/// 1MB 一段的毫秒级小片，查询不会被一整秒的写盘卡住。
+const PUBLISH_CHUNK: usize = 1 << 20;
+
+/// 缓存里四段大字节区。条目/目录块是 `#[repr(C)]` 定长结构，
+/// 内存排布与小端序列化结果逐字节相同（mmap 载入路径本来就依赖这一点），
+/// 所以可以直接按原始字节搬运，不必逐字段拼。
+#[derive(Clone, Copy)]
+enum Seg {
+    Blob,
+    Items,
+    DirBlob,
+    Dirs,
+}
+
+impl Seg {
+    fn raw<'a>(self, ix: &'a Index) -> &'a [u8] {
+        unsafe {
+            match self {
+                Seg::Blob => ix.blob().as_bytes(),
+                Seg::Items => std::slice::from_raw_parts(
+                    ix.items().as_ptr() as *const u8,
+                    ix.items().len() * ITEM_BYTES,
+                ),
+                Seg::DirBlob => ix.dir_blob().as_bytes(),
+                Seg::Dirs => std::slice::from_raw_parts(
+                    ix.dirs().as_ptr() as *const u8,
+                    ix.dirs().len() * DIR_BYTES,
+                ),
+            }
+        }
+    }
+}
+
+/// 缓存头部 64 字节。
+fn cache_header(index: &Index) -> [u8; HDR_V5] {
+    let mut h = [0u8; HDR_V5];
+    h[0..8].copy_from_slice(MAGIC);
+    h[8..16].copy_from_slice(&index.built_unix.to_le_bytes());
+    h[16..24].copy_from_slice(&(index.blob().len() as u64).to_le_bytes());
+    h[24..32].copy_from_slice(&(index.items().len() as u64).to_le_bytes());
     let mut flags = if index.complete { FLAG_COMPLETE } else { 0 };
     if index.incomplete_dirs {
         flags |= FLAG_INCOMPLETE_DIRS;
     }
-    buf.extend_from_slice(&flags.to_le_bytes());
-    buf.extend_from_slice(&(index.dir_blob().len() as u64).to_le_bytes());
-    buf.extend_from_slice(&(index.dirs().len() as u64).to_le_bytes());
-    buf.extend_from_slice(&(index.usn.len() as u64).to_le_bytes());
-    buf.extend_from_slice(index.blob().as_bytes());
+    h[32..40].copy_from_slice(&flags.to_le_bytes());
+    h[40..48].copy_from_slice(&(index.dir_blob().len() as u64).to_le_bytes());
+    h[48..56].copy_from_slice(&(index.dirs().len() as u64).to_le_bytes());
+    h[56..64].copy_from_slice(&(index.usn.len() as u64).to_le_bytes());
+    h
+}
+
+/// 顺序写入器：把索引按缓存格式填进一段已经备好的字节里（仅测试用：
+/// 生产发布是分块直写，不再整块拼字节）。
+#[cfg(test)]
+struct ByteSink<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+#[cfg(test)]
+impl<'a> ByteSink<'a> {
+    fn put(&mut self, bytes: &[u8]) {
+        let end = self.pos + bytes.len();
+        self.buf[self.pos..end].copy_from_slice(bytes);
+        self.pos = end;
+    }
+    fn zeros(&mut self, n: usize) {
+        let end = self.pos + n;
+        self.buf[self.pos..end].fill(0);
+        self.pos = end;
+    }
+}
+
+#[cfg(test)]
+fn write_cache_into(index: &Index, buf: &mut [u8], pad1: usize, pad2: usize) {
+    let mut w = ByteSink { buf, pos: 0 };
+    w.put(&cache_header(index));
+    w.put(Seg::Blob.raw(index));
     // 对齐填充：让条目块从 8 的倍数偏移开始（mmap 后可直接当 &[Item]）
-    buf.extend(std::iter::repeat(0u8).take(pad1));
-    for it in index.items() {
-        buf.extend_from_slice(&it.path_off.to_le_bytes());
-        buf.extend_from_slice(&it.path_len.to_le_bytes());
-        buf.extend_from_slice(&it.name_off.to_le_bytes());
-        buf.extend_from_slice(&it.name_len.to_le_bytes());
-        buf.extend_from_slice(&it.size.to_le_bytes());
-        buf.extend_from_slice(&it.mtime.to_le_bytes());
-    }
-    buf.extend_from_slice(index.dir_blob().as_bytes());
-    buf.extend(std::iter::repeat(0u8).take(pad2));
-    for rec in index.dirs() {
-        buf.extend_from_slice(&rec.path_off.to_le_bytes());
-        buf.extend_from_slice(&rec.path_len.to_le_bytes());
-        buf.extend_from_slice(&rec.mtime.to_le_bytes());
-    }
+    w.zeros(pad1);
+    w.put(Seg::Items.raw(index));
+    w.put(Seg::DirBlob.raw(index));
+    w.zeros(pad2);
+    w.put(Seg::Dirs.raw(index));
     // 尾部：本份索引覆盖到的 USN 水位（24 字节/盘）
     for c in &index.usn {
         let mut rec = [0u8; USN_BYTES];
         rec[0] = c.drive as u8;
         rec[8..16].copy_from_slice(&c.journal_id.to_le_bytes());
         rec[16..24].copy_from_slice(&c.next_usn.to_le_bytes());
-        buf.extend_from_slice(&rec);
+        w.put(&rec);
     }
+}
 
+/// 测试与旧调用方用：序列化成一整块 `Vec<u8>`。
+/// 生产发布**不走它**——840MB 的堆分配会让写者峰值内存翻倍。
+#[cfg(test)]
+fn build_cache_bytes(index: &Index) -> Vec<u8> {
+    let (pad1, pad2, total) = cache_layout(index);
+    let mut buf = vec![0u8; total];
+    write_cache_into(index, &mut buf, pad1, pad2);
     buf
 }
 
-/// 把序列化好的字节写盘（临时文件 + rename）。**不需要索引锁**：
-/// 790MB 写盘要 1–3 秒，持锁写会让写者自己的查询卡住——这正是要拆开的原因。
-fn write_cache_bytes(buf: &[u8], path: &std::path::Path) -> bool {
-    // 临时文件名带 pid：多个进程同时重建时各写各的，最后 rename 覆盖
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+/// 发布当前内存索引到缓存文件。调用方**不得持有** INDEX 锁。
+///
+/// 三条不变量：
+/// 1. 串行发布：并发发布会让旧快照最后落盘、把新快照盖掉；
+/// 2. 锁内只序列化并记录「这份字节对应的代数」，写盘在索引锁外做；
+/// 3. 成功后只能把 `SAVED_GEN` 推进到这份字节的代数，**绝不能**读「此刻最新」代数——
+///    写盘期间若又发生刷新，读最新代数会把旧字节标成新内容已保存，之后永不补写。
+fn publish_cache() -> bool {
+    let Some(path) = cache_path() else { return false };
+    publish_to(&path)
+}
+
+/// [`publish_cache`] 的本体：把当前内存索引发布到 `path`。
+/// 只在目标是正式缓存时才清变更日志——测试写到临时目录不能动生产日志。
+///
+/// 写盘方式：**分块搬运**，不是「先拼一份 730MB」也不是「整块映射后写」。
+/// 实测后两种都会让写者峰值多 600–800MB（拼 Vec 是私有内存，映射是驻留的脏页），
+/// 而每 30 秒来一次的话，这一下就是「系统突然很卡」的直接来源。
+/// 现在锁内只拷 1MB 到复用缓冲、锁外写盘，峰值不再随缓存大小翻倍。
+fn publish_to(path: &Path) -> bool {
+    let _serial = CACHE_PUBLISH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let fail = |step: &str, e: Option<std::io::Error>| {
+        if std::env::var_os("RUST_SEEK_DEBUG").is_some() {
+            eprintln!("[debug] publish_to {step} 失败: {e:?}");
+        }
+    };
+    // 临时文件名带 pid + 进程内序号：同进程并发发布也不会抢同一个文件
+    let seq = CACHE_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}.{}.tmp", std::process::id(), seq));
+
+    // 布局、头部、代数必须来自同一份快照：分开读会出现「旧长度 + 新代数」。
+    let (pad1, pad2, total, header, lengths, snapshot_gen) = {
+        let guard = lock();
+        let Some(ix) = guard.as_ref() else { return false };
+        let (pad1, pad2, total) = cache_layout(ix);
+        let lengths = [
+            ix.blob().len(),
+            ix.items().len() * ITEM_BYTES,
+            ix.dir_blob().len(),
+            ix.dirs().len() * DIR_BYTES,
+        ];
+        (
+            pad1,
+            pad2,
+            total,
+            cache_header(ix),
+            lengths,
+            CONTENT_GEN.load(Ordering::SeqCst),
+        )
+    };
+
+    let file = match std::fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(e) => {
+            fail("create", Some(e));
+            return false;
+        }
+    };
+    let mut out = std::io::BufWriter::with_capacity(PUBLISH_CHUNK, file);
+    let mut chunk = vec![0u8; PUBLISH_CHUNK];
+    let mut written = 0u64;
+
+    // 任一步失败或发现内容已变：删掉半个临时文件，保持脏，下一轮重试。
+    macro_rules! give_up {
+        ($step:expr, $e:expr) => {{
+            fail($step, $e);
+            drop(out);
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }};
+    }
+
+    if let Err(e) = out.write_all(&header) {
+        give_up!("header", Some(e));
+    }
+    written += header.len() as u64;
+
+    // 四段大区：锁内拷 1MB → 锁外写。中间任何内容变更都让这份字节前后矛盾，
+    // 必须整体作废（CONTENT_GEN 只在持锁时变，所以每块检查一次就够）。
+    let segs = [Seg::Blob, Seg::Items, Seg::DirBlob, Seg::Dirs];
+    let pads = [pad1, 0, pad2, 0];
+    for (i, &len) in lengths.iter().enumerate() {
+        let seg = segs[i];
+        let mut off = 0usize;
+        while off < len {
+            let n = (len - off).min(chunk.len());
+            let stale = {
+                let guard = lock();
+                let Some(ix) = guard.as_ref() else { give_up!("index-gone", None) };
+                if CONTENT_GEN.load(Ordering::SeqCst) != snapshot_gen {
+                    true
+                } else {
+                    chunk[..n].copy_from_slice(&seg.raw(ix)[off..off + n]);
+                    false
+                }
+            };
+            if stale {
+                give_up!("stale", None);
+            }
+            if let Err(e) = out.write_all(&chunk[..n]) {
+                give_up!("body", Some(e));
+            }
+            off += n;
+        }
+        let pad = pads[i];
+        if pad > 0 {
+            if let Err(e) = out.write_all(&[0u8; 8][..pad]) {
+                give_up!("pad", Some(e));
+            }
+        }
+        written += len as u64 + pad as u64;
+    }
+
+    // 尾部水位（每盘 24 字节，很小，直接持锁写完）
+    {
+        let guard = lock();
+        let Some(ix) = guard.as_ref() else { give_up!("index-gone", None) };
+        if CONTENT_GEN.load(Ordering::SeqCst) != snapshot_gen {
+            give_up!("stale", None);
+        }
+        for c in &ix.usn {
+            let mut rec = [0u8; USN_BYTES];
+            rec[0] = c.drive as u8;
+            rec[8..16].copy_from_slice(&c.journal_id.to_le_bytes());
+            rec[16..24].copy_from_slice(&c.next_usn.to_le_bytes());
+            if let Err(e) = out.write_all(&rec) {
+                give_up!("usn", Some(e));
+            }
+        }
+        written += (ix.usn.len() * USN_BYTES) as u64;
+    }
+
+    if written != total as u64 {
+        give_up!("size", None);
+    }
+    if let Err(e) = out.flush() {
+        give_up!("flush", Some(e));
+    }
+    drop(out);
+
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        fail("rename", Some(e));
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    // 单调推进：即使有更旧的写迟到，也不能把「已保存代数」拉回去
+    SAVED_GEN.fetch_max(snapshot_gen, Ordering::SeqCst);
+    // 新缓存代表「此刻的文件系统」，之前那份日志描述的空窗已经归零。
+    // 只对正式缓存生效：测试写到临时目录时不能删生产日志。
+    if cache_path().as_deref() == Some(path) {
+        if let Some(j) = journal_path() {
+            let _ = std::fs::remove_file(j);
+        }
+    }
+    true
+}
+
+/// 把一小段字节原子写盘（唯一临时文件 + rename）。测试与兼容用；
+/// 生产发布走 [`publish_cache`] 的映射写法，不需要索引锁。
+#[cfg(test)]
+fn write_cache_bytes(buf: &[u8], path: &std::path::Path, snapshot_gen: u64) -> bool {
+    // 临时文件名带 pid + 进程内序号：同进程并发发布也不会抢同一个文件
+    let seq = CACHE_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}.{}.tmp", std::process::id(), seq));
     let mut file = match std::fs::File::create(&tmp) {
         Ok(f) => f,
         Err(_) => return false,
@@ -2782,21 +3233,9 @@ fn write_cache_bytes(buf: &[u8], path: &std::path::Path) -> bool {
         let _ = std::fs::remove_file(&tmp);
         return false;
     }
-    // 新缓存代表「此刻的文件系统」，之前那份日志描述的空窗已经归零
-    if let Some(j) = journal_path() {
-        let _ = std::fs::remove_file(j);
-    }
-    SAVED_GEN.store(CONTENT_GEN.load(Ordering::Relaxed), Ordering::Relaxed);
+    // 单调推进：即使有更旧的写迟到，也不能把「已保存代数」拉回去
+    SAVED_GEN.fetch_max(snapshot_gen, Ordering::SeqCst);
     true
-}
-
-fn save_cache(index: &Index) -> bool {
-    let Some(path) = cache_path() else { return false };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let buf = build_cache_bytes(index);
-    write_cache_bytes(&buf, &path)
 }
 
 #[cfg(test)]
@@ -3074,5 +3513,561 @@ mod tests {
             match_item(&idx, it, &re, &exts, &mut path_hits, true);
         }
         assert!(path_hits.is_empty());
+    }
+
+    // ---------- 纯字面量连续扫描 ----------
+
+    fn exts_of(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn fast_hits(idx: &Index, re: &Regex, exts: &[&str], max: usize) -> Vec<String> {
+        let exts = exts_of(exts);
+        let mut hits = Vec::new();
+        let mut buf = String::new();
+        let mut map = Vec::new();
+        scan_literal_chunk(
+            idx,
+            idx.items(),
+            re,
+            &exts,
+            max,
+            &mut hits,
+            &mut buf,
+            &mut map,
+        );
+        hits.into_iter().map(|h| h.path).collect()
+    }
+
+    fn legacy_hits(idx: &Index, re: &Regex, exts: &[&str], max: usize) -> Vec<String> {
+        let exts = exts_of(exts);
+        let mut hits = Vec::new();
+        for item in idx.items() {
+            if hits.len() >= max {
+                break;
+            }
+            match_item(idx, item, re, &exts, &mut hits, false);
+        }
+        hits.into_iter().map(|h| h.path).collect()
+    }
+
+    #[test]
+    fn safe_literal_only_accepts_plain_text() {
+        for ok in ["rust-seek", "述职", "a b", "Cargo", "报告-2026"] {
+            assert!(safe_literal(&Regex::new(ok).unwrap()), "{ok:?} 应走快路径");
+        }
+        // GUI 纯文本模式 / MCP 非正则模式都会先 regex::escape；
+        // 转义后的元字符匹配的仍是固定字节，必须放行，否则「main.rs」这类
+        // 最常见的文件名查询永远吃不到快路径。
+        for raw in ["main.rs", "报告 (1).pdf", "a+b[c]", r"C:\path\x", "100%", "a|b"] {
+            let pat = regex::escape(raw);
+            assert!(
+                safe_literal(&Regex::new(&pat).unwrap()),
+                "{pat:?}（escape({raw:?})）应走快路径"
+            );
+        }
+        for bad in [
+            "", "foo.bar", "^lib", "lib$", "a|b", "a*", "a+", "(?i)foo", r"a\sb", "[ab]",
+            "{2}", "foo\nbar", r"foo\r", r"\d+", r"\x41", r"\p{L}", r"\A", r"\z",
+        ] {
+            // 编译不过的模式根本走不到查询阶段；能编译的必须被判为非字面量
+            if let Ok(re) = Regex::new(bad) {
+                assert!(!safe_literal(&re), "{bad:?} 必须回退逐条匹配");
+            }
+        }
+    }
+
+    #[test]
+    fn literal_scan_matches_legacy_per_item() {
+        let idx = synth(SAMPLE);
+        let patterns = [
+            "rs", "lib.rs", "readme", "述职", "a", "2026", "no-such-file", r"\.exe", r"readme\.md",
+        ];
+        for pat in patterns {
+            let re = Regex::new(pat).unwrap();
+            for max in [1usize, 2, 5, 100] {
+                for exts in [&[][..], &["rs"][..], &["md", "txt"][..]] {
+                    assert_eq!(
+                        fast_hits(&idx, &re, exts, max),
+                        legacy_hits(&idx, &re, exts, max),
+                        "模式 {pat:?} max={max} exts={exts:?} 的新旧结果不一致"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn literal_scan_batch_boundaries_match_legacy() {
+        // 快路径按 1024 条一批拼接；这里专门跨批边界比对，
+        // 防止 `base * BATCH + i` 把命中映射到错误的条目上。
+        let names: Vec<String> = (0..5000)
+            .map(|i| format!("D:/bulk/dir{}/file-{:04}-x{}.txt", i % 37, i, i % 11))
+            .collect();
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let idx = synth(&refs);
+
+        for pat in [
+            "file-0000", "file-1023", "file-1024", "file-2048", "file-4999", "dir36/", "file-",
+        ] {
+            let re = Regex::new(pat).unwrap();
+            for max in [1usize, 3, 50, 10_000] {
+                for exts in [&[][..], &["txt"][..], &["rs"][..]] {
+                    assert_eq!(
+                        fast_hits(&idx, &re, exts, max),
+                        legacy_hits(&idx, &re, exts, max),
+                        "模式 {pat:?} max={max} exts={exts:?} 跨批结果不一致"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn literal_scan_keeps_case_insensitive_semantics() {
+        let idx = synth(SAMPLE);
+        let re = regex::RegexBuilder::new("LIB")
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        assert!(safe_literal(&re), "忽略大小写不改变模式本身是纯字面量");
+        assert_eq!(fast_hits(&idx, &re, &[], 10), legacy_hits(&idx, &re, &[], 10));
+        assert!(fast_hits(&idx, &re, &[], 10)
+            .iter()
+            .any(|p| p.ends_with("/lib.rs")));
+    }
+
+    #[test]
+    fn literal_scan_dedups_repeated_matches_per_file() {
+        let idx = synth(&["D:/x/aaaa.txt", "D:/x/b.txt"]);
+        let re = Regex::new("a").unwrap();
+        assert_eq!(fast_hits(&idx, &re, &[], 10), vec!["D:/x/aaaa.txt".to_string()]);
+        // 上限按「文件数」而不是命中次数：两个 a 也只占一个名额
+        assert_eq!(fast_hits(&idx, &re, &[], 1), vec!["D:/x/aaaa.txt".to_string()]);
+    }
+
+    // ---------- 缓存发布代数 ----------
+
+    static PUBLISH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn test_cache_path(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "rust-seek-publish-{}-{}-{}",
+            tag,
+            std::process::id(),
+            CACHE_WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index-v1.bin");
+        (dir, path)
+    }
+
+    #[test]
+    fn publish_uses_snapshot_gen_not_latest() {
+        let _g = PUBLISH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir, path) = test_cache_path("gen");
+        CONTENT_GEN.store(2, Ordering::SeqCst);
+        SAVED_GEN.store(0, Ordering::SeqCst);
+
+        // 写盘期间内容又变了（CONTENT_GEN=2），但这批字节只代表 gen 1
+        assert!(write_cache_bytes(b"old", &path, 1));
+        assert_eq!(
+            SAVED_GEN.load(Ordering::SeqCst),
+            1,
+            "旧字节不能把新代数标成已保存，否则新内容永不补写"
+        );
+
+        assert!(write_cache_bytes(b"new", &path, 2));
+        assert_eq!(SAVED_GEN.load(Ordering::SeqCst), 2);
+
+        // 迟到的旧写也不能把「已保存代数」拉回去
+        assert!(write_cache_bytes(b"late-old", &path, 1));
+        assert_eq!(SAVED_GEN.load(Ordering::SeqCst), 2);
+
+        CONTENT_GEN.store(0, Ordering::SeqCst);
+        SAVED_GEN.store(0, Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn publish_failure_keeps_dirty_for_retry() {
+        let _g = PUBLISH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir, _) = test_cache_path("fail");
+        let missing = dir.join("missing-dir").join("index-v1.bin");
+        CONTENT_GEN.store(5, Ordering::SeqCst);
+        SAVED_GEN.store(4, Ordering::SeqCst);
+
+        assert!(!write_cache_bytes(b"x", &missing, 5));
+        assert_eq!(
+            SAVED_GEN.load(Ordering::SeqCst),
+            4,
+            "写盘失败不得对齐代数：必须保持脏，让维护循环重试"
+        );
+        assert_ne!(
+            CONTENT_GEN.load(Ordering::SeqCst),
+            SAVED_GEN.load(Ordering::SeqCst)
+        );
+
+        CONTENT_GEN.store(0, Ordering::SeqCst);
+        SAVED_GEN.store(0, Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 生产发布路径本身：映射写出来的缓存必须能被载入，代数只推进到快照那一代。
+    #[test]
+    fn publish_mapped_cache_is_loadable() {
+        let _g = PUBLISH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (dir, path) = test_cache_path("mapped");
+        *lock() = Some(Box::new(tiny_index()));
+        CONTENT_GEN.store(9, Ordering::SeqCst);
+        SAVED_GEN.store(0, Ordering::SeqCst);
+
+        assert!(publish_to(&path), "映射发布失败");
+
+        assert_eq!(SAVED_GEN.load(Ordering::SeqCst), 9);
+        let back = load_cache_from(&path).expect("发布出来的缓存必须能载入");
+        assert_eq!(back.items().len(), 3);
+        assert_eq!(back.items()[2].mtime, 1_700_000_000);
+        assert_eq!(dir_path_of(&back.dir_blob(), &back.dirs()[0]), "C:/a");
+
+        *lock() = None;
+        CONTENT_GEN.store(0, Ordering::SeqCst);
+        SAVED_GEN.store(0, Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- 缓存格式：序列化/压缩 ----------
+
+    /// 小索引构造器：路径池、条目、目录表三样内容自洽且严格升序。
+    fn tiny_index() -> Index {
+        let mut blob = String::new();
+        let mut items = Vec::new();
+        for path in ["C:/a/one.txt", "C:/a/two.rs", "D:/b/中文名.md"] {
+            let path_off = blob.len() as u32;
+            blob.push_str(path);
+            let rel = path.rfind('/').map_or(0, |i| i + 1) as u32;
+            items.push(Item {
+                path_off,
+                path_len: path.len() as u32,
+                name_off: path_off + rel,
+                name_len: path.len() as u32 - rel,
+                size: path.len() as u64,
+                mtime: 1_700_000_000,
+            });
+        }
+        let mut dir_blob = String::new();
+        let mut dirs = Vec::new();
+        for d in ["C:/a", "D:/b"] {
+            let path_off = dir_blob.len() as u32;
+            dir_blob.push_str(d);
+            dirs.push(DirRec { path_off, path_len: d.len() as u32, mtime: 1_700_000_001 });
+        }
+        Index {
+            payload: Index::new_owned(blob, items, dir_blob, dirs),
+            usn: vec![crate::usn::Commit { drive: 'C', journal_id: 7, next_usn: 12345 }],
+            built_unix: now_unix(),
+            complete: true,
+            incomplete_dirs: false,
+        }
+    }
+
+    /// 发布改成「写进映射区」后，字节布局必须和原来逐字节等价：
+    /// 写出来的缓存能原样载入回来，路径/大小/mtime/目录/USN 水位一个不差。
+    #[test]
+    fn cache_bytes_roundtrip_preserves_entries() {
+        let (dir, path) = test_cache_path("roundtrip");
+        let ix = tiny_index();
+        let bytes = build_cache_bytes(&ix);
+        std::fs::write(&path, &bytes).unwrap();
+        let back = load_cache_from(&path).expect("写出来的缓存必须能载入");
+
+        assert_eq!(back.items().len(), ix.items().len());
+        for (a, b) in ix.items().iter().zip(back.items()) {
+            assert_eq!(ix.path(a), back.path(b), "路径必须原样往返");
+            assert_eq!(ix.name(a), back.name(b), "名字偏移必须原样往返");
+            assert_eq!(a.size, b.size);
+            assert_eq!(a.mtime, b.mtime);
+        }
+        let pa: Vec<&str> =
+            ix.dirs().iter().map(|r| dir_path_of(&ix.dir_blob(), r)).collect();
+        let pb: Vec<&str> =
+            back.dirs().iter().map(|r| dir_path_of(&back.dir_blob(), r)).collect();
+        assert_eq!(pa, pb);
+        assert_eq!(back.usn.len(), 1);
+        assert_eq!(back.usn[0].next_usn, 12345);
+        assert!(back.complete);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 路径池只追加，删掉的路径会留在尾部变成垃圾。原地压缩必须做到：
+    /// 路径区长度回落到「活字节」、所有条目路径与名字偏移仍然正确。
+    ///
+    /// 用例特意让**条目偏移不单调**（增量刷新就是这样：新路径写在尾部、
+    /// 条目插在中间）。按条目顺序搬的实现会覆盖还没读的源，实机把 8M 条里
+    /// 320 万条路径拼坏——这条断言就是那次事故的护栏。
+    #[test]
+    fn repack_compacts_garbage_in_place() {
+        let mut ix = tiny_index();
+        // 追加一条「后来新增」的路径到尾部，条目插在路径序中间（偏移比前一条小）
+        let appended = "C:/a/three.txt";
+        let app_off = ix.blob().len() as u32;
+        ix.blob_mut().push_str(appended);
+        let rel = appended.rfind('/').map_or(0, |i| i + 1) as u32;
+        ix.items_mut().insert(
+            1,
+            Item {
+                path_off: app_off,
+                path_len: appended.len() as u32,
+                name_off: app_off + rel,
+                name_len: appended.len() as u32 - rel,
+                size: 7,
+                mtime: 1_700_000_002,
+            },
+        );
+        // 再造一堆没人指向的垃圾，逼过 1/8 阈值
+        ix.blob_mut().push_str(&"X:/deleted/should-not-be-here.bin".repeat(200));
+        ix.dir_blob_mut().push_str(&"Y:/gone".repeat(100));
+        let live: usize = ix.items().iter().map(|it| it.path_len as usize).sum();
+        let before: Vec<String> = ix.items().iter().map(|it| ix.path(it).to_string()).collect();
+        assert!(ix.blob().len() > live + live / 8, "先制造超过阈值的垃圾");
+
+        repack(&mut ix);
+
+        assert_eq!(ix.blob().len(), live, "压缩后路径区只剩活字节");
+        let after: Vec<String> = ix.items().iter().map(|it| ix.path(it).to_string()).collect();
+        assert_eq!(before, after, "压缩不能改变任何条目的路径");
+        assert_eq!(ix.name(&ix.items()[1]), "three.txt", "名字偏移必须跟着搬");
+        assert_eq!(ix.name(&ix.items()[2]), "two.rs", "尾部追加的条目不能串行");
+        assert_eq!(ix.dirs().len(), 2);
+        assert_eq!(dir_path_of(&ix.dir_blob(), &ix.dirs()[1]), "D:/b");
+    }
+
+    // ---------- 端到端性能验收 ----------
+
+    /// 生产查询循环的对照复刻：64K 条目切块、多线程抢游标、每 worker 私有
+    /// `Vec<Hit>` 再合并，与 `query` 完全同构。
+    ///
+    /// - `use_fast=false` → v5.4.8 的逐条匹配（改造前基线）
+    /// - `use_fast=true`  → 新的连续名字扫描
+    /// - `collect=false`  → 命中后不物化 `Hit`（只对零命中模式等价）
+    ///
+    /// 返回 (最优耗时, 命中数)。
+    fn parallel_replica(
+        re: &Regex,
+        max: usize,
+        rounds: usize,
+        use_fast: bool,
+        collect: bool,
+    ) -> (Duration, usize) {
+        let exts: HashSet<String> = HashSet::new();
+        let mut best = Duration::MAX;
+        let mut last = 0usize;
+        for _ in 0..rounds {
+            let t = Instant::now();
+            let guard = lock();
+            let index = guard.as_ref().expect("索引未就绪");
+            const CHUNK: usize = 64 * 1024;
+            let items = index.items();
+            let tasks: Vec<(usize, usize)> = (0..items.len())
+                .step_by(CHUNK)
+                .map(|a| (a, (a + CHUNK).min(items.len())))
+                .collect();
+            let cursor = std::sync::atomic::AtomicUsize::new(0);
+            let stop = AtomicBool::new(false);
+            let out: Mutex<Vec<Hit>> = Mutex::new(Vec::new());
+            let workers = num_cpus::get().clamp(1, 16).min(tasks.len());
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    let cursor = &cursor;
+                    let stop = &stop;
+                    let out = &out;
+                    let tasks = &tasks;
+                    let exts = &exts;
+                    scope.spawn(move || {
+                        let mut local: Vec<Hit> = Vec::new();
+                        let mut name_buf = String::new();
+                        let mut name_map: Vec<(usize, u32)> = Vec::new();
+                        loop {
+                            if stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let i = cursor.fetch_add(1, Ordering::Relaxed);
+                            let Some((lo, hi)) = tasks.get(i).copied() else { break };
+                            let chunk = &index.items()[lo..hi];
+                            let limit_hit = if use_fast {
+                                scan_literal_chunk(
+                                    index,
+                                    chunk,
+                                    re,
+                                    exts,
+                                    max,
+                                    &mut local,
+                                    &mut name_buf,
+                                    &mut name_map,
+                                )
+                            } else {
+                                for item in chunk {
+                                    if local.len() >= max {
+                                        break;
+                                    }
+                                    match_item(index, item, re, exts, &mut local, false);
+                                }
+                                local.len() >= max
+                            };
+                            if limit_hit && collect {
+                                stop.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            if limit_hit {
+                                // 只测内核：清掉命中继续，跳过物化成本
+                                local.clear();
+                            }
+                        }
+                        if !local.is_empty() {
+                            out.lock().unwrap().extend(local);
+                        }
+                    });
+                }
+            });
+            last = out.into_inner().unwrap().len();
+            drop(guard);
+            best = best.min(t.elapsed());
+        }
+        (best, last)
+    }
+
+    /// 实机性能验收（默认忽略，需真实整盘缓存）：
+    /// cargo test --release live_query_perf_acceptance -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_query_perf_acceptance() {
+        ensure_ready();
+        let (items, name_bytes) = {
+            let g = lock();
+            let ix = g.as_ref().expect("索引未就绪");
+            let bytes: usize = ix.items().iter().map(|it| ix.name(it).len()).sum();
+            (ix.items().len(), bytes)
+        };
+        println!("索引条目 {items}，名字区 {:.1} MB", name_bytes as f64 / 1e6);
+        println!(
+            "{:<22} {:>6} {:>10} {:>10} {:>9}",
+            "模式", "命中", "新(ms)", "旧(ms)", "加速"
+        );
+
+        let exts: HashSet<String> = HashSet::new();
+        for pat in [
+            "rust-seek",
+            "zzz-nonexistent-zzz",
+            "zzz-不存在的词-zzz",
+            "述职",
+            "a",
+            r"\.exe",
+        ] {
+            let re = Regex::new(pat).unwrap();
+            // 预热页缓存 + 线程池
+            let _ = query(&re, &[], &exts, 10, None, false);
+
+            let t = Instant::now();
+            let (hits, ..) = query(&re, &[], &exts, 10, None, false).unwrap();
+            let fast = t.elapsed();
+
+            let (legacy, _) = parallel_replica(&re, 10, 3, false, true);
+            println!(
+                "{:<22} {:>6} {:>10.2} {:>10.2} {:>8.1}x",
+                pat,
+                hits.len(),
+                fast.as_secs_f64() * 1000.0,
+                legacy.as_secs_f64() * 1000.0,
+                legacy.as_secs_f64() / fast.as_secs_f64()
+            );
+
+            // 零命中模式再拆出「拼接 + 扫描内核」，差值即 Hit 物化与线程开销
+            if hits.is_empty() {
+                let (kernel, _) = parallel_replica(&re, 10, 3, true, false);
+                println!(
+                    "   └ 仅拼接+扫描内核 {:.2}ms，物化/线程开销 {:.2}ms",
+                    kernel.as_secs_f64() * 1000.0,
+                    (fast.as_secs_f64() - kernel.as_secs_f64()) * 1000.0
+                );
+            }
+        }
+
+        // 决定性拆分：拼接（只写不扫）vs 逐条匹配（只扫不拼）
+        let re = Regex::new("zzz-不存在的词-zzz").unwrap();
+        let mut best_join = Duration::MAX;
+        let mut sink = 0usize;
+        for _ in 0..3 {
+            let t = Instant::now();
+            let guard = lock();
+            let index = guard.as_ref().unwrap();
+            const CHUNK: usize = 64 * 1024;
+            let items = index.items();
+            let mut buf = String::new();
+            let mut lo = 0;
+            while lo < items.len() {
+                let hi = (lo + CHUNK).min(items.len());
+                buf.clear();
+                for item in &items[lo..hi] {
+                    buf.push_str(index.name(item));
+                    buf.push('\n');
+                }
+                sink = sink.wrapping_add(buf.len());
+                lo = hi;
+            }
+            drop(guard);
+            best_join = best_join.min(t.elapsed());
+        }
+        let mut best_scan = Duration::MAX;
+        for _ in 0..3 {
+            let t = Instant::now();
+            let guard = lock();
+            let index = guard.as_ref().unwrap();
+            let mut n = 0usize;
+            for item in index.items() {
+                if re.is_match(index.name(item)) {
+                    n += 1;
+                }
+            }
+            sink = sink.wrapping_add(n);
+            drop(guard);
+            best_scan = best_scan.min(t.elapsed());
+        }
+        println!(
+            "拆分：仅拼接 {:.2}ms / 仅逐条匹配 {:.2}ms（sink={}）",
+            best_join.as_secs_f64() * 1000.0,
+            best_scan.as_secs_f64() * 1000.0,
+            sink
+        );
+    }
+
+    /// 实机测量：索引里有多少「已经没人指向的路径字节」（只增不减的泄漏量）。
+    /// cargo test --release live_index_garbage -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_index_garbage() {
+        ensure_ready();
+        let g = lock();
+        let ix = g.as_ref().expect("索引未就绪");
+        let live: usize = ix.items().iter().map(|it| it.path_len as usize).sum();
+        let blob = ix.blob().len();
+        let live_dirs: usize = ix.dirs().iter().map(|d| d.path_len as usize).sum();
+        let dblob = ix.dir_blob().len();
+        println!(
+            "条目 {} | 路径区 {:.1}MB，活字节 {:.1}MB，垃圾 {:.1}MB（{:.1}%）",
+            ix.items().len(),
+            blob as f64 / 1e6,
+            live as f64 / 1e6,
+            (blob - live) as f64 / 1e6,
+            (blob - live) as f64 * 100.0 / blob.max(1) as f64
+        );
+        println!(
+            "目录 {} | 路径区 {:.2}MB，活字节 {:.2}MB，垃圾 {:.2}MB（{:.1}%）",
+            ix.dirs().len(),
+            dblob as f64 / 1e6,
+            live_dirs as f64 / 1e6,
+            (dblob - live_dirs) as f64 / 1e6,
+            (dblob - live_dirs) as f64 * 100.0 / dblob.max(1) as f64
+        );
+        println!("缓存文件 {:?}", cache_path().map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
     }
 }

@@ -31,13 +31,19 @@ fn main() -> eframe::Result {
     integration::touch_gui_alive();
     // GUI 是写者：后台每 30 秒把「有变更就刷新 + 落盘」跑一遍。
     // 否则用户不搜的时候索引一直不更新，只读的 MCP 进程就会看到很旧的快照。
+    //
+    // 心跳必须在**开工前**打：一轮里可能先跑 20 秒目录巡再写 840MB 缓存，
+    // 若只在家里活儿干完才打，两跳间隔 = 30s 睡眠 + 30~50s 干活 > 60s 判活阈值，
+    // 8 个只读的 MCP 进程会集体认定「写者已死」，各自全量建一份索引 —— 数 GB 内存，
+    // 那正是系统被拖到卡死的路径。
     let _ = std::thread::Builder::new()
         .name("index-keeper".into())
         .spawn(|| loop {
+            integration::touch_gui_alive();
             std::thread::sleep(std::time::Duration::from_secs(30));
             index::ensure_fresh(index::auto_refresh_secs());
             index::persist_if_dirty();
-            // 维护循环跑完才跳心跳：心跳 = 索引真的在被维护
+            // 干完再跳一次：活儿耗时较长时缩短下一跳的间隔
             integration::touch_gui_alive();
         });
     // 自动更新检查（仅 GUI 模式；--mcp 已在上面提前返回）

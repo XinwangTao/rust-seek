@@ -1,0 +1,57 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "rust-seek 热查询与快照发布优化",
+    "locale": "zh-CN",
+    "output": "docs/archify/hot_query_name_blob_workflow.html",
+    "quality_profile": "showcase",
+    "viewBox": [1200, 600]
+  },
+  "lanes": [
+    { "id": "query", "label": "热查询主路径" },
+    { "id": "fallback", "label": "等价性兜底", "variant": "exception" },
+    { "id": "publish", "label": "写者快照发布" }
+  ],
+  "phases": [
+    { "id": "eligibility", "label": "判定与共享数据", "fromCol": 0, "toCol": 2 },
+    { "id": "matching", "label": "扫描与结果还原", "fromCol": 3, "toCol": 5, "variant": "emphasis" }
+  ],
+  "mainPath": ["request", "eligible", "nameBlob", "continuousScan", "mapHits", "results"],
+  "nodes": [
+    { "id": "request", "lane": "query", "col": 0, "width": 150, "type": "frontend", "label": "收到文件名查询", "sublabel": "regex / literal / limit" },
+    { "id": "eligible", "lane": "query", "col": 1, "width": 150, "type": "security", "label": "满足连续扫描条件？", "sublabel": "仅安全字面量 · 仅名字模式" },
+    { "id": "nameBlob", "lane": "query", "col": 2, "width": 150, "type": "database", "label": "小批拼接名字缓冲", "sublabel": "1024 条一批 · worker 复用" },
+    { "id": "continuousScan", "lane": "query", "col": 3, "width": 150, "type": "backend", "label": "连续 Regex 扫描", "sublabel": "find_at · 命中即跳条目" },
+    { "id": "mapHits", "lane": "query", "col": 4, "width": 150, "type": "backend", "label": "按字节边界映射去重", "sublabel": "按文件去重 · 保持原序" },
+    { "id": "results", "lane": "query", "col": 5, "width": 150, "type": "frontend", "label": "按原规则截断并返回", "sublabel": "结果集合与顺序不变" },
+    { "id": "legacyReason", "lane": "fallback", "col": 1, "width": 150, "type": "security", "label": "不满足等价条件", "sublabel": "任意正则 · 路径 · 构建失败" },
+    { "id": "legacyScan", "lane": "fallback", "col": 3, "width": 150, "type": "backend", "label": "现有逐条匹配", "sublabel": "正确性优先，不强行走快路" },
+    { "id": "buildSnapshot", "lane": "publish", "col": 1, "width": 150, "type": "backend", "label": "锁内构建同代快照", "sublabel": "内容变更先加代数 · 记录 gen" },
+    { "id": "writeSnapshot", "lane": "publish", "col": 2, "width": 150, "type": "database", "label": "串行锁外原子写缓存", "sublabel": "唯一临时文件 · 不持索引锁" },
+    { "id": "publishSuccess", "lane": "publish", "col": 4, "width": 150, "type": "backend", "label": "成功后推进保存水位", "sublabel": "SAVED_GEN = 本次记录的 gen" },
+    { "id": "publishFailure", "lane": "publish", "col": 5, "width": 150, "type": "messagebus", "label": "失败保持脏并重试", "sublabel": "不推进水位 · 下轮重新发布" }
+  ],
+  "edges": [
+    { "from": "request", "to": "eligible", "role": "main", "variant": "emphasis" },
+    { "from": "eligible", "to": "nameBlob", "label": "是", "role": "main", "variant": "emphasis" },
+    { "from": "nameBlob", "to": "continuousScan", "role": "main", "variant": "emphasis" },
+    { "from": "continuousScan", "to": "mapHits", "role": "main", "variant": "emphasis" },
+    { "from": "mapHits", "to": "results", "role": "main", "variant": "emphasis" },
+    { "from": "eligible", "to": "legacyReason", "label": "否", "role": "branch", "variant": "dashed" },
+    { "from": "legacyReason", "to": "legacyScan", "role": "branch", "variant": "dashed" },
+    { "from": "legacyScan", "to": "results", "label": "沿用原语义", "role": "return" },
+    { "from": "buildSnapshot", "to": "writeSnapshot", "label": "冻结本次字节与 gen" },
+    { "from": "writeSnapshot", "to": "publishSuccess", "label": "写盘成功", "variant": "emphasis" },
+    { "from": "writeSnapshot", "to": "publishFailure", "label": "写盘失败", "role": "error", "variant": "security" },
+    { "from": "publishFailure", "to": "buildSnapshot", "label": "后续维护循环重试", "role": "return", "variant": "dashed" }
+  ],
+  "semanticChecks": {
+    "allowedRoots": ["request", "buildSnapshot"],
+    "allowedTerminals": ["results", "publishSuccess", "publishFailure"],
+    "requiredPaths": [
+      { "from": "eligible", "to": "legacyScan" },
+      { "from": "writeSnapshot", "to": "publishFailure" }
+    ]
+  }
+}
