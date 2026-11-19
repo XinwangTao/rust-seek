@@ -687,7 +687,7 @@ fn search_text_candidates(
     let cursor = std::sync::atomic::AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let timed_out = AtomicBool::new(false);
-    let workers = num_cpus::get().clamp(1, 32);
+    let workers = crate::qos::foreground_threads();
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -740,7 +740,7 @@ where
     let paths: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
     let opts = fastwalk::Options {
         include_hidden,
-        threads: num_cpus::get(),
+        threads: crate::qos::foreground_threads(),
         // Agent 的搜索请求也是前台请求：保持正常优先级
         background: false,
     };

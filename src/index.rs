@@ -87,6 +87,17 @@ pub fn auto_refresh_secs() -> u64 {
         .unwrap_or(30)
 }
 
+/// 遍历线程数：后台维护把并发压到浅队列（Windows 上核数一半、最多 8 条），
+/// 用户主动发起的搜索封顶 16 条。索引巡盘本身是随机元数据读，
+/// 线程开太多只会把磁盘队列堆深、把前台应用饿死，吞吐并不涨。
+fn walk_threads(background: bool) -> usize {
+    if background {
+        crate::qos::background_threads(num_cpus::get())
+    } else {
+        crate::qos::foreground_threads()
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Item {
@@ -1047,9 +1058,31 @@ pub fn persist_if_dirty() {
     if SAVED_GEN.load(Ordering::Relaxed) == CONTENT_GEN.load(Ordering::Relaxed) {
         return;
     }
-    if !publish_cache() && std::env::var_os("RUST_SEEK_DEBUG").is_some() {
-        eprintln!("[debug] persist_if_dirty: 缓存发布失败，保持脏，等待重试");
+    if !publish_throttled() && std::env::var_os("RUST_SEEK_DEBUG").is_some() {
+        eprintln!("[debug] persist_if_dirty: 缓存发布失败或未到最小间隔，保持脏，等待重试");
     }
+}
+
+/// 两次「定时发布」之间的最小间隔（秒）。`RUST_SEEK_PUBLISH_SECS` 可覆盖，0 = 不限。
+///
+/// 索引约 765MB：系统一直在写文件，脏目录几乎从不清空。如果每 30 秒维护一轮就把整份
+/// 缓存重写一次，等于常驻 25MB/s 的写盘流量——机械盘 / 装了过滤驱动的机器上磁盘永远
+/// 没有空档。只读读者最多晚这么久看到新快照，这个代价可以接受。
+fn publish_min_interval_secs() -> u64 {
+    std::env::var("RUST_SEEK_PUBLISH_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(120)
+}
+
+/// 定时/刷新路径用的发布：受最小间隔限制，避免把整份 765MB 缓存反复重写。
+/// 建索引完成这类「一次性」发布仍走 [`publish_cache`]，不受限。
+fn publish_throttled() -> bool {
+    let last = LAST_PUBLISH_UNIX.load(Ordering::Relaxed);
+    if now_unix().saturating_sub(last) < publish_min_interval_secs() {
+        return false;
+    }
+    publish_cache()
 }
 
 /// 实时输入用：**绝不在搜索路径上刷新**。
@@ -1088,6 +1121,8 @@ pub fn schedule_refresh() {
         return;
     }
     std::thread::spawn(|| {
+        // 实时输入触发的后台补刷：整条线程降到后台 I/O 档，别和用户打字抢磁盘
+        crate::qos::set_background();
         let _ = refresh_now_mode(false);
     });
 }
@@ -1341,7 +1376,9 @@ fn refresh_now_mode(allow_full_sweep: bool) -> bool {
     // 790MB 序列化 + 写盘都放到索引锁外：否则写者自己的查询会被整份缓存写盘堵住。
     // 失败不推进 SAVED_GEN，下一轮维护会重试。
     if ok && changed && SAVED_GEN.load(Ordering::SeqCst) != CONTENT_GEN.load(Ordering::SeqCst) {
-        let _ = publish_cache();
+        // 刷新路径可能每秒被叫一次（实时输入）：发布必须限流，否则整份 765MB 缓存
+        // 会被反复重写，磁盘永远打满。定时维护循环仍会重试，只是不会更频繁。
+        let _ = publish_throttled();
     }
     ok
 }
@@ -1410,7 +1447,7 @@ pub fn spawn_refresh_async() -> bool {
         drop(guard);
         // 序列化与写盘不持索引锁；失败保持脏，下一轮维护重试
         if changed {
-            let _ = publish_cache();
+            let _ = publish_throttled();
         }
     });
     true
@@ -1435,6 +1472,9 @@ fn watcher_trusted() -> bool {
 ///
 /// 返回 `(ok, changed)`：`changed` 表示内存内容/水位真的改过、需要发布到缓存。
 fn refresh_with_mode(index: &mut Index, allow_full_sweep: bool) -> (bool, bool) {
+    // 调用线程可能已经被降到后台档（index-keeper / 后台刷新线程）：
+    // 把这份身份传给遍历线程，它们才会同样按 Very Low I/O 跑。
+    let background = crate::qos::is_background();
     if integration::local_drives().len() as u64 != WATCHED_DRIVES.load(Ordering::Relaxed) {
         NEED_FULL_SCAN.store(true, Ordering::Relaxed);
     }
@@ -1448,7 +1488,7 @@ fn refresh_with_mode(index: &mut Index, allow_full_sweep: bool) -> (bool, bool) 
             return (true, false);
         }
         let had_changes = !dirty.is_empty();
-        let ok = refresh_in_place(index, Some(dirty.clone()), false);
+        let ok = refresh_in_place(index, Some(dirty.clone()), background);
         if ok && had_changes {
             CONTENT_GEN.fetch_add(1, Ordering::SeqCst);
         }
@@ -1481,7 +1521,7 @@ fn refresh_with_mode(index: &mut Index, allow_full_sweep: bool) -> (bool, bool) 
     }
     if let Some((dirty, commits)) = __usn {
         let __t2 = Instant::now();
-        let __ok = refresh_in_place(index, Some(dirty.clone()), false);
+        let __ok = refresh_in_place(index, Some(dirty.clone()), background);
         if std::env::var_os("RUST_SEEK_DEBUG").is_some() {
             eprintln!("[debug] refresh_in_place {:?} ok={}", __t2.elapsed(), __ok);
         }
@@ -1509,7 +1549,7 @@ fn refresh_with_mode(index: &mut Index, allow_full_sweep: bool) -> (bool, bool) 
     // 同时记下事件 ID（macOS FSEvents 回放用）：巡完之后把这次快照的时间点落盘，
     // 下次启动从该点回放，连这次巡之后发生的变更也不会漏。
     let snap = snapshot_event_id();
-    let ok = refresh_in_place(index, None, false);
+    let ok = refresh_in_place(index, None, background);
     if ok {
         NEED_FULL_SCAN.store(false, Ordering::Relaxed);
         // 新鲜度记「巡完的时刻」而不是「开始巡的时刻」：本机巡一次约 17s，
@@ -1565,6 +1605,8 @@ static MAPPED_STAMP: Mutex<Option<(u64, u64)>> = Mutex::new(None);
 /// 否则读者会一直停在旧快照（实测遇到过 13 分钟没更新的情况）。
 static CONTENT_GEN: AtomicU64 = AtomicU64::new(0);
 static SAVED_GEN: AtomicU64 = AtomicU64::new(0);
+/// 上一次把缓存写盘成功的时刻（unix 秒），用于限制定时发布频率。
+static LAST_PUBLISH_UNIX: AtomicU64 = AtomicU64::new(0);
 /// 缓存发布串行锁：并发发布会让旧快照最后落盘、覆盖新快照。
 static CACHE_PUBLISH: Mutex<()> = Mutex::new(());
 /// 进程内缓存写序号：临时文件名不能只用 pid——同进程两次发布并发时
@@ -2416,7 +2458,7 @@ fn refresh_in_place(index: &mut Index, hint: Option<Vec<String>>, background: bo
             &walk_roots,
             &fastwalk::Options {
                 include_hidden: false,
-                threads: num_cpus::get(),
+                threads: walk_threads(background),
                 background,
             },
             &cancel,
@@ -2806,7 +2848,7 @@ fn scan_dirty_dirs(
             old_dirs.len()
         );
     }
-    let threads = num_cpus::get().clamp(1, 16);
+    let threads = walk_threads(background).clamp(1, 16);
     let chunk = ((old_dirs.len() + threads - 1) / threads).max(1);
     let failed = AtomicBool::new(false);
     let out: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
@@ -3036,7 +3078,7 @@ fn build_with_match(
             &roots,
             &fastwalk::Options {
                 include_hidden: false,
-                threads: num_cpus::get(),
+                threads: walk_threads(background),
                 background,
             },
             &cancel,
@@ -3753,6 +3795,7 @@ fn publish_to(path: &Path) -> bool {
     }
     // 单调推进：即使有更旧的写迟到，也不能把「已保存代数」拉回去
     SAVED_GEN.fetch_max(snapshot_gen, Ordering::SeqCst);
+    LAST_PUBLISH_UNIX.store(now_unix(), Ordering::Relaxed);
     // 新缓存代表「此刻的文件系统」，之前那份日志描述的空窗已经归零。
     // 只对正式缓存生效：测试写到临时目录时不能删生产日志。
     if cache_path().as_deref() == Some(path) {

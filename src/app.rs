@@ -966,7 +966,7 @@ impl App {
         self.rx = Some(rx);
         self.cancel = Some(cancelled.clone());
 
-        let threads = num_cpus::get();
+        let threads = crate::qos::foreground_threads();
         let mode = self.mode;
         let exts = self.ext_filter_active();
         // 粘的是路径片段（含 / 或 \）时按完整路径匹配，否则只看文件名。

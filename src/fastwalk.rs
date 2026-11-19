@@ -75,8 +75,6 @@ mod imp {
     where
         F: Fn(&Path, &Info) -> Step + Sync,
     {
-        // Windows 侧暂不接后台优先级；读一下字段避免「从未使用」告警。
-        let _ = opts.background;
         let jobs: VecDeque<(PathBuf, usize)> = roots
             .iter()
             .map(|r| (absolutize(r), 0))
@@ -89,7 +87,16 @@ mod imp {
 
         std::thread::scope(|scope| {
             for _ in 0..threads {
-                scope.spawn(|| loop {
+                scope.spawn(|| {
+                    // 优先级是**线程级**的：每个遍历线程自己降档。
+                    // 后台索引维护 → 最低 CPU + Very Low I/O；用户搜索 → 礼貌档（CPU 次低，
+                    // I/O 保持正常），整机不会因为一次整盘搜索而卡住。
+                    if opts.background {
+                        crate::qos::set_background();
+                    } else {
+                        crate::qos::set_polite();
+                    }
+                    loop {
                     // 取下一个目录；队列空且无人还在枚举，说明整次遍历结束
                     let (dir, depth) = {
                         let mut st = state.lock().unwrap();
@@ -126,11 +133,17 @@ mod imp {
                         &visit,
                     );
 
+                    // 后台扫盘按目标速率给磁盘留出空档（前台搜索限速无意义）
+                    if opts.background {
+                        crate::qos::pace(1);
+                    }
+
                     let mut st = state.lock().unwrap();
                     st.pending += children.len();
                     st.queue.extend(children.drain(..));
                     st.pending -= 1;
                     wake.notify_one();
+                    }
                 });
             }
         });
@@ -368,5 +381,81 @@ mod imp {
             })
         });
         count.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// 走一遍真实目录，确认后台档（每线程降 QoS + 限速）不会把遍历卡住。
+    #[test]
+    fn background_walk_visits_entries() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let cancel = AtomicBool::new(false);
+        let opts = Options {
+            include_hidden: true,
+            threads: 4,
+            background: true,
+        };
+        let n = walk(&[root], &opts, &cancel, |_, _| Step::Continue);
+        assert!(n > 0, "后台遍历一个文件都没看到");
+    }
+
+    /// 前台遍历（礼貌档）同样要能正常结束。
+    #[test]
+    fn foreground_walk_visits_entries() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let cancel = AtomicBool::new(false);
+        let opts = Options {
+            include_hidden: true,
+            threads: 2,
+            background: false,
+        };
+        let n = walk(&[root], &opts, &cancel, |_, _| Step::Continue);
+        assert!(n > 0);
+    }
+
+    /// 实机标定：C 盘整盘遍历在「后台档」下仍能在可接受时间内走完。
+    /// 默认忽略（耗时长、需要真实磁盘），`cargo test -- --ignored walk_bench` 手动跑。
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn walk_bench() {
+        use std::time::Instant;
+        let threads: usize = std::env::var("BENCH_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let cancel = AtomicBool::new(false);
+        let opts = Options {
+            include_hidden: false,
+            threads,
+            background: true,
+        };
+        let root = std::env::var("BENCH_ROOT").unwrap_or_else(|_| "C:/".to_string());
+        let cap: u64 = std::env::var("BENCH_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(u64::MAX);
+        let seen = std::sync::atomic::AtomicU64::new(0);
+        let t = Instant::now();
+        let n = walk(&[PathBuf::from(&root)], &opts, &cancel, |_, _| {
+            let k = seen.fetch_add(1, Ordering::Relaxed) + 1;
+            if k % 1_000_000 == 0 {
+                eprintln!("  ...{k} entries in {:?}", t.elapsed());
+            }
+            if k >= cap {
+                Step::Quit
+            } else {
+                Step::Continue
+            }
+        });
+        eprintln!(
+            "walk {root} threads={threads} entries={n} elapsed={:?}",
+            t.elapsed()
+        );
+        assert!(n > 0);
     }
 }

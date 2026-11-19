@@ -5,7 +5,7 @@
 ![Rust](https://img.shields.io/badge/built%20with-Rust-orange?logo=rust)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue?logo=windows)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Version](https://img.shields.io/badge/version-5.5.0-brightgreen)
+![Version](https://img.shields.io/badge/version-5.6.0-brightgreen)
 
 ---
 
@@ -225,6 +225,27 @@ macOS 没有 `ReadDirectoryChangesW`，改用原生 FSEvents 做同一套增量�
   停机新建的文件重启后 **0.43s** 命中、全程零全量巡；零命中查询 **0.2s** 返回（不再兜底遍历）
 - 剪枝口径：Windows 剪盘根 `C:\Windows`、`Program Files` 等；macOS 剪卷根
   `/System`、`/Library`、`/private`、`/usr` 等，外加 `~/Library` 抖动目录；项目内同名目录不受影响
+
+### Windows：后台 I/O 降级
+
+Windows 没有 macOS 那样的 I/O 档位，之前 `qos::set_background()` 在 Windows 上是空实现，
+索引巡盘用满 16–32 条线程、按正常 I/O 优先级打盘。机械盘 / 装了杀毒过滤驱动的机器上，
+一次整盘巡（31.7 万目录）就能把磁盘队列堆到几十深，整机 I/O 全卡在它后面。
+
+现在 Windows 侧补齐（v5.6.0）：
+
+- **后台线程进「后台处理模式」**：`SetThreadPriority(THREAD_MODE_BACKGROUND_BEGIN)`
+  把 CPU 调度优先级降到最低，同时把线程 I/O 优先级降到 Very Low
+  （实测 `IoPriorityNormal(2)` → `IoPriorityVeryLow(0)`）；再叠一层
+  `ThreadMemoryPriority = MEMORY_PRIORITY_VERY_LOW`，后台扫出来的页缓存不挤前台工作集
+- **后台并发封顶**：核数一半、2–8 条（`RUST_SEEK_BG_THREADS` 可调）。队列越浅，前台越不容易被饿死
+- **限速**：后台每枚举一个目录按目标速率让出磁盘（`RUST_SEEK_BG_DIRS_PER_SEC`，默认 30000/秒，0 关闭）
+- **缓存发布限流**：整份索引约 765MB，之前「有脏目录就每 30 秒重写一次」= 常驻 25MB/s 写盘；
+  现在定时发布最小间隔 120 秒（`RUST_SEEK_PUBLISH_SECS` 可调），建库完成仍立即落盘
+- **前台搜索（含 MCP 与 IDE 触发）**：只降到 `THREAD_PRIORITY_BELOW_NORMAL`，
+  并发封顶 16 条——机器保持可用，搜索速度基本不变
+- **维护心跳不中断**：维护工作放到独立的后台线程，主循环在它干活期间每 10 秒跳一次心跳，
+  避免「全盘巡 + 落盘」被降档后耗时超过 60 秒，被只读进程误判写者已死、各自全量建库
 
 ### 变更日志（v5.0.0）
 

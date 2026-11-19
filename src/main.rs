@@ -44,13 +44,43 @@ fn main() -> eframe::Result {
     // 那正是系统被拖到卡死的路径。
     let _ = std::thread::Builder::new()
         .name("index-keeper".into())
-        .spawn(|| loop {
-            integration::touch_gui_alive();
-            std::thread::sleep(std::time::Duration::from_secs(30));
-            index::ensure_fresh(index::auto_refresh_secs());
-            index::persist_if_dirty();
-            // 干完再跳一次：活儿耗时较长时缩短下一跳的间隔
-            integration::touch_gui_alive();
+        .spawn(|| {
+            // 维护线程降档：全盘巡 + 765MB 落盘都不许抢前台的磁盘
+            // （Windows 上是最低 CPU + Very Low I/O，macOS 是后台 QoS + I/O throttle）。
+            // 心跳由本线程每 10 秒跳一次——维护被降档后可能超过 60 秒，
+            // 只读读者若误判写者已死，会各自全量建库，那正是把内存和磁盘一起打满的路径。
+            struct Kick(std::sync::Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Kick {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            loop {
+                integration::touch_gui_alive();
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let flag = done.clone();
+                let worker = std::thread::Builder::new()
+                    .name("index-maint".into())
+                    .spawn(move || {
+                        let _done = Kick(flag);
+                        qos::set_background();
+                        index::ensure_fresh(index::auto_refresh_secs());
+                        index::persist_if_dirty();
+                    });
+                if worker.is_err() {
+                    // 极端情况起不了线程：退回本线程（至少是礼貌档），别把维护饿死
+                    qos::set_polite();
+                    index::ensure_fresh(index::auto_refresh_secs());
+                    index::persist_if_dirty();
+                    continue;
+                }
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    integration::touch_gui_alive();
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                }
+                integration::touch_gui_alive();
+            }
         });
     // 自动更新检查（仅 GUI 模式；--mcp 已在上面提前返回）
     updater::spawn();
