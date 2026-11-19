@@ -14,7 +14,8 @@ use crate::fastwalk::{self, Step};
 use crate::index;
 use crate::integration;
 use crate::searcher::{
-    path_is_system_root, search_file, search_filename_meta_path, SKIP_DIRS,
+    path_is_system_root, path_is_user_library_noise, search_file, search_filename_meta_path,
+    SKIP_DIRS,
 };
 use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
@@ -737,7 +738,12 @@ where
     F: Fn(&Path, &fastwalk::Info) -> Step + Sync,
 {
     let paths: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
-    let opts = fastwalk::Options { include_hidden, threads: num_cpus::get() };
+    let opts = fastwalk::Options {
+        include_hidden,
+        threads: num_cpus::get(),
+        // Agent 的搜索请求也是前台请求：保持正常优先级
+        background: false,
+    };
     fastwalk::walk(&paths, &opts, &stop, visit)
 }
 
@@ -851,7 +857,7 @@ fn relax_for_explicit_roots(
                 }
             }
         }
-        if path_is_system_root(p) {
+        if path_is_system_root(p) || path_is_user_library_noise(p) {
             prune_system = false;
         }
     }
@@ -885,11 +891,29 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// roots 全是盘符根（`C:/`、`D:/`）时才可能有对应的整盘索引。
+/// roots 全是卷根（`C:/`、`D:/`，或 Unix/macOS 的 `/`）时才可能有对应的整盘索引。
 fn roots_are_drives(roots: &[String]) -> bool {
     !roots.is_empty()
         && roots.iter().all(|r| {
             let b = r.as_bytes();
-            b.len() == 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
+            let windows_drive = b.len() == 3
+                && b[0].is_ascii_alphabetic()
+                && b[1] == b':'
+                && (b[2] == b'/' || b[2] == b'\\');
+            // macOS/Linux 的整个卷根也是「整盘」。
+            windows_drive || r == "/"
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volume_roots_are_recognised() {
+        assert!(roots_are_drives(&["C:/".to_string(), "D:\\".to_string()]));
+        assert!(roots_are_drives(&["/".to_string()]));
+        assert!(!roots_are_drives(&["/Users/a".to_string()]));
+        assert!(!roots_are_drives(&[]));
+    }
 }

@@ -5,6 +5,7 @@ mod icon;
 mod index;
 mod integration;
 mod mcp;
+mod qos;
 mod searcher;
 mod updater;
 #[allow(dead_code)]
@@ -14,6 +15,9 @@ fn main() -> eframe::Result {
     // `--mcp`：作为 MCP server 跑在 stdio 上，供 AI Agent 调用。
     // 必须放在单实例判断之前——Agent 会按需拉起多个进程，不能被互斥体挡住。
     if std::env::args().any(|a| a == "--mcp") {
+        // 只读读者**不挂**目录监听：监听只服务写者（本分支写者是 GUI）。
+        // 8 个 MCP 进程各挂一套 ReadDirectoryChangesW + 变更日志追加，
+        // 纯属重复的磁盘/CPU 开销，而它们本来就不刷新索引，只读共享快照。
         if let Err(e) = mcp::run() {
             eprintln!("rust-seek mcp server error: {e}");
             std::process::exit(1);
@@ -26,6 +30,8 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let start_hidden = std::env::args().any(|a| a == "--hidden");
+    // 目录监听尽早挂上：Mac 上事件流要做「停机期间变更」回放，越早开始越好。
+    index::start_watchers();
     // GUI 是索引的唯一写者：宣告身份并开始心跳，MCP 进程据此只读共享快照。
     index::set_gui_mode();
     integration::touch_gui_alive();
@@ -55,6 +61,7 @@ fn main() -> eframe::Result {
     let _ = std::thread::Builder::new()
         .name("index-warmup".into())
         .spawn(|| {
+            qos::set_background();
             std::thread::sleep(std::time::Duration::from_secs(2));
             index::ensure_ready();
         });

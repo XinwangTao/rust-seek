@@ -175,7 +175,8 @@ claude mcp add rust-seek -- "F:\path\to\rust-seek.exe" --mcp
 | 进程重启后首次查询（从磁盘缓存载入） | **0.12s** |
 | 项目内查询（不走索引） | < 10ms |
 
-- 缓存位置 `%LOCALAPPDATA%\rust-seek\index-v1.bin`（约 590MB），**每 2 分钟没刷新过就先做一次增量刷新**，24 小时以上才排一次后台整盘重建，7 天后强制重建
+- 缓存位置：Windows `%LOCALAPPDATA%\rust-seek\index-v1.bin`；macOS/Linux `~/Library/Caches/rust-seek/index-v1.bin`（约 60–590MB，随条目数变化），**每 2 分钟没刷新过就先做一次增量刷新**，24 小时以上才排一次后台整盘重建，7 天后强制重建
+- 剪枝只在「卷根下一层」生效：Windows 剪 `C:\Windows`、`Program Files` 等，macOS 剪 `/System`、`/Library`、`/private`、`/usr` 等；项目里的同名目录不受影响
 - 常驻内存约 800MB（620 万条）；只存文件（目录只存“路径 + mtime” 用于增量刷新），剪枝规则和普通搜索一致，所以结果集相同
 
 ### 增量刷新（v5.0.0）
@@ -205,6 +206,25 @@ claude mcp add rust-seek -- "F:\path\to\rust-seek.exe" --mcp
 - 监听缓冲区溢出（超忙的盘）或盘数量变化 → 标记需要重新对账，退回全量 stat 巡，保证最终一致
 - 监听可信时索引就是当前文件系统的权威视图，零命中直接回「没有」，
   不必再花 20–50s 走一遍全盘遍历
+
+### macOS：FSEvents
+
+macOS 没有 `ReadDirectoryChangesW`，改用原生 FSEvents 做同一套增量维护：
+
+- **目录级事件 + 0.5s 合并**（不开启 `FileEvents`、不轮询），只记「哪个目录变了」
+- `FSEventStreamSetExclusionPaths` 在**内核侧**排除 `/System`、`/Library`、`/private`、`/usr`
+  以及 `~/Library/{Caches,Containers,Group Containers,Logs,Saved Application State}`；
+  系统噪声不会进入用户态，也不会把索引刷新变成永动机
+- 持久化 `FSEventStreamEventId`，新进程用 `sinceWhen` 回放停机期间的事件；
+  回放完成前不信任索引，只有丢事件（`MustScanSubDirs` 等）才退回一次全量 stat 巡
+- 首次升级 / 事件 ID 丢失 / 换启动卷：做一次后台对账（本机 43k 目录，约 0.5–1s），
+  随后把当前事件 ID 落盘；此后不再全量巡
+- 监听、索引构建/刷新线程降到 `QOS_CLASS_BACKGROUND` + `IOPOL_THROTTLE`，
+  用户搜索线程保持前台优先级：后台维护不抢 I/O，搜索速度不变
+- 本机实测（8GB Intel）：索引 192,312 文件 / 43,022 目录 / 35MB；
+  停机新建的文件重启后 **0.43s** 命中、全程零全量巡；零命中查询 **0.2s** 返回（不再兜底遍历）
+- 剪枝口径：Windows 剪盘根 `C:\Windows`、`Program Files` 等；macOS 剪卷根
+  `/System`、`/Library`、`/private`、`/usr` 等，外加 `~/Library` 抖动目录；项目内同名目录不受影响
 
 ### 变更日志（v5.0.0）
 

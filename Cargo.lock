@@ -1355,6 +1355,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fsevent-sys"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3381,8 +3390,10 @@ dependencies = [
  "eframe",
  "egui",
  "encoding_rs",
+ "fsevent-sys",
  "global-hotkey",
  "ignore",
+ "libc",
  "memmap2",
  "num_cpus",
  "open",
