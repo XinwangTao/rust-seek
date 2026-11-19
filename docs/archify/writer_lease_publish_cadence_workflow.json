@@ -1,0 +1,52 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "rust-seek 写者租约与发布节奏（待确认）",
+    "locale": "zh-CN",
+    "output": "docs/archify/writer_lease_publish_cadence_workflow.html",
+    "quality_profile": "showcase",
+    "viewBox": [1200, 680]
+  },
+  "lanes": [
+    { "id": "election", "label": "启动与写者选举" },
+    { "id": "writer", "label": "写者维护循环" },
+    { "id": "reader", "label": "只读快照读者", "variant": "normal" },
+    { "id": "cadence", "label": "发布节奏与异常接管", "variant": "exception" }
+  ],
+  "phases": [
+    { "id": "elect", "label": "选举", "fromCol": 0, "toCol": 2 },
+    { "id": "run", "label": "维护与发布", "fromCol": 3, "toCol": 5, "variant": "emphasis" }
+  ],
+  "mainPath": ["start", "acquire", "gotLease", "maintain", "due", "publish"],
+  "nodes": [
+    { "id": "start", "lane": "election", "col": 0, "width": 150, "type": "frontend", "label": "进程启动", "sublabel": "GUI 或 --mcp 读者" },
+    { "id": "acquire", "lane": "election", "col": 1, "width": 150, "type": "security", "label": "尝试获取写者租约", "sublabel": "独占锁文件 · 带到期时间" },
+    { "id": "gotLease", "lane": "election", "col": 2, "width": 150, "type": "security", "label": "拿到租约？" },
+    { "id": "reader", "lane": "reader", "col": 3, "width": 150, "type": "database", "label": "只读 mmap 快照", "sublabel": "不刷新 · 不写盘" },
+    { "id": "maintain", "lane": "writer", "col": 3, "width": 150, "type": "backend", "label": "写者增量刷新索引", "sublabel": "USN 增量 · 开工前先续租" },
+    { "id": "due", "lane": "writer", "col": 4, "width": 150, "type": "security", "label": "到发布时机？", "sublabel": "最短间隔 · 变更量阈值" },
+    { "id": "publish", "lane": "writer", "col": 5, "width": 150, "type": "database", "label": "分块流式发布", "sublabel": "1MB 块 · 代数校验" },
+    { "id": "takeover", "lane": "cadence", "col": 4, "width": 150, "type": "messagebus", "label": "租约超期自动接管", "sublabel": "记日志 · 竞争重新获取" }
+  ],
+  "edges": [
+    { "from": "start", "to": "acquire", "role": "main", "variant": "emphasis" },
+    { "from": "acquire", "to": "gotLease", "role": "main", "variant": "emphasis" },
+    { "from": "gotLease", "to": "maintain", "label": "是", "role": "main", "variant": "emphasis" },
+    { "from": "maintain", "to": "due", "role": "main", "variant": "emphasis" },
+    { "from": "due", "to": "publish", "label": "是", "role": "main", "variant": "emphasis" },
+    { "from": "due", "to": "maintain", "label": "否 · 只更新内存", "role": "return", "variant": "dashed" },
+    { "from": "publish", "to": "maintain", "label": "下一轮", "role": "return" },
+    { "from": "gotLease", "to": "reader", "label": "否", "role": "branch", "variant": "dashed" },
+    { "from": "reader", "to": "acquire", "label": "写者失联 · 重试", "role": "return", "variant": "dashed" },
+    { "from": "maintain", "to": "takeover", "label": "租约到期未续", "role": "error", "variant": "security" }
+  ],
+  "semanticChecks": {
+    "allowedRoots": ["start"],
+    "allowedTerminals": ["reader", "takeover", "publish"],
+    "requiredPaths": [
+      { "from": "gotLease", "to": "reader" },
+      { "from": "due", "to": "publish" }
+    ]
+  }
+}
